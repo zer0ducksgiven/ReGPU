@@ -41,6 +41,8 @@ bool RendererIsResolveDraw();
 // Occlusion queries (EVENT_WRITE_ZPD): Begin starts counting the samples later draws pass;
 // End stops and gives the count in console samples (of the same query in the last completed
 // frame), false while there is none yet.
+// Before a fence write: the host GPU finishes what has been recorded (see renderer.cpp).
+void RendererFenceSync();
 void RendererOcclusionBegin();
 bool RendererOcclusionEnd(uint32_t& samples);
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.

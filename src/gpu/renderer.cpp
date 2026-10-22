@@ -3332,7 +3332,11 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     // A texture unchanged for many checks (most of them: loaded once) is checked every 4th
     // frame (staggered), not every frame: hashing all textures in use cost ~0.5 ms a frame.
     // Ones that change (video, render-to-texture on the CPU) never get here.
-    static LiveSwitch checkAlways("REGPU_CHECK_TEXTURES_ALWAYS"); // A/B
+    // Every frame by default: titles that stream textures reuse their memory (PGR4's scenery), and
+    // a texture rechecked every 4th or 16th frame showed the previous one there for a few frames.
+    // REGPU_TEXTURE_CHECK_STAGGER=1 brings the staggered checks back (A/B; faster).
+    static LiveSwitch stagger("REGPU_TEXTURE_CHECK_STAGGER");
+    const bool checkAlways = !stagger;
     const uint64_t textureKey = TextureKey(fetch.Address(), fetch.Format(), w, h);
     // Unchanged for 300 checks (a few seconds): every 16th frame (a CPU-side update shows up at most
     // ~0.1 s late). REGPU_TEXTURE_CHECK_EVERY4=1 keeps every 4th (A/B).
@@ -3368,6 +3372,10 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         native = cached.native;
         return cached.resource.Get();
     }
+    // REGPU_TRACE_TEXCHANGE=1: textures whose contents changed (address, frame, checks unchanged before).
+    if (static LiveSwitch traceChange("REGPU_TRACE_TEXCHANGE"); traceChange && cached.resource)
+        Log("texchange: %08X %s %ux%u frame %llu after %u unchanged", fetch.Address(), TextureFormatName(fetch.Format()), w, h,
+            (unsigned long long)g_r.frame, cached.unchanged);
     const auto uploadStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool wasNew = !cached.resource;
     cached.unchanged = 0;
@@ -5654,6 +5662,29 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
     w.x0 = x0, w.x1 = x1, w.y0 = y0, w.y1 = y1;
 }
 
+// Before a fence write from the command stream: run what has been recorded and let the host
+// GPU finish it, so the title only sees the fence once the draws before it have really read
+// their data. Written at record time, it reused vertex and index buffers the GPU had yet to
+// read (PGR4: torn geometry spiking into the sky for a frame, crowd poses snapping).
+// REGPU_EARLY_FENCES writes them at record time again (A/B; faster).
+void FenceSyncImpl()
+{
+    static LiveSwitch early("REGPU_EARLY_FENCES");
+    if (early || !g_r.ok)
+        return;
+    // Nothing recorded since the last sync: nothing to wait for.
+    static uint64_t lastFrame = ~0ull;
+    static uint32_t lastDraws = ~0u;
+    const uint32_t draws = g_r.drawsThisFrame.load();
+    if (lastFrame == g_r.frame && lastDraws == draws)
+        return;
+    lastFrame = g_r.frame;
+    lastDraws = draws;
+    BeginFrameIfNeeded();
+    SplitMainList();
+    WaitForQueueIdle();
+}
+
 void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info)
 {
     const auto it = g_r.resolved.find(base);
@@ -5829,6 +5860,8 @@ bool RendererIsResolveDraw()
 {
     return (gpureg::Get(RB_MODECONTROL) & 7) == 6;
 }
+
+void RendererFenceSync() { FenceSyncImpl(); }
 
 void RendererOcclusionBegin()
 {

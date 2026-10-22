@@ -516,6 +516,7 @@ void WriteBack(uint32_t address, uint32_t value)
         work::End(2);
         return;
     }
+    RendererFenceSync();
     WriteBackNow(address, value);
 }
 
