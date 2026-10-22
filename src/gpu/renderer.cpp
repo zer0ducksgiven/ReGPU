@@ -1539,6 +1539,56 @@ UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
     return offset;
 }
 
+// A large vertex buffer the title rewrites from frame to frame (PGR4's crowd bone palettes):
+// read in place, the title's next frame can overwrite it before the host GPU runs this one
+// (its fences are signalled when recorded), so it is copied while it keeps changing. Checked
+// once per frame with the sampled hash. REGPU_DIRECT_DYNAMIC keeps them in place (A/B).
+bool DynamicBuffer(uint32_t address, uint32_t bytes)
+{
+    static LiveSwitch keepDirect("REGPU_DIRECT_DYNAMIC");
+    if (keepDirect)
+        return false;
+    struct Seen
+    {
+        uint64_t hash = 0, frame = ~0ull, dynamicUntil = 0;
+    };
+    static std::unordered_map<uint64_t, Seen> seen;
+    Seen& s = seen[uint64_t(address) << 32 | bytes];
+    // Hashing is the cost: a buffer that stopped changing (static geometry, most of them) is
+    // checked every 16th frame, one that changes every frame.
+    const bool due = s.frame == ~0ull || g_r.frame <= s.dynamicUntil || g_r.frame >= s.frame + 16;
+    if (s.frame != g_r.frame && due)
+    {
+        const uint64_t hash = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes);
+        if (s.frame != ~0ull && hash != s.hash)
+            s.dynamicUntil = g_r.frame + 120;
+        s.hash = hash;
+        s.frame = g_r.frame;
+        // REGPU_TRACE_DYNAMIC=1: the buffers being copied, every 600 frames.
+        static LiveSwitch trace("REGPU_TRACE_DYNAMIC");
+        static uint64_t lastLog = 0;
+        if (trace && g_r.frame >= lastLog + 600)
+        {
+            lastLog = g_r.frame;
+            uint32_t n = 0, total = 0;
+            uint64_t bytesTotal = 0;
+            for (const auto& [key, e] : seen)
+            {
+                total++;
+                if (g_r.frame <= e.dynamicUntil)
+                {
+                    n++;
+                    bytesTotal += uint32_t(key);
+                    if (n <= 12)
+                        Log("dynamic: buffer %08X %u bytes", uint32_t(key >> 32), uint32_t(key));
+                }
+            }
+            Log("dynamic: %u of %u large buffers copied, %llu KB", n, total, (unsigned long long)(bytesTotal >> 10));
+        }
+    }
+    return g_r.frame <= s.dynamicUntil;
+}
+
 // Copies a guest range into the ring once per frame; draws sharing a vertex
 // buffer reuse the copy. A sampled hash catches ranges rewritten mid-frame.
 UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
@@ -6257,7 +6307,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // rewritten before the GPU runs this frame, so they are copied.
         static LiveSwitch noDirect("REGPU_NO_DIRECT_FETCH");
         static const uint32_t directBytes = getenv("REGPU_DIRECT_FETCH_KB") ? uint32_t(atoi(getenv("REGPU_DIRECT_FETCH_KB"))) * 1024u : kDirectFetchBytes;
-        if (g_r.physical && !noDirect && bytes >= directBytes)
+        if (g_r.physical && !noDirect && bytes >= directBytes && !DynamicBuffer(address, bytes))
         {
             vc->vf[k][0] = address & 0x1FFFFFFF;
             vc->vf[k][1] = d1 & 3;
