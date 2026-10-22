@@ -48,6 +48,7 @@ ByteAddressBuffer gphys : register(t1);   // guest physical memory (large vertex
 // Bindless textures: the fetch slot's heap index is in tbias[slot].y.
 Texture2D<float4> gtex[] : register(t0, space1);
 TextureCube<float4> gcube[] : register(t0, space2);
+Texture3D<float4> gvol[] : register(t0, space3);
 SamplerState sLinearWrap : register(s0);
 SamplerState sLinearClamp : register(s1);
 SamplerState sPointClamp : register(s2);
@@ -223,6 +224,16 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     uint index = asuint(tbias[slot].y);
     Texture2D<float4> t = gtex[index];
     TextureCube<float4> tc = gcube[index];
+    if ((tinfo[slot].w & 0xFFu) == 2) // 3D
+    {
+        Texture3D<float4> tv = gvol[index];
+        const uint vmode = tinfo[slot].x & 3u;
+        if (vertexStage) return tv.SampleLevel(sLinearClamp, coord, max(bias, 0));
+        if (vmode == 1) return tv.SampleBias(sLinearClamp, coord, bias);
+        if (vmode == 2) return tv.SampleBias(sPointClamp, coord, bias);
+        if (vmode == 3) return tv.SampleBias(sPointWrap, coord, bias);
+        return tv.SampleBias(sLinearWrap, coord, bias);
+    }
     if ((tinfo[slot].w & 0xFFu) == 3)
     {
         float3 dir = CubeDirection(coord);
@@ -279,6 +290,7 @@ struct Emitter
     TranslatedShader& result;
     bool layoutOnly = false;   // only collect the vertex fetch layout (no HLSL)
     bool literalFetch = false; // a fetch had to be baked into the code
+    mutable bool exportsDepth = false; // a pixel shader writing depth (export 61)
     uint32_t lastStride = 0;
     uint32_t lastSrc = 0, lastSrcSwizzle = 0; // mini fetches reuse the full fetch's index
     bool lastRound = false;
@@ -318,7 +330,14 @@ struct Emitter
     std::string ExportTarget(uint32_t reg) const
     {
         if (pixel)
+        {
+            if (reg == 61) // depth, in X (Xenia's kPSDepth)
+            {
+                exportsDepth = true;
+                return "oD";
+            }
             return reg < 4 ? "oC[" + std::to_string(reg) + "]" : "";
+        }
         if (reg == 63)
             return "opts";
         if (reg == 62)
@@ -936,8 +955,14 @@ TranslatedShader TranslateShader(const Shader& shader)
     }
     else
     {
-        h += "float4 main(VSOut input) : SV_Target0\n{\n"
-             "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
+        // A shader that writes depth outputs it too (a full-screen copy restoring a scene's depth
+        // into another EDRAM view, which later draws depth-test against).
+        if (e.exportsDepth)
+            h += "struct PSOut { float4 c : SV_Target0; float d : SV_Depth; };\nPSOut main(VSOut input)\n{\n"
+                 "    float4 oD = float4(input.pos.z, 0, 0, 0);\n";
+        else
+            h += "float4 main(VSOut input) : SV_Target0\n{\n";
+        h += "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
              "    [unroll] for (int j = 0; j < 16; j++) r[j] = input.o[j];\n"
              "    float4 oC[4]; [unroll] for (int k = 0; k < 4; k++) oC[k] = 0;\n"
              "    float ps = 0; bool p = false; int a0 = 0, aL = 0;\n"
@@ -954,7 +979,7 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    case 6: if (!(oC[0].a >= pinfo2.x)) discard; break;\n"
              "    }\n"
              "    if (pinfo2.w > 0.0) oC[0].rgb = clamp(oC[0].rgb, 0.0, pinfo2.w); // 7e3 target range\n"
-             "    return oC[0];\n}\n";
+             + std::string(e.exportsDepth ? "    PSOut o; o.c = oC[0]; o.d = saturate(oD.x); return o;\n}\n" : "    return oC[0];\n}\n");
     }
     result.hlsl = h;
     result.ok = true;

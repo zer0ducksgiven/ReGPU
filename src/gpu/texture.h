@@ -13,8 +13,10 @@ struct TextureFetch
     uint32_t Format() const { return dwords[1] & 0x3F; }
     uint32_t Endian() const { return (dwords[1] >> 6) & 3; }
     uint32_t Address() const { return dwords[1] & 0xFFFFF000; } // physical
-    uint32_t Width() const { return (dwords[2] & 0x1FFF) + 1; }
-    uint32_t Height() const { return ((dwords[2] >> 13) & 0x1FFF) + 1; }
+    // 3D textures pack the size as 11 + 11 + 10 bits (Xenia's size_3d), the others 13 + 13.
+    uint32_t Width() const { return Dimension() == 2 ? (dwords[2] & 0x7FF) + 1 : (dwords[2] & 0x1FFF) + 1; }
+    uint32_t Height() const { return Dimension() == 2 ? ((dwords[2] >> 11) & 0x7FF) + 1 : ((dwords[2] >> 13) & 0x1FFF) + 1; }
+    uint32_t Depth() const { return Dimension() == 2 ? ((dwords[2] >> 22) & 0x3FF) + 1 : 1; }
     uint32_t Swizzle() const { return (dwords[3] >> 1) & 0xFFF; }
     uint32_t Dimension() const { return (dwords[5] >> 9) & 3; } // 1 = 2D
     int32_t ExpAdjust() const { return int32_t(dwords[3] << 13) >> 26; } // texels scaled by 2^n
@@ -32,6 +34,8 @@ const char* TextureFormatName(uint32_t format);
 bool DecodeTexture(const TextureFetch& fetch, std::vector<uint8_t>& rgba);
 // The same from texture data outside guest memory (e.g. an .xds file after its header).
 bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector<uint8_t>& rgba);
+// Mip 0 of a 3D texture to RGBA8, slice after slice (width*height*depth*4).
+bool DecodeTexture3D(const TextureFetch& fetch, std::vector<uint8_t>& rgba);
 
 // Block-compressed formats the GPU samples natively: 1-4 for BC1-BC4 (DXT1, DXT3, DXT5,
 // DXT5A), 0 for formats that are decoded to RGBA8.

@@ -71,6 +71,20 @@ int32_t TiledOffset2DInner(uint32_t x, uint32_t y, uint32_t log2Bpp, int32_t bas
         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6));
 }
 
+// Xenos 3D tiling (Xenia's texture_address.h Tiled3D): macro tiles of 32x16x4 blocks; pitch
+// and height in blocks, aligned to 32. Returns the byte offset of block (x, y, z).
+int64_t TiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitchAligned, uint32_t heightAligned, uint32_t log2Bpp)
+{
+    const int32_t outerBlocks = ((((z >> 2) * int32_t(heightAligned >> 4) + (y >> 4)) * int32_t(pitchAligned >> 5)) + (x >> 5)) << 7;
+    const int32_t innerBlocks = ((z & 3) << 5) | (((y >> 1) & 3) << 3) | (x & 7);
+    const int64_t outerInnerBytes = int64_t(outerBlocks | innerBlocks) << log2Bpp;
+    const uint32_t bank = uint32_t((y >> 3) ^ (z >> 2)) & 1;
+    const uint32_t pipe = (uint32_t(x >> 3) & 3) ^ (bank << 1);
+    const uint32_t yLsb = uint32_t(y) & 1;
+    return int64_t((yLsb << 4) | (pipe << 6) | (bank << 11)) | (outerInnerBytes & 0xF) | (((outerInnerBytes >> 4) & 1) << 5) |
+        (((outerInnerBytes >> 5) & 7) << 8) | (outerInnerBytes >> 8 << 12);
+}
+
 void Swap(uint8_t* p, uint32_t bytes, uint32_t endian)
 {
     switch (endian)
@@ -400,6 +414,61 @@ uint32_t TextureTiledOffset(uint32_t x, uint32_t y, uint32_t pitchBlocks, uint32
     return uint32_t(TiledOffset2DInner(x, y, log2Bytes, rowOffset) >> log2Bytes) << log2Bytes;
 }
 
+bool DecodeTexture3D(const TextureFetch& fetch, std::vector<uint8_t>& rgba)
+{
+    FormatInfo info;
+    if (fetch.Type() != 2 || fetch.Dimension() != 2 || !Info(fetch.Format(), info))
+        return false;
+    const uint32_t width = fetch.Width(), height = fetch.Height(), depth = fetch.Depth();
+    const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
+    const uint32_t bs = info.blockSize;
+    const uint32_t blocksX = (width + bs - 1) / bs, blocksY = (height + bs - 1) / bs;
+    const uint32_t blockBytes = 1u << info.log2Bytes;
+    // Storage is aligned to 32x32x4 blocks, tiled or linear (Xenia's texture_address.h).
+    const uint32_t pitchBlocks = (std::max(fetch.Pitch() / bs, blocksX) + 31) & ~31u;
+    const uint32_t heightBlocks = (blocksY + 31) & ~31u;
+    rgba.assign(size_t(width) * height * depth * 4, 0);
+    uint8_t block[32];
+    uint8_t texels[16][4];
+    for (uint32_t z = 0; z < depth; z++)
+    {
+        uint8_t* slice = &rgba[size_t(z) * width * height * 4];
+        for (uint32_t by = 0; by < blocksY; by++)
+            for (uint32_t bx = 0; bx < blocksX; bx++)
+            {
+                const size_t offset = fetch.Tiled() ? size_t(TiledOffset3D(int32_t(bx), int32_t(by), int32_t(z), pitchBlocks, heightBlocks, info.log2Bytes))
+                                                    : ((size_t(z) * heightBlocks + by) * pitchBlocks + bx) * blockBytes;
+                memcpy(block, source + offset, blockBytes);
+                Swap(block, blockBytes, fetch.Endian());
+                if (bs == 4)
+                {
+                    DecodeBlock(fetch.Format(), block, texels);
+                    for (uint32_t i = 0; i < 16; i++)
+                    {
+                        const uint32_t x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
+                        if (x < width && y < height)
+                            memcpy(&slice[(size_t(y) * width + x) * 4], texels[i], 4);
+                    }
+                }
+                else
+                    DecodeTexel(fetch.Format(), block, &slice[(size_t(by) * width + bx) * 4]);
+            }
+    }
+    const uint32_t swizzle = fetch.Swizzle();
+    if (swizzle != 0x688) // XYZW
+        for (size_t i = 0; i < rgba.size(); i += 4)
+        {
+            uint8_t in[4];
+            memcpy(in, &rgba[i], 4);
+            for (int c = 0; c < 4; c++)
+            {
+                const uint32_t sel = (swizzle >> (c * 3)) & 7;
+                rgba[i + c] = sel < 4 ? in[sel] : (sel == 5 ? 255 : 0);
+            }
+        }
+    return true;
+}
+
 size_t TextureSourceSize(const TextureFetch& fetch)
 {
     FormatInfo info;
@@ -410,6 +479,8 @@ size_t TextureSourceSize(const TextureFetch& fetch)
     const uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
     uint32_t pitchBlocks = std::max(fetch.Pitch() / info.blockSize, blocksX);
     uint32_t rows = blocksY;
+    if (fetch.Dimension() == 2) // 3D: 32x32x4-block storage
+        return size_t((pitchBlocks + 31) & ~31u) * ((rows + 31) & ~31u) * ((fetch.Depth() + 3) & ~3u) * (size_t(1) << info.log2Bytes);
     if (fetch.Tiled())
     {
         pitchBlocks = (pitchBlocks + 31) & ~31u;

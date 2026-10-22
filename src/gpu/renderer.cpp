@@ -429,6 +429,7 @@ struct Renderer
     // texture of every draw.
     std::unordered_map<uint64_t, CachedTexture> textures;
     std::unordered_map<uint64_t, CachedTexture> cubes;
+    std::unordered_map<uint64_t, CachedTexture> volumes; // 3D textures
     std::unordered_map<uint32_t, CachedTexture> mipChains; // resolved textures with their mips, by base
     // Bindless texture descriptors.
     struct BindlessEntry
@@ -439,7 +440,7 @@ struct Renderer
     };
     std::unordered_map<uint64_t, BindlessEntry> bindless; // by resource pointer, format, cube
     std::vector<UINT> bindlessFree;
-    UINT bindlessNext = 2;
+    UINT bindlessNext = 3; // 0-2: the null 2D, cube and 3D views
     std::unordered_map<uint32_t, ResolvedTexture> resolved; // by physical address
 
     uint64_t frame = 0;
@@ -994,10 +995,10 @@ void Init()
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     range.NumDescriptors = 2; // t0 upload ring, t1 guest memory
-    D3D12_DESCRIPTOR_RANGE bindless[2]{};
-    for (UINT i = 0; i < 2; i++)
+    D3D12_DESCRIPTOR_RANGE bindless[3]{};
+    for (UINT i = 0; i < 3; i++)
     {
-        // 2D textures in space1, cubes in space2, over the same descriptors.
+        // 2D textures in space1, cubes in space2, 3D in space3, over the same descriptors.
         bindless[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         bindless[i].NumDescriptors = kBindless;
         bindless[i].RegisterSpace = 1 + i;
@@ -1015,7 +1016,7 @@ void Init()
     params[2].DescriptorTable.pDescriptorRanges = &range;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[3].DescriptorTable.NumDescriptorRanges = 2;
+    params[3].DescriptorTable.NumDescriptorRanges = 3;
     params[3].DescriptorTable.pDescriptorRanges = bindless;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_STATIC_SAMPLER_DESC samplers[4]{};
@@ -1083,6 +1084,9 @@ void Init()
     d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.stagingHeap.Get(), 1, g_r.srvStride));
     d->CopyDescriptorsSimple(2, Cpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride), Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride),
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    nullSrv.Texture3D.MipLevels = 1;
+    d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.srvHeap.Get(), kBindlessBase + 2, g_r.srvStride));
 
     InitPipelineLibrary(d);
     // Guest physical memory for the GPU, in place: vertex fetches read it
@@ -1262,23 +1266,24 @@ void SelectSurfaces(bool force)
 // while the texture is in use. Entries unused for a few frames (replaced or
 // dropped textures) go back to the free list; their resources are released
 // once the GPU is done with the frame that last used them.
-UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, bool cube);
+UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t kind);
 // Each thread remembers this frame's descriptors (eviction only takes ones unused for frames).
-UINT BindlessIndex(ID3D12Resource* resource, DXGI_FORMAT format, bool cube)
+// kind: 0 2D, 1 cube, 2 3D.
+UINT BindlessIndex(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t kind)
 {
-    const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(resource)) << 8 ^ uint64_t(format) << 1 ^ uint64_t(cube);
+    const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(resource)) << 8 ^ uint64_t(format) << 2 ^ uint64_t(kind);
     thread_local FrameMap<UINT> known;
     if (const UINT* index = known.Find(key, g_r.frame))
         return *index;
     std::lock_guard textureLock(g_textureMutex);
-    const UINT index = BindlessIndexLocked(resource, format, cube);
+    const UINT index = BindlessIndexLocked(resource, format, kind);
     known.Put(key, g_r.frame, index);
     return index;
 }
 
-UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, bool cube)
+UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t kind)
 {
-    const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(resource)) << 8 ^ uint64_t(format) << 1 ^ uint64_t(cube);
+    const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(resource)) << 8 ^ uint64_t(format) << 2 ^ uint64_t(kind);
     auto it = g_r.bindless.find(key);
     if (it != g_r.bindless.end())
     {
@@ -1294,16 +1299,21 @@ UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, bool cube
     else if (g_r.bindlessNext < kBindless)
         index = g_r.bindlessNext++;
     else
-        return cube ? 1u : 0u; // full: draw with a null texture
+        return kind; // full: draw with a null texture
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = format;
     srv.Shader4ComponentMapping = format == DXGI_FORMAT_BC4_UNORM
         ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, 0) // DXT5A: its one channel in all four
         : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    if (cube)
+    if (kind == 1)
     {
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
         srv.TextureCube.MipLevels = UINT(-1);
+    }
+    else if (kind == 2)
+    {
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        srv.Texture3D.MipLevels = UINT(-1);
     }
     else
     {
@@ -2831,6 +2841,85 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
 // Cube textures: six faces, each a padded 2D slice. Faces the title rendered
 // and resolved (dynamic reflections) are copied from their host textures every
 // frame; static faces are decoded once and re-decoded when their data changes.
+// A 3D texture, decoded on the CPU (DecodeTexture3D) and uploaded as RGBA8 when its contents change.
+ID3D12Resource* GetVolumeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
+{
+    TextureScope textureScope;
+    static LiveSwitch noVolumes("REGPU_NO_3D_TEXTURES"); // A/B: the white fallback
+    const uint32_t w = fetch.Width(), h = fetch.Height(), d = fetch.Depth();
+    if (noVolumes || w > 2048 || h > 2048 || d > 256 || !TextureFormatSupported(fetch.Format()))
+    {
+        NoteTextureFailure("3D texture not supported", fetch);
+        return nullptr;
+    }
+    CachedTexture& cached = g_r.volumes[TextureKey(fetch.Address(), fetch.Format(), w, h) ^ (uint64_t(d) << 52)];
+    if (cached.resource && cached.checkedFrame == g_r.frame)
+    {
+        format = cached.format;
+        return cached.resource.Get();
+    }
+    cached.checkedFrame = g_r.frame;
+    format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
+    const uint64_t hash = ContentHash(source, TextureSourceSize(fetch)) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Endian()) << 44);
+    if (cached.resource && cached.contentHash == hash)
+        return cached.resource.Get();
+    if (!cached.resource || cached.width != w || cached.height != h || cached.resource->GetDesc().DepthOrArraySize != d)
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        td.Width = w;
+        td.Height = h;
+        td.DepthOrArraySize = UINT16(d);
+        td.MipLevels = 1;
+        td.SampleDesc.Count = 1;
+        td.Format = format;
+        if (cached.resource)
+            Frame().garbage.push_back(std::move(cached.resource));
+        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                  IID_PPV_ARGS(&cached.resource)),
+            "CreateCommittedResource(3D)"); CountCreate("3D texture");
+        cached.width = w;
+        cached.height = h;
+        cached.format = format;
+    }
+    std::vector<uint8_t> rgba;
+    if (!DecodeTexture3D(fetch, rgba))
+        return nullptr;
+    const UINT rowPitch = (w * 4 + 255) & ~255u;
+    const UINT64 offset = RingAlloc(UINT64(rowPitch) * h * d, 512);
+    if (offset == ~0ull)
+    {
+        NoteTextureFailure("upload ring full (3D)", fetch);
+        return nullptr;
+    }
+    for (uint32_t z = 0; z < d; z++)
+        for (uint32_t y = 0; y < h; y++)
+            memcpy(Frame().ringCpu + offset + (UINT64(z) * h + y) * rowPitch, &rgba[(size_t(z) * h + y) * w * 4], size_t(w) * 4);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = cached.resource.Get();
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    C().list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+    dst.pResource = cached.resource.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.pResource = Frame().ring.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = offset;
+    src.PlacedFootprint.Footprint = { format, w, h, d, rowPitch };
+    C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    C().list->ResourceBarrier(1, &b);
+    cached.contentHash = hash;
+    return cached.resource.Get();
+}
+
 ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
 {
     TextureScope textureScope;
@@ -6375,11 +6464,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
         bool native = false;
         g_textureFailure[0] = 0;
-        ID3D12Resource* texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format, native);
+        const bool volume = fetch.Dimension() == 2;
+        ID3D12Resource* texture = cube ? GetCubeTexture(fetch, format) : volume ? GetVolumeTexture(fetch, format) : GetTexture(fetch, format, native);
         // Debug: REGPU_NO_LIVE_CUBE=1 binds the fallback for cubes the title rendered (live reflections).
         if (static LiveSwitch noLiveCube("REGPU_NO_LIVE_CUBE"); noLiveCube && cube && ResolvedFor(fetch))
             texture = nullptr;
-        const uint32_t index = texture ? BindlessIndex(texture, format, cube) : (cube ? 1u : 0u);
+        const uint32_t kind = cube ? 1u : volume ? 2u : 0u;
+        const uint32_t index = texture ? BindlessIndex(texture, format, kind) : kind;
         if (RendererTracing())
             CaptureTexture(fetch, slot, cube, texture != nullptr, index, native, g_textureFailure);
         // w: dimension (1 2D, 3 cube); bit 31 + bits 8-19: the fetch swizzle, applied in the
@@ -6397,7 +6488,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 if (sel == 0 || sel == 2)
                     swizzle ^= (sel ^ (2 - sel)) << (3 * c);
             }
-        pc->tinfo[slot][3] = (cube ? 3 : 1) | (onGpu ? (1u << 31) | (swizzle << 8) : 0);
+        pc->tinfo[slot][3] = (cube ? 3 : volume ? 2 : 1) | (onGpu ? (1u << 31) | (swizzle << 8) : 0);
         // Clamp X and Y (dword 0 bits 10-12, 13-15): 0 wrap, else clamp. Filter: dword 3 bits
         // 19-20 (mag): 0 point. With only one axis clamped (kerbs: clamped across, repeating
         // along) the wrapping sampler is used and the shader clamps that axis (bits 18, 19).
