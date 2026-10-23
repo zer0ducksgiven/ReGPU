@@ -57,7 +57,7 @@ bool RendererTileReplay(uint32_t surface, const int32_t first[4], const int32_t 
 // Each draw on its way to the renderer, with its window scissor (screen space): true when it is
 // a later tile's draw that the first tile drew (dropped). Keeps track of where the tile pass is.
 // `replay`: the draw is in a buffer the command processor found to be a later tile's replay.
-bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uint32_t initiator, bool replay);
+bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uint32_t initiator, bool replay, uint32_t dmaBase, uint32_t dmaSize);
 void RendererOcclusionBegin();
 bool RendererOcclusionEnd(uint32_t& samples);
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.

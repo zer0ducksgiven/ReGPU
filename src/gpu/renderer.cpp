@@ -3961,11 +3961,11 @@ static LiveSwitch g_noForeignTile("REGPU_NO_FOREIGN_TILE"); // A/B for the paint
 // drawn tile by tile as before.
 // A resolve keeps its clear inside the first tile (ReGPU otherwise extends a full-width clear down
 // the surface for the next tile, which wiped what the first tile drew there).
-// EXPERIMENTAL, off by default (REGPU_TILE_MERGE=1 turns it on): PGR4 races ~63 -> ~85 fps, menus
-// ~75 -> ~96. Still wrong: in the race one road marking in the bottom third comes out dark (a
-// dropped later-tile draw the widened first tile does not reproduce: REGPU_TILE_MERGE_KEEP=1
-// keeps them and the picture matches), and the profile menu shows a small black speck. Debug:
-// REGPU_TRACE_TILE_PHASE, REGPU_TRACE_TILE_WIDEN, REGPU_TILE_MERGE_KEEP, REGPU_TILE_MERGE_DROP_RESOLVES.
+// A later tile drops only draws the first tile drew (by DrawKey): tiles can differ.
+// On by default; REGPU_NO_TILE_MERGE=1 draws every tile (A/B). Checked pixel for pixel on PGR4's
+// race (paused) and by eye on its menus. Not with the draw thread (gpu.cpp). Debug:
+// REGPU_TRACE_TILE_PHASE, REGPU_TRACE_TILE_WIDEN, REGPU_TILE_MERGE_KEEP, REGPU_TILE_MERGE_DROP_RESOLVES,
+// out/tile_keep.txt "from to" (later-tile draws to keep, for bisecting).
 namespace TileMerge
 {
 struct Entry
@@ -3985,8 +3985,23 @@ std::mutex g_mutex;
 
 bool Enabled()
 {
-    static LiveSwitch on("REGPU_TILE_MERGE");
-    return on;
+    static LiveSwitch off("REGPU_NO_TILE_MERGE");
+    return !off;
+}
+
+// What a draw draws: its primitive, indices and the shaders' first vertex buffer and textures
+// (fetch constants), so a later tile's copy of a first-tile draw can be recognised.
+uint64_t DrawKey(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    auto mix = [&](uint32_t v) { h = (h ^ v) * 0x100000001B3ull; };
+    mix(initiator);
+    mix(dmaBase);
+    mix(dmaSize);
+    for (uint32_t r = 0x4800; r < 0x4800 + 8 * 6; r++) // fetch constants of the first 8 slots
+        mix(gpureg::Get(r));
+    mix(gpureg::Get(0x2180)); // SQ_PROGRAM_CNTL
+    return h;
 }
 
 // Where the current tile pass is (the command processor's thread): the surface, whether the
@@ -3997,6 +4012,9 @@ struct Phase
     bool firstResolved = false, inLater = false;
     bool laterResolved[4]{};
     int current = -1; // the tile running: 0 the first, 1.. the later ones
+    // The first tile's draws (before its first resolve), by what they draw: a later tile drops only
+    // these. Tiles can differ (PGR4's race: the second tile had one draw more, a road marking).
+    std::unordered_multiset<uint64_t> drawn;
     uint32_t counts[4]{}; // REGPU_TRACE_TILES: first tile before / after its first resolve, later tiles the same
     uint32_t bases[2]{};  // REGPU_TRACE_TILES: colour | depth EDRAM bases of the first and the later tiles' last draws
 };
@@ -6108,7 +6126,7 @@ uint64_t RendererFenceSubmit() { return FenceSubmitImpl(); }
 
 void RendererScreenScissor(int32_t rect[4]) { ScreenScissor(rect); }
 
-bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uint32_t initiator, bool replay)
+bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uint32_t initiator, bool replay, uint32_t dmaBase, uint32_t dmaSize)
 {
     static LiveSwitch tracePhase("REGPU_TRACE_TILE_PHASE"); // the tile pass's resolves and draw counts
     TileMerge::Phase& p = TileMerge::g_phase;
@@ -6138,6 +6156,8 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
             }
             p.current = 0;
             p.counts[p.firstResolved ? 1 : 0]++;
+            if (!p.firstResolved && !resolve)
+                p.drawn.insert(TileMerge::DrawKey(initiator, dmaBase, dmaSize));
             p.bases[0] = (gpureg::Get(RB_COLOR_INFO) & 0xFFF) << 16 | (gpureg::Get(RB_DEPTH_INFO) & 0xFFF);
             if (resolve)
             {
@@ -6172,7 +6192,32 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
                     return false;
                 }
                 static LiveSwitch keep("REGPU_TILE_MERGE_KEEP"); // debug: widen the first tile, keep the others' draws
-                return !p.laterResolved[i] && !keep;
+                // Debug (bisecting a draw that must stay): out/tile_keep.txt "from to" keeps the later
+                // tile's draws with those numbers (re-read every 60 frames).
+                static uint32_t keepFrom = 0, keepTo = 0;
+                static uint64_t keepRead = 0;
+                if (g_r.frame >= keepRead + 60)
+                {
+                    keepRead = g_r.frame;
+                    keepFrom = keepTo = 0;
+                    if (FILE* f = fopen("out/tile_keep.txt", "r"))
+                    {
+                        if (fscanf(f, "%u %u", &keepFrom, &keepTo) != 2)
+                            keepFrom = keepTo = 0;
+                        fclose(f);
+                    }
+                }
+                const uint32_t number = p.counts[2] - 1;
+                if (number >= keepFrom && number < keepTo)
+                    return false;
+                if (p.laterResolved[i] || keep)
+                    return false;
+                // Drawn by the first tile: dropped (each first-tile draw stands for one later one).
+                const auto it = p.drawn.find(TileMerge::DrawKey(initiator, dmaBase, dmaSize));
+                if (it == p.drawn.end())
+                    return false;
+                p.drawn.erase(it);
+                return true;
             }
     }
     // A resolve with a scissor of its own during the pass (PGR4's menus resolve the scene mid-pass

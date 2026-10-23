@@ -379,7 +379,7 @@ void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         int32_t rect[4];
         RendererScreenScissor(rect);
-        g_gpu.dropDraws = !work::Active() && RendererTileDrop(gpureg::Get(0x2000 /* RB_SURFACE_INFO */), rect, RendererIsResolveDraw(), initiator, g_gpu.inReplay);
+        g_gpu.dropDraws = !work::Active() && RendererTileDrop(gpureg::Get(0x2000 /* RB_SURFACE_INFO */), rect, RendererIsResolveDraw(), initiator, g_gpu.inReplay, dmaBase, dmaSize);
     }
     if (g_gpu.dropDraws)
     {
