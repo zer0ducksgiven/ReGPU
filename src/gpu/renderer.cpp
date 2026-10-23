@@ -242,7 +242,9 @@ constexpr UINT kMaxSurfaces = 64; // EDRAM bases with host surfaces
 // read them use multisampled shaders when this is above 1.
 uint32_t g_msaa = 1;
 constexpr uint32_t RB_SURFACE_INFO = 0x2000, RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
-constexpr uint32_t kDirectFetchBytes = 16 * 1024; // buffers that change (UI quads, particles) are all under 3 KB (REGPU_TRACE_MIDSIZE); REGPU_DIRECT_FETCH_KB overrides
+// Buffers that change (UI quads, particles) are all under 3 KB (REGPU_TRACE_MIDSIZE); REGPU_DIRECT_FETCH_KB
+// overrides. (16 KB while fences were written at record time; since they wait for the host GPU, 4 KB.)
+constexpr uint32_t kDirectFetchBytes = 4 * 1024;
 
 // Registers.
 constexpr uint32_t RB_STENCILREFMASK = 0x210D;

@@ -28,6 +28,8 @@ using Clock = std::chrono::steady_clock;
 #include "gpu/renderer.h"
 #include "precise_sleep.h"
 
+extern HANDLE g_profiledWorker; // renderer.cpp
+
 namespace
 {
 // GPU registers are memory-mapped at 0x7FC80000 in guest space.
@@ -403,6 +405,9 @@ void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 void WorkerLoop()
 {
     SetThreadDescription(GetCurrentThread(), L"gpu draw worker");
+    // the port's sampler (PGR4_SAMPLE_THREAD=w) follows this thread
+    if (!g_profiledWorker)
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_profiledWorker, 0, FALSE, DUPLICATE_SAME_ACCESS);
     gpureg::t_file = work::g_file.data();
     for (;;)
     {
