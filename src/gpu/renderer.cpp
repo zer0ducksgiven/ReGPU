@@ -6743,7 +6743,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 if (sel == 0 || sel == 2)
                     swizzle ^= (sel ^ (2 - sel)) << (3 * c);
             }
-        pc->tinfo[slot][3] = (cube ? 3 : volume ? 2 : 1) | (onGpu ? (1u << 31) | (swizzle << 8) : 0);
+        // Built here and written once: the constants live in upload memory, which is slow to read back.
+        uint32_t ti[4]{};
+        float tb[4]{};
+        ti[3] = (cube ? 3 : volume ? 2 : 1) | (onGpu ? (1u << 31) | (swizzle << 8) : 0);
         // Clamp X and Y (dword 0 bits 10-12, 13-15): 0 wrap, else clamp. Filter: dword 3 bits
         // 19-20 (mag): 0 point. With only one axis clamped (kerbs: clamped across, repeating
         // along) the wrapping sampler is used and the shader clamps that axis (bits 18, 19).
@@ -6751,31 +6754,33 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         static LiveSwitch oldClamp("REGPU_OLD_CLAMP"); // A/B: X's mode for both axes (before the kerb fix)
         const bool clamp = oldClamp ? clampX != 0 : clampX != 0 && clampY != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
-        pc->tinfo[slot][0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
+        ti[0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
         if (!clamp && !oldClamp)
-            pc->tinfo[slot][0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
+            ti[0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
         // Clamp to border on both axes (modes 6, 7): the shader returns the border colour
         // outside the image (dword 5 bits 0-1: 1 white, else black).
         if (clampX >= 6 && clampY >= 6)
-            pc->tinfo[slot][0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
-        pc->tbias[slot][0] = fetch.LodBias();
-        memcpy(&pc->tbias[slot][1], &index, 4);
+            ti[0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
+        tb[0] = fetch.LodBias();
+        memcpy(&tb[1], &index, 4);
         // A resolved texture is as wide as the pitch it was resolved with; the fetch
         // constant may declare a narrower image inside it (e.g. 163 of 192 columns):
         // the shader scales UVs so 0..1 spans the declared image, not the padding.
-        pc->tbias[slot][2] = pc->tbias[slot][3] = 1.0f;
+        tb[2] = tb[3] = 1.0f;
         if (onGpu && resolvedPtr && !cube && resolvedPtr->width && resolvedPtr->height && resolvedPtr->resource)
         {
-            pc->tbias[slot][2] = std::min(1.0f, float(fetch.Width()) / float(resolvedPtr->width));
-            pc->tbias[slot][3] = std::min(1.0f, float(fetch.Height()) / float(resolvedPtr->height));
+            tb[2] = std::min(1.0f, float(fetch.Width()) / float(resolvedPtr->width));
+            tb[3] = std::min(1.0f, float(fetch.Height()) / float(resolvedPtr->height));
         }
-        pc->tinfo[slot][1] = fetch.Width();
-        pc->tinfo[slot][2] = fetch.Height();
+        ti[1] = fetch.Width();
+        ti[2] = fetch.Height();
         memcpy(memo.fetch, fetch.dwords, sizeof(memo.fetch));
         memo.frame = g_r.frame;
         memo.epoch = g_resolveEpoch;
-        memcpy(memo.tinfo, pc->tinfo[slot], sizeof(memo.tinfo));
-        memcpy(memo.tbias, pc->tbias[slot], sizeof(memo.tbias));
+        memcpy(memo.tinfo, ti, sizeof(memo.tinfo));
+        memcpy(memo.tbias, tb, sizeof(memo.tbias));
+        memcpy(pc->tinfo[slot], ti, sizeof(ti));
+        memcpy(pc->tbias[slot], tb, sizeof(tb));
         memo.samplesResolve = g_drawSamplesResolve;
         g_drawSamplesResolve |= samplesBefore;
     }
