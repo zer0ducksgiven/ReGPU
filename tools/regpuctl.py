@@ -76,7 +76,10 @@ def start(assignments):
     if not game:
         print(json.dumps({'ok': False, 'error': 'set REGPU_GAME to the game executable'}))
         return 1
-    p = subprocess.Popen([game], cwd=os.path.dirname(os.path.abspath(game)), env=env, stdout=log, stderr=log,
+    # REGPU_GAME_ARGS: its command-line arguments; REGPU_GAME_CWD: where to run it (default: beside it).
+    args = os.environ.get('REGPU_GAME_ARGS', '').split()
+    cwd = os.environ.get('REGPU_GAME_CWD') or os.path.dirname(os.path.abspath(game))
+    p = subprocess.Popen([os.path.abspath(game)] + args, cwd=cwd, env=env, stdout=log, stderr=log,
                          creationflags=flags)
     for _ in range(120):
         time.sleep(0.5)
