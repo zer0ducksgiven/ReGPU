@@ -6320,7 +6320,50 @@ void RendererOcclusionBegin()
     g_occlusionOpen = true;
 }
 
+bool OcclusionEndImpl(uint32_t& samples);
+namespace
+{
+namespace Unstable
+{
+bool On();
+extern uint32_t g_logged;
+}
+}
+
+// REGPU_TRACE_UNSTABLE: a query's answer that turns from hidden to visible or back between frames
+// (no result yet counts as visible: the caller answers 1000 samples).
 bool RendererOcclusionEnd(uint32_t& samples)
+{
+    const UINT order = g_occlusionOrder;
+    const bool open = g_occlusionOpen;
+    const bool known = OcclusionEndImpl(samples);
+    if (open && Unstable::On())
+    {
+        // By order in the frame and frame parity: -1 no result yet, 0 hidden, 1 visible.
+        static std::vector<int> lastByParity[2];
+        static std::vector<uint64_t> frameByParity[2];
+        auto& last = lastByParity[g_r.frame & 1];
+        auto& lastFrame = frameByParity[g_r.frame & 1];
+        if (last.size() <= order)
+        {
+            last.resize(order + 1, -2);
+            lastFrame.resize(order + 1, 0);
+        }
+        const int now = known ? (samples > 0 ? 1 : 0) : -1;
+        if (last[order] != -2 && last[order] != now && lastFrame[order] + 2 == g_r.frame && Unstable::g_logged < 400)
+        {
+            Unstable::g_logged++;
+            Log("unstable: frame %llu occlusion query %u: %s -> %s (%u samples)", (unsigned long long)g_r.frame, order,
+                last[order] < 0 ? "no result (visible)" : last[order] ? "visible" : "hidden",
+                now < 0 ? "no result (visible)" : now ? "visible" : "hidden", known ? samples : 0);
+        }
+        last[order] = now;
+        lastFrame[order] = g_r.frame;
+    }
+    return known;
+}
+
+bool OcclusionEndImpl(uint32_t& samples)
 {
     if (!g_occlusionOpen)
         return false;
@@ -6460,6 +6503,99 @@ void Section(int i)
         g_frameEvents.section[i - 1] += seconds * 1000.0;
     }
     g_perf.mark = now;
+}
+
+// REGPU_TRACE_UNSTABLE=1: draws whose inputs are the same as in the frame before but for which the
+// renderer decided differently (where the vertices came from, the index list, the textures bound,
+// the pipeline, the scissor, a merged tile). In a paused game every frame is the same, so anything
+// logged is a decision that flips by itself: the flickering geometry hunt (a tower or a wall of vents
+// in PGR4's sky for a frame). Also logs a change in the number of draws.
+namespace Unstable
+{
+enum Part : uint32_t { kVertices, kIndices, kTextures, kPipeline, kScissor, kTile, kParts };
+const char* const kPartNames[kParts] = { "vertices", "indices", "textures", "pipeline", "scissor", "tile merge" };
+struct Draw
+{
+    uint64_t input = 0;
+    uint64_t part[kParts]{};
+    uint64_t vsHash = 0, psHash = 0;
+    uint32_t initiator = 0, firstVertexFetch = 0;
+};
+// The two frames before (titles alternate work between frames: reflection faces, PGR4's paused
+// race has 4390 and 4358 draws in turn), so a frame is compared with the one two back.
+std::vector<Draw> g_older, g_previous, g_current;
+uint64_t g_frame = ~0ull;
+uint32_t g_logged = 0;
+
+bool On()
+{
+    static LiveSwitch on("REGPU_TRACE_UNSTABLE");
+    // A fresh log budget each time it is switched on.
+    static bool was = false;
+    if (on && !was)
+    {
+        g_logged = 0;
+        g_older.clear();
+        g_previous.clear();
+        g_current.clear();
+        g_frame = ~0ull;
+    }
+    was = on;
+    return on;
+}
+
+uint64_t Mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001B3ull; }
+
+// What the draw is given: its packet and every register a draw reads (shaders, fetch and ALU
+// constants, render state).
+uint64_t InputKey(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, uint64_t vsHash, uint64_t psHash)
+{
+    uint64_t h = Mix(Mix(Mix(Mix(Mix(0xCBF29CE484222325ull, initiator), dmaBase), dmaSize), vsHash), psHash);
+    for (uint32_t r = 0x2000; r < 0x2400; r++) // render state
+        if (r != 0x2080) // (PA_SC_WINDOW_OFFSET: a merged tile's differs by design)
+            h = Mix(h, gpureg::Get(r));
+    for (uint32_t r = 0x4000; r < 0x4980; r++) // ALU and fetch constants
+        h = Mix(h, gpureg::Get(r));
+    return h;
+}
+
+// At each draw: a new frame compares the last one with the one before.
+void Begin()
+{
+    if (g_frame == g_r.frame)
+        return;
+    if (g_frame != ~0ull)
+    {
+        const std::vector<Draw>& base = g_older; // two frames back
+        if (!base.empty() && base.size() != g_current.size() && g_logged < 400)
+        {
+            g_logged++;
+            Log("unstable: frame %llu has %zu draws, two frames before %zu", (unsigned long long)g_frame, g_current.size(), base.size());
+        }
+        else if (!base.empty() && base.size() == g_current.size())
+        {
+            uint32_t inFrame = 0;
+            for (size_t i = 0; i < g_current.size() && g_logged < 400; i++)
+            {
+                const Draw &a = base[i], &b = g_current[i];
+                if (a.input != b.input)
+                    continue; // given something else: not ours
+                for (uint32_t k = 0; k < kParts; k++)
+                    if (a.part[k] != b.part[k] && inFrame++ < 12)
+                    {
+                        g_logged++;
+                        Log("unstable: frame %llu draw %zu (vs %016llx ps %016llx, initiator %08X, vertex fetch %08X): same input, %s differ (%016llx -> %016llx)",
+                            (unsigned long long)g_frame, i, (unsigned long long)b.vsHash, (unsigned long long)b.psHash, b.initiator, b.firstVertexFetch,
+                            kPartNames[k], (unsigned long long)a.part[k], (unsigned long long)b.part[k]);
+                    }
+            }
+        }
+    }
+    std::swap(g_older, g_previous);
+    std::swap(g_previous, g_current);
+    g_current.clear();
+    g_frame = g_r.frame;
+}
 }
 
 // REGPU_PERF: the constants section split further (Sub(k) ends part k), logged with the rest.
@@ -7235,6 +7371,46 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             if (ms > 1.0)
                 Log("perf: SetPipelineState took %.1f ms (vs %016llx ps %016llx)", ms, (unsigned long long)C().vsHash, (unsigned long long)C().psHash);
         }
+    }
+    if (Unstable::On())
+    {
+        using namespace Unstable;
+        Begin();
+        Draw d;
+        d.vsHash = C().vsHash;
+        d.psHash = C().psHash;
+        d.initiator = initiator;
+        d.firstVertexFetch = gpureg::Get(gpureg::FetchConstants);
+        d.input = InputKey(initiator, dmaBase, dmaSize, d.vsHash, d.psHash);
+        uint64_t h = 0xCBF29CE484222325ull;
+        for (uint32_t k : vs.info.vertexFetchConstants)
+        {
+            // In place: its address. Copied: that it was (the ring offset moves every frame) and
+            // what was copied.
+            const uint32_t d1 = gpureg::Get(gpureg::FetchConstants + k * 2 + 1), bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
+            const uint32_t address = gpureg::Get(gpureg::FetchConstants + k * 2) & 0xFFFFFFFC;
+            h = Mix(Mix(h, k), vc->vf[k][2]);
+            h = Mix(h, vc->vf[k][2] ? vc->vf[k][0] : ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), std::min<uint32_t>(bytes, 1u << 20), 64));
+        }
+        d.part[kVertices] = h;
+        d.part[kIndices] = Mix(Mix(Mix(Mix(0, indexedCount), indexView.BufferLocation), uint64_t(reinterpret_cast<uintptr_t>(indexEntry))),
+            indexEntry ? indexEntry->offset : 0);
+        h = 0;
+        for (uint32_t m = ps.info.usedTextureSlots | vs.info.usedTextureSlots; m; m &= m - 1)
+        {
+            const uint32_t slot = uint32_t(__builtin_ctz(m));
+            uint64_t t[4];
+            memcpy(t, pc->tinfo[slot], 16);
+            memcpy(t + 2, pc->tbias[slot], 16);
+            for (uint64_t v : t)
+                h = Mix(h, v);
+        }
+        d.part[kTextures] = h;
+        d.part[kPipeline] = uint64_t(reinterpret_cast<uintptr_t>(pso));
+        d.part[kScissor] = Mix(Mix(Mix(Mix(0, uint64_t(hostScissor.left)), uint64_t(hostScissor.top)), uint64_t(hostScissor.right)), uint64_t(hostScissor.bottom)) ^
+            uint64_t(std::bit_cast<uint32_t>(vp.TopLeftY)) << 32;
+        d.part[kTile] = TileMerge::t_widened;
+        g_current.push_back(d);
     }
     {
         const size_t vsFrom = hooked ? 0 : offsetof(VSConstants, b), psFrom = offsetof(PSConstants, b);
