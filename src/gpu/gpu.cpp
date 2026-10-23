@@ -1589,7 +1589,9 @@ GUEST_EXPORT(VdSwap)
                 if (now != seen)
                     logged = false;
                 seen = now;
-                if (still >= 10 && !logged && regpu::GetHost().logThreadStacks)
+                // (Only once the title presents steadily: the first swaps are followed by loading and
+                // a shader cache rebuild, minutes without a swap.)
+                if (still >= 10 && now >= 600 && !logged && regpu::GetHost().logThreadStacks)
                 {
                     logged = true;
                     Log("hang: no VdSwap for 10 s (last #%llu)", (unsigned long long)now);
