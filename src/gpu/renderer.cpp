@@ -976,6 +976,53 @@ ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RES
     return r;
 }
 
+// Whether the GPU sees guest memory through the placed buffer over it. A driver can open the heap
+// and still not alias it (vkd3d-proton on RADV: the calls succeed and the GPU reads zeros, so
+// in-place vertex fetches draw nothing): a value written by the CPU is copied out by the GPU and
+// compared. The block is ours (Host::alloc), not memory the title may be using.
+bool PhysicalHeapAliasesGuest(ID3D12Device* d, ID3D12Resource* physical)
+{
+    const uint32_t address = RegpuGuestAlloc(Heap::Physical, 4096, 4096);
+    if (!address)
+        return true; // nothing to test with: trust the mapping, as before
+    uint32_t pattern[4];
+    for (uint32_t i = 0; i < 4; i++)
+        pattern[i] = 0x9E3779B9u * (i + 1) ^ uint32_t(GetTickCount64()) ^ address;
+    memcpy(GuestPtr<uint8_t>(address), pattern, sizeof(pattern));
+
+    ComPtr<ID3D12Resource> readback = CreateBuffer(256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;
+    if (FAILED(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list))) ||
+        FAILED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
+        return true;
+    list->CopyBufferRegion(readback.Get(), 0, physical, address & 0x1FFFFFFF, sizeof(pattern));
+    list->Close();
+    ID3D12CommandList* lists[] = { list.Get() };
+    g_r.queue->ExecuteCommandLists(1, lists);
+    const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_r.queue->Signal(fence.Get(), 1);
+    fence->SetEventOnCompletion(1, event);
+    WaitForSingleObject(event, 5000);
+    CloseHandle(event);
+    if (fence->GetCompletedValue() < 1)
+        return false; // the copy never finished: don't read through this heap
+    uint32_t seen[4] = {};
+    void* mapped = nullptr;
+    const D3D12_RANGE range{ 0, sizeof(seen) };
+    if (SUCCEEDED(readback->Map(0, &range, &mapped)))
+    {
+        memcpy(seen, mapped, sizeof(seen));
+        readback->Unmap(0, nullptr);
+    }
+    if (memcmp(seen, pattern, sizeof(pattern)) == 0)
+        return true;
+    Log("renderer: guest memory self-test at %08X wrote %08X %08X, the GPU read %08X %08X", address, pattern[0], pattern[1], seen[0], seen[1]);
+    return false;
+}
+
 // Depth resolves: a depth-stencil buffer can only be copied whole, so the
 // resolve rectangle is drawn into an R32_FLOAT texture by a tiny pass that
 // reads the depth buffer at the same pixel.
@@ -1260,6 +1307,14 @@ void Init()
             Log("renderer: placing the guest memory buffer failed %08X", unsigned(hr));
             g_r.physical.Reset();
         }
+    }
+    // The calls can succeed on a driver that doesn't alias the memory (vkd3d-proton on RADV): test it.
+    // REGPU_NO_HEAP_SELFTEST=1 trusts the mapping (A/B).
+    if (g_r.physical && !getenv("REGPU_NO_HEAP_SELFTEST") && !PhysicalHeapAliasesGuest(d, g_r.physical.Get()))
+    {
+        Log("renderer: the GPU does not see guest memory through the mapped heap; vertex data is copied instead");
+        g_r.physical.Reset();
+        g_r.physicalHeap.Reset();
     }
     Log("renderer: guest memory %s", g_r.physical ? "mapped for the GPU (zero-copy vertex fetch)" : "not mappable; vertex data is copied");
 
