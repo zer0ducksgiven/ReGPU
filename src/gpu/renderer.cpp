@@ -452,6 +452,11 @@ struct Renderer
 };
 
 Renderer g_r;
+std::atomic<uint32_t> g_lastFrameDraws{ 0 }; // the debug server's status
+}
+uint32_t RendererLastFrameDraws() { return g_lastFrameDraws.load(std::memory_order_relaxed); }
+namespace
+{
 
 // Shared caches used by draws on several threads (see DrawContext).
 std::recursive_mutex g_shaderMutex;  // shaders, pipelines, the compiler's maps
@@ -8191,6 +8196,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (frameNumber % 600 == 0)
         Log("renderer: frame %llu: %u draws, %u skipped, %zu shaders, %zu pipelines, %zu textures", (unsigned long long)frameNumber,
             g_r.drawsThisFrame.load(), g_r.skippedThisFrame.load(), g_r.shaders.size(), g_r.pipelines.size(), g_r.textures.size());
+    g_lastFrameDraws.store(g_r.drawsThisFrame.load(), std::memory_order_relaxed);
     g_r.drawsThisFrame = g_r.skippedThisFrame = 0;
     g_r.frameIndex = (g_r.frameIndex + 1) % kFrames;
 }
