@@ -4908,12 +4908,12 @@ void Resolve()
         const uint32_t info = gpureg::Get(RB_COPY_DEST_INFO);
         const bool depth = sourceSelect == 4;
         const uint32_t destFormat = (info >> 7) & 0x3F;
-        // Guest bytes per pixel (Xenos colour formats: k_8 2, 16-bit 3-5/10/15/24, 64-bit 26/32/37, 128-bit 34/38).
+        // Guest bytes per pixel (Xenos formats: k_8 2, 16-bit 3-5/10/15/24/30, 64-bit 26/32/34/37, 128-bit 35/38).
         const uint32_t guestBpp = depth ? 4
             : destFormat == 2 ? 1
-            : (destFormat >= 3 && destFormat <= 5) || destFormat == 10 || destFormat == 15 || destFormat == 24 ? 2
-            : destFormat == 26 || destFormat == 32 || destFormat == 37 ? 8
-            : destFormat == 34 || destFormat == 38 ? 16 : 4;
+            : (destFormat >= 3 && destFormat <= 5) || destFormat == 10 || destFormat == 15 || destFormat == 24 || destFormat == 30 ? 2
+            : destFormat == 26 || destFormat == 32 || destFormat == 34 || destFormat == 37 ? 8
+            : destFormat == 35 || destFormat == 38 ? 16 : 4;
         // The tile's rows are pitch * guestBpp bytes each (PGR4's 2xMSAA HDR scene, k_16_16_16_16_FLOAT,
         // put its lower tile in a separate image at 4 bytes a pixel: the bottom third came out black).
         static LiveSwitch noTileBpp("REGPU_NO_TILE_BPP"); // A/B: rows of 4 bytes a pixel, as before
