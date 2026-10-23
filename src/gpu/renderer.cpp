@@ -2181,7 +2181,10 @@ struct ShaderCompiler
         // Runtime compiles skip optimisation: fxc can take minutes on the
         // larger translated shaders.
         const auto start = std::chrono::steady_clock::now();
-        const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, nullptr, nullptr, "main",
+        // The translated source picks its sampling form per stage (see hlsl.cpp: a vertex
+        // shader cannot sample with an implicit LOD).
+        const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
+        const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, cs.pixel ? nullptr : vertexStage, nullptr, "main",
             cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         if (FAILED(hr))

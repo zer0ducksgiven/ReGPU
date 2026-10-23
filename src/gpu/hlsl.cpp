@@ -198,9 +198,19 @@ float3 CubeDirection(float3 stf)
 
 float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel);
 
-// Fetch swizzle (3 bits per channel: 0-3 component, 4 zero, 5 one) for
-// textures that live on the GPU; CPU-decoded textures are swizzled already.
-// texel: the instruction's texel offset (PCF taps in shadow filters), in texels.
+// Sampling with a LOD bias is a pixel-shader-only operation: a vertex shader cannot compute an
+// implicit LOD, and dxc rejects the module outright ("sampling with implicit lod is only allowed
+// in fragment and compute shaders"), where fxc merely ignored the dead branch. The translator
+// emits the same source for both stages, so the stage picks the form here. A macro, not a
+// function: a call in the fetch path keeps fxc from inlining and costs half the frame rate.
+#ifdef REGPU_VERTEX_STAGE
+#define REGPU_SAMPLE_BIAS_2D(t, s, uv, bias) ((t).SampleLevel((s), (uv), max((bias), 0)))
+#define REGPU_SAMPLE_BIAS_CUBE(t, s, dir, bias) ((t).SampleLevel((s), (dir), max((bias), 0)))
+#else
+#define REGPU_SAMPLE_BIAS_2D(t, s, uv, bias) ((t).SampleBias((s), (uv), (bias)))
+#define REGPU_SAMPLE_BIAS_CUBE(t, s, dir, bias) ((t).SampleBias((s), (dir), (bias)))
+#endif
+
 float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
 {
     float4 v = TFetchRaw(slot, coord, denorm, vertexStage, bias, texel);
@@ -237,7 +247,7 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     if ((tinfo[slot].w & 0xFFu) == 3)
     {
         float3 dir = CubeDirection(coord);
-        return vertexStage ? tc.SampleLevel(sLinearClamp, dir, max(bias, 0)) : tc.SampleBias(sLinearClamp, dir, bias);
+        return vertexStage ? tc.SampleLevel(sLinearClamp, dir, max(bias, 0)) : REGPU_SAMPLE_BIAS_CUBE(tc, sLinearClamp, dir, bias);
     }
     float2 uv = coord.xy;
     const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
@@ -255,10 +265,10 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     uint mode = tinfo[slot].x & 3u;
     if (vertexStage)
         return t.SampleLevel(sLinearClamp, uv, max(bias, 0));
-    if (mode == 1) return t.SampleBias(sLinearClamp, uv, bias);
-    if (mode == 2) return t.SampleBias(sPointClamp, uv, bias);
-    if (mode == 3) return t.SampleBias(sPointWrap, uv, bias);
-    return t.SampleBias(sLinearWrap, uv, bias);
+    if (mode == 1) return REGPU_SAMPLE_BIAS_2D(t, sLinearClamp, uv, bias);
+    if (mode == 2) return REGPU_SAMPLE_BIAS_2D(t, sPointClamp, uv, bias);
+    if (mode == 3) return REGPU_SAMPLE_BIAS_2D(t, sPointWrap, uv, bias);
+    return REGPU_SAMPLE_BIAS_2D(t, sLinearWrap, uv, bias);
 }
 
 float4 CubeOp(float4 a, float4 b)
