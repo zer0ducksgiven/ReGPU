@@ -2342,6 +2342,18 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     if (!cs.info.ok)
     {
         Log("renderer: %s %016llx not translated: %s", pixel ? "ps" : "vs", (unsigned long long)hash, cs.info.error.c_str());
+        // REGPU_DUMP_SHADERS: keep the microcode too, so a missing instruction can be looked
+        // at with tools/xenos_dis (the on-load dump only covers shaders that get this far).
+        static const bool dumpShaders = getenv("REGPU_DUMP_SHADERS") != nullptr;
+        if (dumpShaders)
+        {
+            const auto dir = RegpuUserDir() / "shaders";
+            std::filesystem::create_directories(dir);
+            char name[64];
+            snprintf(name, sizeof(name), "fail_%s_%016llx.bin", pixel ? "ps" : "vs", (unsigned long long)hash);
+            std::ofstream(dir / name, std::ios::binary)
+                .write(reinterpret_cast<const char*>(cs.ucodeBE.data()), std::streamsize(cs.ucodeBE.size() * 4));
+        }
         cs.state = CompiledShader::Failed;
         return cs;
     }
@@ -5037,6 +5049,10 @@ std::vector<LookItem> g_look;
 std::unordered_set<PipelineKey, PipelineKeyHash> g_lookKeys;
 uint64_t g_predVs = 0, g_predPs = 0;
 const uint32_t *g_predVsCode = nullptr, *g_predPsCode = nullptr;
+// Microcode read from guest memory, copied when the prediction is made: the pointer can
+// point into memory the guest rewrites before the predicted draw is looked at, and then the
+// bytes would no longer match the hash taken at the same moment.
+std::shared_ptr<std::vector<uint32_t>> g_predVsOwn, g_predPsOwn;
 uint32_t g_predVsDwords = 0, g_predPsDwords = 0;
 size_t g_lookNext = 0;
 uint32_t g_lookStarted = 0, g_lookFinished = 0;
@@ -5123,6 +5139,12 @@ void DrainScan(double budgetMs, std::vector<const CompiledShader*>* queued = nul
             return;
         for (ScannedShader& s : found)
         {
+            // The scanner accepts a candidate on control flow alone, and some of what it finds in
+            // the mesh files is not a shader (ucode::Plausible: an opcode the ISA doesn't define,
+            // or instructions past the end). Warming one costs a background compile and logs a
+            // translation failure for a hash no draw will ever use.
+            if (!ucode::Plausible(ucode::Parse(s.code.data(), uint32_t(s.code.size()), s.pixel)))
+                continue;
             const uint64_t hash = Fnv(s.code.data(), s.code.size() * 4) ^ (s.pixel ? 1 : 0);
             g_scanKnown.insert(hash);
             // Speculative (and partly stale memory): compiled when nothing urgent waits,
@@ -5242,6 +5264,8 @@ void PredictBeginImpl()
     g_predPs = C().psHash;
     g_predVsCode = C().vsCode.data();
     g_predPsCode = C().psCode.data();
+    g_predVsOwn.reset(); // the command list's own copy stays valid
+    g_predPsOwn.reset();
     g_predVsDwords = uint32_t(C().vsCode.size());
     g_predPsDwords = uint32_t(C().psCode.size());
 }
@@ -5643,19 +5667,21 @@ void RendererPredictBegin()
 void RendererPredictShader(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
     dwords = ucode::UsedDwords(microcodeBE, dwords);
-    const uint64_t hash = Fnv(microcodeBE, dwords * 4) ^ type;
-    if (type == 0)
-    {
-        g_predVs = hash;
-        g_predVsCode = microcodeBE;
-        g_predVsDwords = dwords;
-    }
-    else
-    {
-        g_predPs = hash;
-        g_predPsCode = microcodeBE;
-        g_predPsDwords = dwords;
-    }
+    auto& hash = type == 0 ? g_predVs : g_predPs;
+    auto& code = type == 0 ? g_predVsCode : g_predPsCode;
+    auto& own = type == 0 ? g_predVsOwn : g_predPsOwn;
+    auto& count = type == 0 ? g_predVsDwords : g_predPsDwords;
+    hash = 0;
+    count = 0;
+    own.reset();
+    // The signal can name a shader the command processor has not loaded yet, so the
+    // microcode may still be uninitialised or already reused: only predict one that decodes.
+    if (!dwords || !ucode::Plausible(ucode::Parse(microcodeBE, dwords, type != 0)))
+        return;
+    hash = Fnv(microcodeBE, dwords * 4) ^ type;
+    own = std::make_shared<std::vector<uint32_t>>(microcodeBE, microcodeBE + dwords);
+    code = own->data();
+    count = dwords;
 }
 
 void RendererPredictDraw(uint32_t initiator)
@@ -5669,9 +5695,9 @@ void RendererPredictDraw(uint32_t initiator)
         return;
     LookItem item{ key, nullptr, nullptr, nullptr, false };
     if (!g_r.shaders.count(g_predVs))
-        item.vsCode = std::make_shared<std::vector<uint32_t>>(g_predVsCode, g_predVsCode + g_predVsDwords);
+        item.vsCode = g_predVsOwn ? g_predVsOwn : std::make_shared<std::vector<uint32_t>>(g_predVsCode, g_predVsCode + g_predVsDwords);
     if (!g_r.shaders.count(g_predPs))
-        item.psCode = std::make_shared<std::vector<uint32_t>>(g_predPsCode, g_predPsCode + g_predPsDwords);
+        item.psCode = g_predPsOwn ? g_predPsOwn : std::make_shared<std::vector<uint32_t>>(g_predPsCode, g_predPsCode + g_predPsDwords);
     g_look.push_back(std::move(item));
 }
 
@@ -7748,6 +7774,11 @@ void PrecompileAll()
         BootPresent(bootFrame);
     for (const regpu::ScannedShader& s : host.staticShaders())
     {
+        // The scanner accepts a candidate on control flow alone, and a few of what it finds in
+        // the mesh files is not a shader (ucode::Plausible). Translating one fails on an opcode
+        // the ISA doesn't define, after paying a translation on every boot.
+        if (!ucode::Plausible(ucode::Parse(s.code.data(), uint32_t(s.code.size()), s.pixel)))
+            continue;
         const uint64_t hash = Fnv(s.code.data(), s.code.size() * 4) ^ (s.pixel ? 1 : 0);
         if (g_r.shaders.count(hash))
             continue;
