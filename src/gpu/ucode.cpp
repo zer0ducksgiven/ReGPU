@@ -120,6 +120,29 @@ uint32_t UsedDwords(const uint32_t* microcodeBE, uint32_t dwords)
 const char* VectorOpName(uint32_t op) { return kVectorOps[op & 31]; }
 const char* ScalarOpName(uint32_t op) { return kScalarOps[op & 63]; }
 
+bool Plausible(const Shader& shader)
+{
+    if (!shader.valid)
+        return false;
+    for (const Cf& cf : shader.cf)
+    {
+        if (!cf.IsExec())
+            continue;
+        for (uint32_t k = 0; k < cf.count(); k++)
+        {
+            const uint32_t index = cf.address() + k;
+            if (index * 3 + 2 >= shader.words.size())
+                return false;
+            if ((cf.sequence() >> (2 * k)) & 1)
+                continue; // vertex fetch: no opcode to check
+            const Alu a = DecodeAlu(&shader.words[index * 3]);
+            if (kVectorOps[a.vectorOp][0] == '?' || kScalarOps[a.scalarOp][0] == '?')
+                return false;
+        }
+    }
+    return true;
+}
+
 Shader Parse(const uint32_t* microcodeBE, uint32_t dwords, bool pixel)
 {
     Shader shader;

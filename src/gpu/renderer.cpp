@@ -452,6 +452,11 @@ struct Renderer
 };
 
 Renderer g_r;
+std::atomic<uint32_t> g_lastFrameDraws{ 0 }; // the debug server's status
+}
+uint32_t RendererLastFrameDraws() { return g_lastFrameDraws.load(std::memory_order_relaxed); }
+namespace
+{
 
 // Shared caches used by draws on several threads (see DrawContext).
 std::recursive_mutex g_shaderMutex;  // shaders, pipelines, the compiler's maps
@@ -971,6 +976,53 @@ ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RES
     return r;
 }
 
+// Whether the GPU sees guest memory through the placed buffer over it. A driver can open the heap
+// and still not alias it (vkd3d-proton on RADV: the calls succeed and the GPU reads zeros, so
+// in-place vertex fetches draw nothing): a value written by the CPU is copied out by the GPU and
+// compared. The block is ours (Host::alloc), not memory the title may be using.
+bool PhysicalHeapAliasesGuest(ID3D12Device* d, ID3D12Resource* physical)
+{
+    const uint32_t address = RegpuGuestAlloc(Heap::Physical, 4096, 4096);
+    if (!address)
+        return true; // nothing to test with: trust the mapping, as before
+    uint32_t pattern[4];
+    for (uint32_t i = 0; i < 4; i++)
+        pattern[i] = 0x9E3779B9u * (i + 1) ^ uint32_t(GetTickCount64()) ^ address;
+    memcpy(GuestPtr<uint8_t>(address), pattern, sizeof(pattern));
+
+    ComPtr<ID3D12Resource> readback = CreateBuffer(256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;
+    if (FAILED(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list))) ||
+        FAILED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
+        return true;
+    list->CopyBufferRegion(readback.Get(), 0, physical, address & 0x1FFFFFFF, sizeof(pattern));
+    list->Close();
+    ID3D12CommandList* lists[] = { list.Get() };
+    g_r.queue->ExecuteCommandLists(1, lists);
+    const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_r.queue->Signal(fence.Get(), 1);
+    fence->SetEventOnCompletion(1, event);
+    WaitForSingleObject(event, 5000);
+    CloseHandle(event);
+    if (fence->GetCompletedValue() < 1)
+        return false; // the copy never finished: don't read through this heap
+    uint32_t seen[4] = {};
+    void* mapped = nullptr;
+    const D3D12_RANGE range{ 0, sizeof(seen) };
+    if (SUCCEEDED(readback->Map(0, &range, &mapped)))
+    {
+        memcpy(seen, mapped, sizeof(seen));
+        readback->Unmap(0, nullptr);
+    }
+    if (memcmp(seen, pattern, sizeof(pattern)) == 0)
+        return true;
+    Log("renderer: guest memory self-test at %08X wrote %08X %08X, the GPU read %08X %08X", address, pattern[0], pattern[1], seen[0], seen[1]);
+    return false;
+}
+
 // Depth resolves: a depth-stencil buffer can only be copied whole, so the
 // resolve rectangle is drawn into an R32_FLOAT texture by a tiny pass that
 // reads the depth buffer at the same pixel.
@@ -1255,6 +1307,14 @@ void Init()
             Log("renderer: placing the guest memory buffer failed %08X", unsigned(hr));
             g_r.physical.Reset();
         }
+    }
+    // The calls can succeed on a driver that doesn't alias the memory (vkd3d-proton on RADV): test it.
+    // REGPU_NO_HEAP_SELFTEST=1 trusts the mapping (A/B).
+    if (g_r.physical && !getenv("REGPU_NO_HEAP_SELFTEST") && !PhysicalHeapAliasesGuest(d, g_r.physical.Get()))
+    {
+        Log("renderer: the GPU does not see guest memory through the mapped heap; vertex data is copied instead");
+        g_r.physical.Reset();
+        g_r.physicalHeap.Reset();
     }
     Log("renderer: guest memory %s", g_r.physical ? "mapped for the GPU (zero-copy vertex fetch)" : "not mappable; vertex data is copied");
 
@@ -2181,7 +2241,10 @@ struct ShaderCompiler
         // Runtime compiles skip optimisation: fxc can take minutes on the
         // larger translated shaders.
         const auto start = std::chrono::steady_clock::now();
-        const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, nullptr, nullptr, "main",
+        // The translated source picks its sampling form per stage (see hlsl.cpp: a vertex
+        // shader cannot sample with an implicit LOD).
+        const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
+        const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, cs.pixel ? nullptr : vertexStage, nullptr, "main",
             cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         if (FAILED(hr))
@@ -2321,6 +2384,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
                 cs.info.usedTextureSlots = base.info.usedTextureSlots;
                 cs.info.constantsUsed = base.info.constantsUsed; // same ALU code
                 cs.info.constantMask = base.info.constantMask;
+                cs.info.interpolatorsWritten = base.info.interpolatorsWritten;
                 cs.info.vertexFetchLayout = std::move(layout.vertexFetchLayout);
                 cs.info.vertexFetchConstants = std::move(layout.vertexFetchConstants);
                 cs.cacheKey = base.cacheKey;
@@ -2342,6 +2406,18 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     if (!cs.info.ok)
     {
         Log("renderer: %s %016llx not translated: %s", pixel ? "ps" : "vs", (unsigned long long)hash, cs.info.error.c_str());
+        // REGPU_DUMP_SHADERS: keep the microcode too, so a missing instruction can be looked
+        // at with tools/xenos_dis (the on-load dump only covers shaders that get this far).
+        static const bool dumpShaders = getenv("REGPU_DUMP_SHADERS") != nullptr;
+        if (dumpShaders)
+        {
+            const auto dir = RegpuUserDir() / "shaders";
+            std::filesystem::create_directories(dir);
+            char name[64];
+            snprintf(name, sizeof(name), "fail_%s_%016llx.bin", pixel ? "ps" : "vs", (unsigned long long)hash);
+            std::ofstream(dir / name, std::ios::binary)
+                .write(reinterpret_cast<const char*>(cs.ucodeBE.data()), std::streamsize(cs.ucodeBE.size() * 4));
+        }
         cs.state = CompiledShader::Failed;
         return cs;
     }
@@ -5037,6 +5113,10 @@ std::vector<LookItem> g_look;
 std::unordered_set<PipelineKey, PipelineKeyHash> g_lookKeys;
 uint64_t g_predVs = 0, g_predPs = 0;
 const uint32_t *g_predVsCode = nullptr, *g_predPsCode = nullptr;
+// Microcode read from guest memory, copied when the prediction is made: the pointer can
+// point into memory the guest rewrites before the predicted draw is looked at, and then the
+// bytes would no longer match the hash taken at the same moment.
+std::shared_ptr<std::vector<uint32_t>> g_predVsOwn, g_predPsOwn;
 uint32_t g_predVsDwords = 0, g_predPsDwords = 0;
 size_t g_lookNext = 0;
 uint32_t g_lookStarted = 0, g_lookFinished = 0;
@@ -5123,6 +5203,12 @@ void DrainScan(double budgetMs, std::vector<const CompiledShader*>* queued = nul
             return;
         for (ScannedShader& s : found)
         {
+            // The scanner accepts a candidate on control flow alone, and some of what it finds in
+            // the mesh files is not a shader (ucode::Plausible: an opcode the ISA doesn't define,
+            // or instructions past the end). Warming one costs a background compile and logs a
+            // translation failure for a hash no draw will ever use.
+            if (!ucode::Plausible(ucode::Parse(s.code.data(), uint32_t(s.code.size()), s.pixel)))
+                continue;
             const uint64_t hash = Fnv(s.code.data(), s.code.size() * 4) ^ (s.pixel ? 1 : 0);
             g_scanKnown.insert(hash);
             // Speculative (and partly stale memory): compiled when nothing urgent waits,
@@ -5242,6 +5328,8 @@ void PredictBeginImpl()
     g_predPs = C().psHash;
     g_predVsCode = C().vsCode.data();
     g_predPsCode = C().psCode.data();
+    g_predVsOwn.reset(); // the command list's own copy stays valid
+    g_predPsOwn.reset();
     g_predVsDwords = uint32_t(C().vsCode.size());
     g_predPsDwords = uint32_t(C().psCode.size());
 }
@@ -5643,19 +5731,21 @@ void RendererPredictBegin()
 void RendererPredictShader(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
     dwords = ucode::UsedDwords(microcodeBE, dwords);
-    const uint64_t hash = Fnv(microcodeBE, dwords * 4) ^ type;
-    if (type == 0)
-    {
-        g_predVs = hash;
-        g_predVsCode = microcodeBE;
-        g_predVsDwords = dwords;
-    }
-    else
-    {
-        g_predPs = hash;
-        g_predPsCode = microcodeBE;
-        g_predPsDwords = dwords;
-    }
+    auto& hash = type == 0 ? g_predVs : g_predPs;
+    auto& code = type == 0 ? g_predVsCode : g_predPsCode;
+    auto& own = type == 0 ? g_predVsOwn : g_predPsOwn;
+    auto& count = type == 0 ? g_predVsDwords : g_predPsDwords;
+    hash = 0;
+    count = 0;
+    own.reset();
+    // The signal can name a shader the command processor has not loaded yet, so the
+    // microcode may still be uninitialised or already reused: only predict one that decodes.
+    if (!dwords || !ucode::Plausible(ucode::Parse(microcodeBE, dwords, type != 0)))
+        return;
+    hash = Fnv(microcodeBE, dwords * 4) ^ type;
+    own = std::make_shared<std::vector<uint32_t>>(microcodeBE, microcodeBE + dwords);
+    code = own->data();
+    count = dwords;
 }
 
 void RendererPredictDraw(uint32_t initiator)
@@ -5669,9 +5759,9 @@ void RendererPredictDraw(uint32_t initiator)
         return;
     LookItem item{ key, nullptr, nullptr, nullptr, false };
     if (!g_r.shaders.count(g_predVs))
-        item.vsCode = std::make_shared<std::vector<uint32_t>>(g_predVsCode, g_predVsCode + g_predVsDwords);
+        item.vsCode = g_predVsOwn ? g_predVsOwn : std::make_shared<std::vector<uint32_t>>(g_predVsCode, g_predVsCode + g_predVsDwords);
     if (!g_r.shaders.count(g_predPs))
-        item.psCode = std::make_shared<std::vector<uint32_t>>(g_predPsCode, g_predPsCode + g_predPsDwords);
+        item.psCode = g_predPsOwn ? g_predPsOwn : std::make_shared<std::vector<uint32_t>>(g_predPsCode, g_predPsCode + g_predPsDwords);
     g_look.push_back(std::move(item));
 }
 
@@ -7105,6 +7195,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->voffset[2] = RegFloat(PA_CL_VPORT_ZOFFSET);
     vc->vte[0] = gpureg::Get(PA_CL_VTE_CNTL);
     vc->vte[1] = vc->vte[2] = vc->vte[3] = 0;
+    // Flags for the screen-space position code (hlsl.cpp), in bits the register doesn't use:
+    // bit 31 REGPU_OLD_CLEAR_SHIFT (A/B: half-pixel shift before the MSAA-view scale); bit 30 snaps a
+    // texture-less screen-space draw's edges to whole guest pixels on an upscaled surface. The console
+    // covers a guest pixel by its centre; scaled, the half-pixel shift is more than half a host pixel,
+    // and a rectangle with integer edges (a shadow map's clear) lost its first row and column.
+    // REGPU_NO_RECT_SNAP=1: no snap.
+    static LiveSwitch oldClearShift("REGPU_OLD_CLEAR_SHIFT"), noRectSnap("REGPU_NO_RECT_SNAP");
+    if (oldClearShift)
+        vc->vte[0] |= 1u << 31;
+    if (!noRectSnap && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots && (ScaleX() != 1.0f || ScaleY() != 1.0f))
+        vc->vte[0] |= 1u << 30;
     Sub(3); // viewport, MSAA scale
     // Triangle lists and restart-free strips from an index buffer: a real indexed draw.
     static LiveSwitch noIndexed("REGPU_NO_INDEXED");
@@ -7151,10 +7252,15 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
     const uint32_t colorControl = gpureg::Get(RB_COLORCONTROL);
-    // Depth-only passes (EDRAM mode 5) keep the alpha test: a shadow map can have
-    // cut-out geometry that otherwise lands in it as solid blocks (jagged shadow under the
-    // object). REGPU_NO_DEPTH_ALPHATEST=1 skips it.
-    static const bool depthAlphaTest = getenv("REGPU_NO_DEPTH_ALPHATEST") == nullptr;
+    // Depth-only passes (EDRAM mode 5) keep the alpha test for draws that sample a texture: a
+    // shadow map can have cut-out geometry that otherwise lands in it as solid blocks (jagged
+    // shadow under the object). A texture-less draw has no cut-out to make: Top Spin 4 clears its
+    // shadow map's depth with a quad whose colour, and so alpha, is 0, and the console writes it
+    // (alpha-tested, the clear was lost and the stale depth shadowed the map's whole square).
+    // REGPU_NO_DEPTH_ALPHATEST=1: no alpha test in depth-only passes; REGPU_DEPTH_ALPHATEST_ALL=1:
+    // texture-less draws tested too (before).
+    static LiveSwitch noDepthAlphaTest("REGPU_NO_DEPTH_ALPHATEST"), testAll("REGPU_DEPTH_ALPHATEST_ALL");
+    const bool depthAlphaTest = !noDepthAlphaTest && (testAll || ps.info.usedTextureSlots || vs.info.usedTextureSlots);
     pc->info[0] = (colorControl >> 3) & 1 && (edramMode != 5 || depthAlphaTest) ? (colorControl & 7) : 7;
     pc->info2[0] = RegFloat(RB_ALPHA_REF);
     pc->info2[1] = 1.0f / ScaleX();
@@ -7162,8 +7268,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // Our colour target is half float: a 7e3 surface (formats 3 and 12, the title's HDR scene)
     // saturates at 31.875, so its output is clamped to that, as the hardware does (the bloom
     // reads those values).
+    // A fixed-point surface (k_8_8_8_8, its _GAMMA, k_2_10_10_10, 0 1 2 10) takes the output clamped
+    // to 0..1 before blending (-1: saturate). Unclamped, a multiply blend brightened where the output
+    // was a little over 1 (Top Spin 4's contact-shadow decals: light squares under every foot).
+    // REGPU_NO_UNORM_CLAMP=1: not clamped.
+    static LiveSwitch noUnormClamp("REGPU_NO_UNORM_CLAMP");
     const uint32_t colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF;
-    pc->info2[3] = colorFormat == 3 || colorFormat == 12 ? 31.875f : 0.0f;
+    const bool unorm = colorFormat == 0 || colorFormat == 1 || colorFormat == 2 || colorFormat == 10;
+    pc->info2[3] = colorFormat == 3 || colorFormat == 12 ? 31.875f : unorm && !noUnormClamp ? -1.0f : 0.0f;
 
     Sub(5); // the rest
     Section(4);
@@ -7280,6 +7392,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         memo.samplesResolve = g_drawSamplesResolve;
         g_drawSamplesResolve |= samplesBefore;
     }
+    pc->info[2] = 0;
+    // A vertex shader that allocates interpolators but exports none (depth-only shaders end with an
+    // empty export) leaves the pixel shader's inputs to whatever the hardware's parameter cache
+    // held: titles rely on cut-out kills there passing (Top Spin 4's player shadows: a texture
+    // looked up at the unwritten coordinate, read as 0 here, cut whole bodies out of the shadow map).
+    // In depth-only passes such kills are skipped (bit 2). REGPU_NO_KILL_SKIP=1: kept.
+    if (static LiveSwitch noKillSkip("REGPU_NO_KILL_SKIP"); !noKillSkip && edramMode == 5 && !vs.info.interpolatorsWritten)
+        pc->info[2] |= 4u;
     // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
     // and must keep spanning the width (squeezing them warped the image outside 16:9).
     vc->vwide[3] = g_drawSamplesResolve ? 0.0f : 1.0f;
@@ -7532,6 +7652,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             (unsigned long long)C().vsHash, (unsigned long long)C().psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
             gpureg::Get(RB_COLOR_MASK) & 15, scissor.left, scissor.top, scissor.right, scissor.bottom, gpureg::Get(PA_CL_VTE_CNTL) & 0x3FF,
             int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF, tex.c_str());
+        Log("    host: scissor %ld,%ld-%ld,%ld viewport %g,%g %gx%g depth %p colour %p (bases %03X %03X)", hostScissor.left, hostScissor.top,
+            hostScissor.right, hostScissor.bottom, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, static_cast<void*>(C().depth.Get()),
+            static_cast<void*>(C().color.Get()), C().depthBase, C().colorBase);
         uint32_t bools[8];
         for (int i = 0; i < 8; i++)
             bools[i] = gpureg::Get(gpureg::BoolConstants + i);
@@ -7990,6 +8113,11 @@ void PrecompileAll()
         BootPresent(bootFrame);
     for (const regpu::ScannedShader& s : host.staticShaders())
     {
+        // The scanner accepts a candidate on control flow alone, and a few of what it finds in
+        // the mesh files is not a shader (ucode::Plausible). Translating one fails on an opcode
+        // the ISA doesn't define, after paying a translation on every boot.
+        if (!ucode::Plausible(ucode::Parse(s.code.data(), uint32_t(s.code.size()), s.pixel)))
+            continue;
         const uint64_t hash = Fnv(s.code.data(), s.code.size() * 4) ^ (s.pixel ? 1 : 0);
         if (g_r.shaders.count(hash))
             continue;
@@ -8281,6 +8409,14 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             uint8_t* mapped = nullptr;
             d.buffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
             std::vector<uint8_t> out(size_t(d.width) * d.height * 4);
+            // Depth: the values between the clear values (0, 1) stretched over the grey range, so a
+            // map of depths close together (a shadow map) shows its shapes.
+            float lo = 1.0f, hi = 0.0f;
+            if (d.format == DXGI_FORMAT_R32_FLOAT)
+                for (UINT y = 0; y < d.height; y++)
+                    for (UINT x = 0; x < d.width; x++)
+                        if (const float f = reinterpret_cast<const float*>(mapped + size_t(y) * d.pitch)[x]; f > 0.0f && f < 1.0f)
+                            lo = std::min(lo, f), hi = std::max(hi, f);
             for (UINT y = 0; y < d.height; y++)
                 for (UINT x = 0; x < d.width; x++)
                 {
@@ -8306,7 +8442,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
                         d.maxDepth = std::max(d.maxDepth, f);
                         if (f > 0.0f && f < 1.0f)
                             d.midCount++;
-                        o[0] = o[1] = o[2] = uint8_t(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f);
+                        const float g = f <= 0.0f ? 0.0f : f >= 1.0f ? 1.0f : hi > lo ? 0.1f + 0.8f * (f - lo) / (hi - lo) : 0.5f;
+                        o[0] = o[1] = o[2] = uint8_t(g * 255.0f + 0.5f);
                         o[3] = 255;
                     }
                     else
@@ -8315,8 +8452,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
                 }
             d.buffer->Unmap(0, nullptr);
             if (d.format == DXGI_FORMAT_R32_FLOAT)
-                Log("resolve dump: depth %08X %ux%u min %g max %g strictly-inside %llu", d.base, d.width, d.height, d.minDepth, d.maxDepth,
-                    (unsigned long long)d.midCount);
+                Log("resolve dump: depth %08X %ux%u min %g max %g strictly-inside %llu (%g to %g, drawn stretched)", d.base, d.width, d.height,
+                    d.minDepth, d.maxDepth, (unsigned long long)d.midCount, lo, hi);
             std::filesystem::create_directories("out/res");
             char name[96];
             snprintf(name, sizeof(name), "out/res/%08X_%ux%u_v%d.png", d.base, d.width, d.height, d.variant);
@@ -8399,6 +8536,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (frameNumber % 600 == 0)
         Log("renderer: frame %llu: %u draws, %u skipped, %zu shaders, %zu pipelines, %zu textures", (unsigned long long)frameNumber,
             g_r.drawsThisFrame.load(), g_r.skippedThisFrame.load(), g_r.shaders.size(), g_r.pipelines.size(), g_r.textures.size());
+    g_lastFrameDraws.store(g_r.drawsThisFrame.load(), std::memory_order_relaxed);
     g_r.drawsThisFrame = g_r.skippedThisFrame = 0;
     g_r.frameIndex = (g_r.frameIndex + 1) % kFrames;
 }
@@ -8426,7 +8564,9 @@ void RendererSetGammaEntry(uint32_t index, uint32_t rgb10)
 }
 
 // The debug server's "capture": what F12 does.
-void RendererRequestCapture() { g_hotkeyFrame = g_r.frame + 1; }
+// The next whole frame, as F12 does: frame + 1 is the frame already being drawn, whose trace
+// started part-way through (the first tiles of a tiled pass were missing).
+void RendererRequestCapture() { g_hotkeyFrame = g_r.frame + 2; }
 
 // The debug server's "ps HASH [EXPR]": an empty expression drops the edit. Returns the alias (0 if dropped).
 uint64_t RendererEditPixelShader(uint64_t hash, const std::string& expr)

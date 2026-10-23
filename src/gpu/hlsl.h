@@ -35,6 +35,8 @@ struct TranslatedShader
     // The same as a bit per constant (all of them with relative addressing): a draw copies only
     // these (shaders read a few constants spread up to c[255]: ~440 per draw were copied).
     std::array<uint64_t, 4> constantMask{};
+    // Vertex shaders: bit per interpolator (o0-o15) the code exports.
+    uint32_t interpolatorsWritten = 0;
 };
 
 TranslatedShader TranslateShader(const ucode::Shader& shader);

@@ -33,6 +33,7 @@ uint64_t RendererEditPixelShader(uint64_t hash, const std::string& expr);
 std::string RendererShaderHlsl(uint64_t hash);
 bool RendererPsEditReady(uint64_t alias);
 std::string RendererDrawStats();
+uint32_t RendererLastFrameDraws();
 
 namespace
 {
@@ -132,7 +133,7 @@ std::string Handle(const std::string& line)
         while (!g_swapTimes.empty() && now - g_swapTimes.front() > std::chrono::seconds(1))
             g_swapTimes.pop_front();
         char buf[256];
-        snprintf(buf, sizeof(buf), "\"frame\":%llu,\"fps\":%zu", (unsigned long long)g_frame, g_swapTimes.size());
+        snprintf(buf, sizeof(buf), "\"frame\":%llu,\"fps\":%zu,\"draws\":%u", (unsigned long long)g_frame, g_swapTimes.size(), RendererLastFrameDraws());
         return Ok(buf);
     }
     // press A [ms]   press A+B 200   (held for ms, default 120, then released)

@@ -198,9 +198,19 @@ float3 CubeDirection(float3 stf)
 
 float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel);
 
-// Fetch swizzle (3 bits per channel: 0-3 component, 4 zero, 5 one) for
-// textures that live on the GPU; CPU-decoded textures are swizzled already.
-// texel: the instruction's texel offset (PCF taps in shadow filters), in texels.
+// Sampling with a LOD bias is a pixel-shader-only operation: a vertex shader cannot compute an
+// implicit LOD, and dxc rejects the module outright ("sampling with implicit lod is only allowed
+// in fragment and compute shaders"), where fxc merely ignored the dead branch. The translator
+// emits the same source for both stages, so the stage picks the form here. A macro, not a
+// function: a call in the fetch path keeps fxc from inlining and costs half the frame rate.
+#ifdef REGPU_VERTEX_STAGE
+#define REGPU_SAMPLE_BIAS_2D(t, s, uv, bias) ((t).SampleLevel((s), (uv), max((bias), 0)))
+#define REGPU_SAMPLE_BIAS_CUBE(t, s, dir, bias) ((t).SampleLevel((s), (dir), max((bias), 0)))
+#else
+#define REGPU_SAMPLE_BIAS_2D(t, s, uv, bias) ((t).SampleBias((s), (uv), (bias)))
+#define REGPU_SAMPLE_BIAS_CUBE(t, s, dir, bias) ((t).SampleBias((s), (dir), (bias)))
+#endif
+
 float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
 {
     float4 v = TFetchRaw(slot, coord, denorm, vertexStage, bias, texel);
@@ -237,7 +247,7 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     if ((tinfo[slot].w & 0xFFu) == 3)
     {
         float3 dir = CubeDirection(coord);
-        return vertexStage ? tc.SampleLevel(sLinearClamp, dir, max(bias, 0)) : tc.SampleBias(sLinearClamp, dir, bias);
+        return vertexStage ? tc.SampleLevel(sLinearClamp, dir, max(bias, 0)) : REGPU_SAMPLE_BIAS_CUBE(tc, sLinearClamp, dir, bias);
     }
     float2 uv = coord.xy;
     const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
@@ -255,10 +265,10 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     uint mode = tinfo[slot].x & 3u;
     if (vertexStage)
         return t.SampleLevel(sLinearClamp, uv, max(bias, 0));
-    if (mode == 1) return t.SampleBias(sLinearClamp, uv, bias);
-    if (mode == 2) return t.SampleBias(sPointClamp, uv, bias);
-    if (mode == 3) return t.SampleBias(sPointWrap, uv, bias);
-    return t.SampleBias(sLinearWrap, uv, bias);
+    if (mode == 1) return REGPU_SAMPLE_BIAS_2D(t, sLinearClamp, uv, bias);
+    if (mode == 2) return REGPU_SAMPLE_BIAS_2D(t, sPointClamp, uv, bias);
+    if (mode == 3) return REGPU_SAMPLE_BIAS_2D(t, sPointWrap, uv, bias);
+    return REGPU_SAMPLE_BIAS_2D(t, sLinearWrap, uv, bias);
 }
 
 float4 CubeOp(float4 a, float4 b)
@@ -347,7 +357,10 @@ struct Emitter
         if (reg == 62)
             return "opos";
         if (reg < 16)
+        {
+            result.interpolatorsWritten |= 1u << reg;
             return "o[" + std::to_string(reg) + "]";
+        }
         return "";
     }
 
@@ -443,7 +456,7 @@ struct Emitter
         {
             static const char* cmp[] = { "== 0.0", "> 0.0", ">= 0.0", "!= 0.0", "== 1.0" };
             const std::string c = A + " " + cmp[a.scalarOp - 35];
-            return std::string(pixel ? "if (" + c + ") discard; " : "") + "s = float(" + c + ");";
+            return std::string(pixel ? "if ((" + c + ") && !(pinfo.z & 4u)) discard; " : "") + "s = float(" + c + ");";
         }
         case 40: return set("sqrt(" + A + ")");
         case 42: case 43: case 44: case 45: case 46: case 47:
@@ -486,8 +499,9 @@ struct Emitter
         {
             static const char* cmp[] = { "==", ">", ">=", "!=" };
             body += "{ bool k = any(" + A + " " + cmp[a.vectorOp - 24] + " " + B + "); v = float(k).xxxx; ";
+            // (pinfo.z bit 2: kills skipped, renderer.cpp: the vertex shader wrote no interpolators.)
             if (pixel)
-                body += "if (k) discard; ";
+                body += "if (k && !(pinfo.z & 4u)) discard; ";
             body += "} ";
         }
         else
@@ -611,7 +625,9 @@ struct Emitter
             char call[320];
             snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
                 f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
-            body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+            // Declared, then assigned: fxc drops the value when the fetch initialises the declaration
+            // in some shaders ("internal error: invalid access of unbound variable").
+            body = std::string("{ float4 t; t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
             result.usedTextureSlots |= 1u << f.constIndex;
         }
         else if (f.opcode == 18 && pixel)
@@ -661,16 +677,21 @@ struct Emitter
     // instruction, blocks run in order within an iteration, jumps set pc.
     void EmitProgram()
     {
-        bool linear = true;
+        bool linear = true, loops = false;
         for (const Cf& cf : shader.cf)
+        {
             linear = linear && cf.op() != CfOp::CondJmp && cf.op() != CfOp::LoopStart && cf.op() != CfOp::LoopEnd &&
                 cf.op() != CfOp::CondCall && cf.op() != CfOp::Return;
+            loops = loops || cf.op() == CfOp::LoopStart;
+        }
         if (!linear)
         {
             Line("uint cfpc = 0;");
-            // Loops: each level keeps its counter and the aL it replaced.
+            // Loops: each level keeps its counter and the aL it replaced. Calls: a 4-deep return stack.
             Line("uint loopCount[4] = { 0, 0, 0, 0 }; int loopSaved[4] = { 0, 0, 0, 0 }; uint loopDepth = 0;");
-            Line("[loop] for (uint guard = 0; guard < 1024 && cfpc != 0xFFFFu; guard++)");
+            Line("uint callRet[4] = { 0, 0, 0, 0 }; uint callDepth = 0;");
+            // The guard only stops a program that never ends: a 255-iteration loop runs far past 1024 blocks.
+            Line(std::string("[loop] for (uint guard = 0; guard < ") + (loops ? "65536" : "1024") + "u && cfpc != 0xFFFFu; guard++)");
             Line("{");
             indent++;
         }
@@ -759,6 +780,25 @@ struct Emitter
                 Line("  loopDepth = d; aL = loopSaved[d]; }");
                 break;
             }
+            // ccall (conditions as condjmp) pushes the next block; ret pops it (an empty stack falls through).
+            case CfOp::CondCall:
+            {
+                const uint32_t target = cf.lo & 0x1FFF;
+                std::string cond;
+                if ((cf.lo >> 13) & 1)
+                    cond = "true";
+                else if ((cf.lo >> 14) & 1)
+                    cond = cf.condition() ? "p" : "!p";
+                else
+                    cond = std::string("BoolConstant(") + (pixel ? "pb" : "vb") + ", " + std::to_string((cf.hi >> 2) & 0xFF) + ") == " +
+                        (cf.condition() ? "true" : "false");
+                Line("if ((" + cond + ") && callDepth < 4) { callRet[callDepth++] = " + std::to_string(i + 1) + "u; cfpc = " +
+                    std::to_string(target) + "u; continue; }");
+                break;
+            }
+            case CfOp::Return:
+                Line("if (callDepth > 0) { cfpc = callRet[--callDepth]; continue; }");
+                break;
             default:
                 error = std::string("control flow op ") + std::to_string(unsigned(cf.op())) + " not supported yet";
                 return;
@@ -942,9 +982,17 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    // Positions the title gives in screen space (no viewport scale or offset: its\n"
              "    // rectangle clears and filter passes, authored for D3D9's integer pixel centres,\n"
              "    // e.g. -0.5 .. 255.5) must cover the last row and column too: shift by half a pixel.\n"
-             "    if ((vte.x & 0x30Fu) == 0x300u) p.xy += 0.5;\n"
-             "    // vscale.w/voffset.w: pixel scale of MSAA clear rectangles (renderer.cpp).\n"
+             "    // vscale.w/voffset.w: pixel scale of MSAA clear rectangles (renderer.cpp), applied before the\n"
+             "    // half-pixel shift: scaled after it, a 4x view's rectangle started a whole pixel in and left the\n"
+             "    // first row and column uncleared (vte.x bit 31, REGPU_OLD_CLEAR_SHIFT: the old order).\n"
+             "    // vte.x bit 30 (texture-less, upscaled surface): edges snapped to the guest pixels whose\n"
+             "    // centres they cover instead, so each host pixel takes its guest pixel's coverage.\n"
+             "    bool halfPixel = (vte.x & 0x30Fu) == 0x300u;\n"
+             "    bool snap = halfPixel && (vte.x & (1u << 30));\n"
+             "    if (snap) p.xy = ceil(p.xy);\n"
+             "    if (halfPixel && !snap && (vte.x & (1u << 31))) p.xy += 0.5;\n"
              "    if (vscale.w > 0.0) p.xy *= float2(vscale.w, voffset.w);\n"
+             "    if (halfPixel && !snap && !(vte.x & (1u << 31))) p.xy += 0.5;\n"
              "    p.xy += pointOffset;\n"
              "    if (vte.x & (1u << 8)) w = 1.0;\n"
              "    float2 ndc = float2(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0);\n"
@@ -983,6 +1031,7 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    case 6: if (!(oC[0].a >= pinfo2.x)) discard; break;\n"
              "    }\n"
              "    if (pinfo2.w > 0.0) oC[0].rgb = clamp(oC[0].rgb, 0.0, pinfo2.w); // 7e3 target range\n"
+             "    else if (pinfo2.w < 0.0) oC[0] = saturate(oC[0]); // fixed-point target\n"
              + std::string(e.exportsDepth ? "    PSOut o; o.c = oC[0]; o.d = saturate(oD.x); return o;\n}\n" : "    return oC[0];\n}\n");
     }
     result.hlsl = h;
