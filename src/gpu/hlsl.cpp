@@ -621,7 +621,9 @@ struct Emitter
             char call[320];
             snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
                 f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
-            body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+            // Declared, then assigned: fxc drops the value when the fetch initialises the declaration
+            // in some shaders ("internal error: invalid access of unbound variable").
+            body = std::string("{ float4 t; t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
             result.usedTextureSlots |= 1u << f.constIndex;
         }
         else if (f.opcode == 18 && pixel)
@@ -671,16 +673,21 @@ struct Emitter
     // instruction, blocks run in order within an iteration, jumps set pc.
     void EmitProgram()
     {
-        bool linear = true;
+        bool linear = true, loops = false;
         for (const Cf& cf : shader.cf)
+        {
             linear = linear && cf.op() != CfOp::CondJmp && cf.op() != CfOp::LoopStart && cf.op() != CfOp::LoopEnd &&
                 cf.op() != CfOp::CondCall && cf.op() != CfOp::Return;
+            loops = loops || cf.op() == CfOp::LoopStart;
+        }
         if (!linear)
         {
             Line("uint cfpc = 0;");
-            // Loops: each level keeps its counter and the aL it replaced.
+            // Loops: each level keeps its counter and the aL it replaced. Calls: a 4-deep return stack.
             Line("uint loopCount[4] = { 0, 0, 0, 0 }; int loopSaved[4] = { 0, 0, 0, 0 }; uint loopDepth = 0;");
-            Line("[loop] for (uint guard = 0; guard < 1024 && cfpc != 0xFFFFu; guard++)");
+            Line("uint callRet[4] = { 0, 0, 0, 0 }; uint callDepth = 0;");
+            // The guard only stops a program that never ends: a 255-iteration loop runs far past 1024 blocks.
+            Line(std::string("[loop] for (uint guard = 0; guard < ") + (loops ? "65536" : "1024") + "u && cfpc != 0xFFFFu; guard++)");
             Line("{");
             indent++;
         }
@@ -769,6 +776,25 @@ struct Emitter
                 Line("  loopDepth = d; aL = loopSaved[d]; }");
                 break;
             }
+            // ccall (conditions as condjmp) pushes the next block; ret pops it (an empty stack falls through).
+            case CfOp::CondCall:
+            {
+                const uint32_t target = cf.lo & 0x1FFF;
+                std::string cond;
+                if ((cf.lo >> 13) & 1)
+                    cond = "true";
+                else if ((cf.lo >> 14) & 1)
+                    cond = cf.condition() ? "p" : "!p";
+                else
+                    cond = std::string("BoolConstant(") + (pixel ? "pb" : "vb") + ", " + std::to_string((cf.hi >> 2) & 0xFF) + ") == " +
+                        (cf.condition() ? "true" : "false");
+                Line("if ((" + cond + ") && callDepth < 4) { callRet[callDepth++] = " + std::to_string(i + 1) + "u; cfpc = " +
+                    std::to_string(target) + "u; continue; }");
+                break;
+            }
+            case CfOp::Return:
+                Line("if (callDepth > 0) { cfpc = callRet[--callDepth]; continue; }");
+                break;
             default:
                 error = std::string("control flow op ") + std::to_string(unsigned(cf.op())) + " not supported yet";
                 return;
