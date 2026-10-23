@@ -55,6 +55,11 @@ struct Gpu
     std::atomic<uint32_t> interruptCallback{ 0 };
     std::atomic<uint32_t> interruptData{ 0 };
     uint32_t rptr = 0;
+    // VdInitializeRingBuffer can replace the ring while the command processor is running the old
+    // one (a title handing the GPU from one module's D3D device to another's). ringMutex orders
+    // that against the CP's read pointer updates; the generation tells the CP its ring is gone.
+    std::mutex ringMutex;
+    uint32_t ringGeneration = 0;
 
     bool interruptThread = false;
     std::mutex interruptMutex;
@@ -1257,7 +1262,13 @@ void CommandProcessorLoop(PPCContext& ctx)
     }
     for (;;)
     {
-        const uint32_t base = g_gpu.ringBase, size = g_gpu.ringDwords;
+        uint32_t base, size, generation;
+        {
+            std::lock_guard lock(g_gpu.ringMutex);
+            base = g_gpu.ringBase;
+            size = g_gpu.ringDwords;
+            generation = g_gpu.ringGeneration;
+        }
         if (!base || !size)
         {
             Sleep(1);
@@ -1270,7 +1281,8 @@ void CommandProcessorLoop(PPCContext& ctx)
             Sleep(0);
             continue;
         }
-        while (g_gpu.rptr != wptr)
+        bool replaced = false;
+        while (!replaced && g_gpu.rptr != wptr)
         {
 
             // A packet may wrap past the end of the ring: run it from a
@@ -1295,6 +1307,14 @@ void CommandProcessorLoop(PPCContext& ctx)
                     StoreBE32(scratch + i * 4, LoadBE32(base + ((g_gpu.rptr + i) % size) * 4));
                 used = ExecutePacket(scratch);
             }
+            std::lock_guard lock(g_gpu.ringMutex);
+            if (g_gpu.ringGeneration != generation)
+            {
+                // The ring was replaced during this packet: the new one starts at 0, and this
+                // ring's position must not land in it.
+                replaced = true;
+                break;
+            }
             g_gpu.rptr = (g_gpu.rptr + used) % size;
             // Publish progress packet by packet: the title waits for ring
             // space by polling this, and only publishing once the ring is
@@ -1303,9 +1323,6 @@ void CommandProcessorLoop(PPCContext& ctx)
             if (const uint32_t wb = g_gpu.rptrWriteback)
                 StoreBE32(wb, g_gpu.rptr);
         }
-        SetReg(CP_RB_RPTR, g_gpu.rptr);
-        if (const uint32_t wb = g_gpu.rptrWriteback)
-            StoreBE32(wb, g_gpu.rptr);
     }
 }
 
@@ -1412,9 +1429,17 @@ GUEST_EXPORT(VdSetGraphicsInterruptCallback)
 GUEST_EXPORT(VdInitializeRingBuffer)
 {
     // (physical address, log2 of size in qwords? - size = 1 << (log2 + 3) bytes)
-    g_gpu.ringBase = PhysToGuest(ctx.r3.u32);
-    g_gpu.ringDwords = (1u << (ctx.r4.u32 + 3)) / 4;
-    g_gpu.rptr = 0;
+    // A new ring starts empty: both pointers back to 0, as the kernel resets the CP. Without the
+    // write pointer reset, the CP would run the new ring's stale contents up to the old one's.
+    {
+        std::lock_guard lock(g_gpu.ringMutex);
+        g_gpu.ringBase = PhysToGuest(ctx.r3.u32);
+        g_gpu.ringDwords = (1u << (ctx.r4.u32 + 3)) / 4;
+        g_gpu.rptr = 0;
+        g_gpu.ringGeneration++;
+        SetReg(CP_RB_WPTR, 0);
+        SetReg(CP_RB_RPTR, 0);
+    }
     Log("gpu: ring buffer at %08X, %u dwords", g_gpu.ringBase.load(), g_gpu.ringDwords.load());
 }
 
