@@ -188,7 +188,6 @@ void WriteBackNow(uint32_t address, uint32_t value);
 namespace PendingWrites
 {
 void Add(uint64_t fence, uint32_t address, uint32_t value);
-void Drain();
 }
 
 // ---- Parallel draw segments ------------------------------------------------------------
@@ -555,16 +554,7 @@ void Main()
         WriteBackNow(w.address, w.value);
         lock.lock();
         g_queue.pop_front(); // after the write: Add sees it pending until then, keeping the order
-        if (g_queue.empty())
-            g_cv.notify_all();
     }
-}
-
-// Waits until every pending write is in memory (an interrupt handler reads them at once).
-void Drain()
-{
-    std::unique_lock lock(g_mutex);
-    g_cv.wait(lock, [] { return g_queue.empty(); });
 }
 
 void Add(uint64_t fence, uint32_t address, uint32_t value)
@@ -580,7 +570,7 @@ void Add(uint64_t fence, uint32_t address, uint32_t value)
     if (!fence)
         fence = g_queue.back().fence;
     g_queue.push_back({ fence, address, value });
-    g_cv.notify_all(); // (Drain waits on the same condition)
+    g_cv.notify_one();
 }
 }
 
@@ -685,14 +675,7 @@ void WriteRegister(uint32_t index, uint32_t value)
                 work::End(2);
             }
             else
-            {
-                // A fence too (D3D's): after the host GPU has run the draws before it, like the
-                // memory writes (WriteBack). Stored at once, the title reused vertex buffers the
-                // GPU had yet to read: one-frame geometry spikes (PGR4's post-race screen).
-                // Endian mode 2 (in the address's low bits): stored big-endian.
-                (void)address;
-                PendingWrites::Add(RendererFenceSubmit(), ((Reg(SCRATCH_ADDR) + n * 4) & ~3u) | 2u, value);
-            }
+                StoreBE32(address, value);
         }
     }
 }
@@ -988,7 +971,6 @@ uint32_t ExecutePacket(uint32_t ptr)
     case 0x54: // INTERRUPT: cpu mask
         seg::Flush();
         work::Drain(); // after the draws before it, like the hardware
-        PendingWrites::Drain(); // and the fences before it, which the handler reads
         for (uint32_t cpu = 0; cpu < 6; cpu++)
         {
             if ((arg(0) >> cpu) & 1)
