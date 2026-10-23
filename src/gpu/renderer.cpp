@@ -6512,14 +6512,15 @@ void Section(int i)
 // in PGR4's sky for a frame). Also logs a change in the number of draws.
 namespace Unstable
 {
-enum Part : uint32_t { kVertices, kIndices, kTextures, kPipeline, kScissor, kTile, kParts };
-const char* const kPartNames[kParts] = { "vertices", "indices", "textures", "pipeline", "scissor", "tile merge" };
+enum Part : uint32_t { kVertices, kIndices, kTextures, kPipeline, kScissor, kTile, kVertexData, kIndexData, kParts };
+const char* const kPartNames[kParts] = { "vertices", "indices", "textures", "pipeline", "scissor", "tile merge",
+    "vertex data (the game rewrote it)", "index data (the game rewrote it)" };
 struct Draw
 {
     uint64_t input = 0;
     uint64_t part[kParts]{};
     uint64_t vsHash = 0, psHash = 0;
-    uint32_t initiator = 0, firstVertexFetch = 0;
+    uint32_t initiator = 0, firstVertexFetch = 0, dmaBase = 0, dmaSize = 0;
 };
 // The two frames before (titles alternate work between frames: reflection faces, PGR4's paused
 // race has 4390 and 4358 draws in turn), so a frame is compared with the one two back.
@@ -6584,9 +6585,9 @@ void Begin()
                     if (a.part[k] != b.part[k] && inFrame++ < 12)
                     {
                         g_logged++;
-                        Log("unstable: frame %llu draw %zu (vs %016llx ps %016llx, initiator %08X, vertex fetch %08X): same input, %s differ (%016llx -> %016llx)",
+                        Log("unstable: frame %llu draw %zu (vs %016llx ps %016llx, initiator %08X, vertex fetch %08X %08X, indices %08X %08X): same input, %s differ (%016llx -> %016llx)",
                             (unsigned long long)g_frame, i, (unsigned long long)b.vsHash, (unsigned long long)b.psHash, b.initiator, b.firstVertexFetch,
-                            kPartNames[k], (unsigned long long)a.part[k], (unsigned long long)b.part[k]);
+                            gpureg::Get(gpureg::FetchConstants + 1), b.dmaBase, b.dmaSize, kPartNames[k], (unsigned long long)a.part[k], (unsigned long long)b.part[k]);
                     }
             }
         }
@@ -6611,9 +6612,56 @@ void Sub(int k)
     g_subMark = now;
 }
 
+// Debug (finding which draw paints something): out/draw_skip.txt "from to [info]" skips this frame's
+// draws with those numbers (counted from 0 each frame, re-read every 30 frames); "info N" logs
+// draw N's packet and registers once. With REGPU_DEBUG only.
+bool DebugSkipDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
+{
+    static const bool enabled = getenv("REGPU_DEBUG") != nullptr;
+    if (!enabled)
+        return false;
+    static uint32_t from = 0, to = 0, info = ~0u;
+    static uint64_t readFrame = 0, infoFrame = 0;
+    if (g_r.frame >= readFrame + 30)
+    {
+        readFrame = g_r.frame;
+        from = to = 0;
+        info = ~0u;
+        if (FILE* f = fopen("out/draw_skip.txt", "r"))
+        {
+            char word[16] = {};
+            if (fscanf(f, "%u %u", &from, &to) != 2)
+                from = to = 0;
+            if (fscanf(f, "%15s %u", word, &info) != 2 || strcmp(word, "info") != 0)
+                info = ~0u;
+            fclose(f);
+        }
+    }
+    const uint32_t n = g_r.drawsThisFrame.load();
+    if (n == info && infoFrame + 60 < g_r.frame)
+    {
+        infoFrame = g_r.frame;
+        Log("draw info %u: initiator %08X index base %08X size %08X vs %016llx ps %016llx", n, initiator, dmaBase, dmaSize, (unsigned long long)C().vsHash,
+            (unsigned long long)C().psHash);
+        for (uint32_t k = 0; k < 8; k++)
+            Log("  vertex fetch %u: %08X %08X", k, gpureg::Get(gpureg::FetchConstants + k * 2), gpureg::Get(gpureg::FetchConstants + k * 2 + 1));
+        Log("  surface %08X colour %08X depth %08X mode %08X window offset %08X scissor %08X %08X", gpureg::Get(RB_SURFACE_INFO), gpureg::Get(RB_COLOR_INFO),
+            gpureg::Get(RB_DEPTH_INFO), gpureg::Get(RB_MODECONTROL), gpureg::Get(PA_SC_WINDOW_OFFSET), gpureg::Get(PA_SC_WINDOW_SCISSOR_TL),
+            gpureg::Get(PA_SC_WINDOW_SCISSOR_BR));
+    }
+    if (n >= from && n < to)
+    {
+        g_r.drawsThisFrame++; // (keeps the numbering of the draws after it)
+        return true;
+    }
+    return false;
+}
+
 void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     Section(0);
+    if (DebugSkipDraw(initiator, dmaBase, dmaSize))
+        return;
     g_drawSamplesResolve = false;
     static LiveSwitch noRender("REGPU_NO_RENDER");
     if (noRender)
@@ -7381,6 +7429,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         d.psHash = C().psHash;
         d.initiator = initiator;
         d.firstVertexFetch = gpureg::Get(gpureg::FetchConstants);
+        d.dmaBase = dmaBase;
+        d.dmaSize = dmaSize;
         d.input = InputKey(initiator, dmaBase, dmaSize, d.vsHash, d.psHash);
         uint64_t h = 0xCBF29CE484222325ull;
         for (uint32_t k : vs.info.vertexFetchConstants)
@@ -7410,6 +7460,22 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         d.part[kScissor] = Mix(Mix(Mix(Mix(0, uint64_t(hostScissor.left)), uint64_t(hostScissor.top)), uint64_t(hostScissor.right)), uint64_t(hostScissor.bottom)) ^
             uint64_t(std::bit_cast<uint32_t>(vp.TopLeftY)) << 32;
         d.part[kTile] = TileMerge::t_widened;
+        // The data itself, every dword (a paused game rewriting geometry it draws).
+        h = 0;
+        for (uint32_t k : vs.info.vertexFetchConstants)
+        {
+            const uint32_t d1 = gpureg::Get(gpureg::FetchConstants + k * 2 + 1), bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
+            const uint32_t address = gpureg::Get(gpureg::FetchConstants + k * 2) & 0xFFFFFFFC;
+            h = Mix(h, ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), std::min<uint32_t>(bytes, 4u << 20), 4));
+        }
+        d.part[kVertexData] = h;
+        {
+            const bool is32 = (initiator >> 11) & 1;
+            const uint32_t count = dmaSize & 0xFFFFFF;
+            d.part[kIndexData] = dmaBase && count ? ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(dmaBase & 0x1FFFFFFF & ~(is32 ? 3u : 1u))),
+                                                        std::min<uint32_t>(count * (is32 ? 4 : 2), 4u << 20), 4)
+                                                  : 0;
+        }
         g_current.push_back(d);
     }
     {

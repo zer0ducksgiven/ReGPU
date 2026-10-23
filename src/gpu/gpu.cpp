@@ -1546,6 +1546,33 @@ GUEST_EXPORT(VdSwap)
     }
     if (n == 1 || (n & (n - 1)) == 0 || n % 60 == 0)
         Log("gpu: VdSwap #%llu", (unsigned long long)n);
+    // Watchdog: no swap for 10 s once the title has started presenting logs every thread's stack
+    // (once per stall), so a lockup says where each thread is waiting.
+    static std::atomic<uint64_t> lastSwap{ 0 };
+    lastSwap.store(n, std::memory_order_relaxed);
+    static std::once_flag watchdog;
+    std::call_once(watchdog, [] {
+        std::thread([] {
+            uint64_t seen = 0;
+            int still = 0;
+            bool logged = false;
+            for (;;)
+            {
+                Sleep(1000);
+                const uint64_t now = lastSwap.load(std::memory_order_relaxed);
+                still = now == seen ? still + 1 : 0;
+                if (now != seen)
+                    logged = false;
+                seen = now;
+                if (still >= 10 && !logged && regpu::GetHost().logThreadStacks)
+                {
+                    logged = true;
+                    Log("hang: no VdSwap for 10 s (last #%llu)", (unsigned long long)now);
+                    regpu::GetHost().logThreadStacks("no swap for 10 s");
+                }
+            }
+        }).detach();
+    });
     // Frame limiter (settings: max FPS, the display's refresh with vsync): the title's render
     // thread waits for its next frame slot. Vblanks run faster than the cap, so menus (which
     // present every second vblank) and gameplay (every vblank) both reach it.
