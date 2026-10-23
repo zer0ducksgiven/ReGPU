@@ -357,7 +357,10 @@ struct Emitter
         if (reg == 62)
             return "opos";
         if (reg < 16)
+        {
+            result.interpolatorsWritten |= 1u << reg;
             return "o[" + std::to_string(reg) + "]";
+        }
         return "";
     }
 
@@ -453,7 +456,7 @@ struct Emitter
         {
             static const char* cmp[] = { "== 0.0", "> 0.0", ">= 0.0", "!= 0.0", "== 1.0" };
             const std::string c = A + " " + cmp[a.scalarOp - 35];
-            return std::string(pixel ? "if (" + c + ") discard; " : "") + "s = float(" + c + ");";
+            return std::string(pixel ? "if ((" + c + ") && !(pinfo.z & 4u)) discard; " : "") + "s = float(" + c + ");";
         }
         case 40: return set("sqrt(" + A + ")");
         case 42: case 43: case 44: case 45: case 46: case 47:
@@ -496,8 +499,9 @@ struct Emitter
         {
             static const char* cmp[] = { "==", ">", ">=", "!=" };
             body += "{ bool k = any(" + A + " " + cmp[a.vectorOp - 24] + " " + B + "); v = float(k).xxxx; ";
+            // (pinfo.z bit 2: kills skipped, renderer.cpp: the vertex shader wrote no interpolators.)
             if (pixel)
-                body += "if (k) discard; ";
+                body += "if (k && !(pinfo.z & 4u)) discard; ";
             body += "} ";
         }
         else

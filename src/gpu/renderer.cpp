@@ -2329,6 +2329,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
                 cs.info.usedTextureSlots = base.info.usedTextureSlots;
                 cs.info.constantsUsed = base.info.constantsUsed; // same ALU code
                 cs.info.constantMask = base.info.constantMask;
+                cs.info.interpolatorsWritten = base.info.interpolatorsWritten;
                 cs.info.vertexFetchLayout = std::move(layout.vertexFetchLayout);
                 cs.info.vertexFetchConstants = std::move(layout.vertexFetchConstants);
                 cs.cacheKey = base.cacheKey;
@@ -7153,6 +7154,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         g_drawSamplesResolve |= samplesBefore;
     }
     pc->info[2] = 0;
+    // A vertex shader that allocates interpolators but exports none (depth-only shaders end with an
+    // empty export) leaves the pixel shader's inputs to whatever the hardware's parameter cache
+    // held: titles rely on cut-out kills there passing (Top Spin 4's player shadows: a texture
+    // looked up at the unwritten coordinate, read as 0 here, cut whole bodies out of the shadow map).
+    // In depth-only passes such kills are skipped (bit 2). REGPU_NO_KILL_SKIP=1: kept.
+    if (static LiveSwitch noKillSkip("REGPU_NO_KILL_SKIP"); !noKillSkip && edramMode == 5 && !vs.info.interpolatorsWritten)
+        pc->info[2] |= 4u;
     // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
     // and must keep spanning the width (squeezing them warped the image outside 16:9).
     vc->vwide[3] = g_drawSamplesResolve ? 0.0f : 1.0f;
@@ -7347,6 +7355,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             (unsigned long long)C().vsHash, (unsigned long long)C().psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
             gpureg::Get(RB_COLOR_MASK) & 15, scissor.left, scissor.top, scissor.right, scissor.bottom, gpureg::Get(PA_CL_VTE_CNTL) & 0x3FF,
             int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF, tex.c_str());
+        Log("    host: scissor %ld,%ld-%ld,%ld viewport %g,%g %gx%g depth %p colour %p (bases %03X %03X)", hostScissor.left, hostScissor.top,
+            hostScissor.right, hostScissor.bottom, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, static_cast<void*>(C().depth.Get()),
+            static_cast<void*>(C().color.Get()), C().depthBase, C().colorBase);
         uint32_t bools[8];
         for (int i = 0; i < 8; i++)
             bools[i] = gpureg::Get(gpureg::BoolConstants + i);
