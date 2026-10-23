@@ -916,7 +916,9 @@ void StartFrame()
 // The texture's hash, from the workers when they have it and memory still matches.
 uint64_t Hash(uint64_t key, const uint8_t* source, size_t bytes, size_t stride)
 {
-    if (!Enabled())
+    // The command processor's thread only (draw workers hash as before).
+    static const std::thread::id owner = std::this_thread::get_id();
+    if (!Enabled() || std::this_thread::get_id() != owner)
         return ContentHashFwd(source, bytes, stride);
     g_next.push_back({ key, source, bytes, stride });
     if (const auto it = g_index.find(key); it != g_index.end())
@@ -6178,6 +6180,19 @@ void Section(int i)
     g_perf.mark = now;
 }
 
+// REGPU_PERF: the constants section split further (Sub(k) ends part k), logged with the rest.
+double g_sub[8] = {};
+std::chrono::steady_clock::time_point g_subMark;
+void Sub(int k)
+{
+    if (!g_perfTiming)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (k >= 0)
+        g_sub[k] += std::chrono::duration<double>(now - g_subMark).count();
+    g_subMark = now;
+}
+
 void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     Section(0);
@@ -6366,6 +6381,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     FrameResources& f = Frame();
 
     Section(3);
+    Sub(-1);
     // Index list.
     UINT64 listOffset = 0;
     if (!directIndex)
@@ -6421,15 +6437,24 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         g_r.skippedThisFrame++;
         return;
     }
-    auto* vc = reinterpret_cast<VSConstants*>(f.ringCpu + vsOffset);
-    auto* pc = reinterpret_cast<PSConstants*>(f.ringCpu + psOffset);
+    // The float constants go straight to the ring (only those the shaders read); the rest of each
+    // block is built in a cached copy and written in one go before the draw is bound: the ring is
+    // write-combined upload memory, where scattered small writes (vc and pc in turn) cost ~5 ms a
+    // frame and reading back is slower still.
+    auto* vcRing = reinterpret_cast<VSConstants*>(f.ringCpu + vsOffset);
+    auto* pcRing = reinterpret_cast<PSConstants*>(f.ringCpu + psOffset);
+    thread_local VSConstants vcStage;
+    thread_local PSConstants pcStage;
+    auto* vc = &vcStage;
+    auto* pc = &pcStage;
+    const bool hooked = regpu::GetHost().onDraw && (vs.tag || ps.tag); // onDraw reads and writes vc->c
     {
         // Byte-swapped block copy of both constant banks (1024 dwords each).
         const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
         // Only the constants each shader reads (the rest of the block is never read).
         const auto* src = reinterpret_cast<const __m128i*>(gpureg::File() + gpureg::AluConstants * 4);
-        auto* dv = reinterpret_cast<__m128i*>(vc->c);
-        auto* dp = reinterpret_cast<__m128i*>(pc->c);
+        auto* dv = reinterpret_cast<__m128i*>(hooked ? vc->c : vcRing->c);
+        auto* dp = reinterpret_cast<__m128i*>(pcRing->c);
         static LiveSwitch allConstants("REGPU_ALL_CONSTANTS"); // A/B
         const uint32_t nv = allConstants ? 256 : std::min(vs.info.constantsUsed, 256u), np = allConstants ? 256 : std::min(ps.info.constantsUsed, 256u);
         if (static LiveSwitch traceUsed("REGPU_TRACE_CONSTANTS_USED"); traceUsed)
@@ -6460,7 +6485,6 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                     _mm_storeu_si128(dst + i, _mm_shuffle_epi8(_mm_loadu_si128(from + i), swap));
                 }
         };
-        const bool hooked = regpu::GetHost().onDraw && (vs.tag || ps.tag);
         copy(dv, src, vs.info.constantMask, nv, allConstants || hooked);
         copy(dp, src + 256, ps.info.constantMask, np, allConstants || hooked);
         if (motion)
@@ -6488,6 +6512,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             vc->vjitter[2] = vc->vjitter[3] = 0;
         }
     }
+    Sub(0); // index list, ring allocations, float constants
     for (uint32_t i = 0; i < 8; i++)
         vc->b[i] = pc->b[i] = gpureg::Get(gpureg::BoolConstants + i);
     for (uint32_t i = 0; i < 32; i++)
@@ -6503,6 +6528,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             vc->b[index >> 5] = pc->b[index >> 5] = value ? (pc->b[index >> 5] | bit) : (pc->b[index >> 5] & ~bit);
         }
     }
+    Sub(1); // bools, loops
     memset(vc->vf, 0, sizeof(vc->vf));
     for (uint32_t k : vs.info.vertexFetchConstants)
     {
@@ -6546,6 +6572,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vf[k][0] = uint32_t(dataOffset);
         vc->vf[k][1] = d1 & 3;
     }
+    Sub(2); // vertex fetches (uploads)
     // Perspective geometry in a wide pass (see ViewExtent): the game's camera already projects
     // at the wider aspect once hooks/camera_aspect.cpp widened it, so only the vertical zoom
     // for REGPU_WIDE_FOV < 100 remains; otherwise the view is narrowed here (Hor+ without the
@@ -6612,6 +6639,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->voffset[2] = RegFloat(PA_CL_VPORT_ZOFFSET);
     vc->vte[0] = gpureg::Get(PA_CL_VTE_CNTL);
     vc->vte[1] = vc->vte[2] = vc->vte[3] = 0;
+    Sub(3); // viewport, MSAA scale
     // Triangle lists and restart-free strips from an index buffer: a real indexed draw.
     static LiveSwitch noIndexed("REGPU_NO_INDEXED");
     D3D12_INDEX_BUFFER_VIEW indexView{};
@@ -6640,6 +6668,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // The window scissor marks a tall pass (PassHeight); this draw may be its first, so check before the
     // target size is taken (else the vertices are placed for 720 rows in a taller viewport: a one-off 1024-row
     // downsample came out stretched 1.42x).
+    Sub(4); // index buffer
     (void)WindowScissor();
     vc->info[2] = PassWidth();
     vc->info[3] = PassHeight();
@@ -6670,6 +6699,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const uint32_t colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF;
     pc->info2[3] = colorFormat == 3 || colorFormat == 12 ? 31.875f : 0.0f;
 
+    Sub(5); // the rest
     Section(4);
     // Textures are bindless: each one has a permanent descriptor in the heap's
     // bindless region, and the draw passes its index in the constants.
@@ -6888,6 +6918,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 Log("perf: SetPipelineState took %.1f ms (vs %016llx ps %016llx)", ms, (unsigned long long)C().vsHash, (unsigned long long)C().psHash);
         }
     }
+    {
+        const size_t vsFrom = hooked ? 0 : offsetof(VSConstants, b), psFrom = offsetof(PSConstants, b);
+        memcpy(reinterpret_cast<uint8_t*>(vcRing) + vsFrom, reinterpret_cast<const uint8_t*>(vc) + vsFrom, sizeof(VSConstants) - vsFrom);
+        memcpy(reinterpret_cast<uint8_t*>(pcRing) + psFrom, reinterpret_cast<const uint8_t*>(pc) + psFrom, sizeof(PSConstants) - psFrom);
+    }
     C().list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     C().list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
     if (motion)
@@ -6944,7 +6979,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         if (getenv("REGPU_TRACE_VC"))
             for (uint32_t i = 0; i < 256; i++)
             {
-                const float* c = vc->c[i];
+                const float* c = vcRing->c[i];
                 if (c[0] != 0 || c[1] != 0 || c[2] != 0 || c[3] != 0)
                     Log("    vc%u = %g %g %g %g", i, c[0], c[1], c[2], c[3]);
             }
@@ -7023,7 +7058,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         Log("    surface %08X color %08X depth %08X depthctl %08X stencil %08X colorctl %08X mode %X", gpureg::Get(0x2000), gpureg::Get(0x2001), gpureg::Get(0x2002),
             gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_STENCILREFMASK), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
         for (uint32_t c : { 0u, 1u, 5u, 6u, 7u, 14u, 22u, 254u, 255u })
-            Log("    pc%u = %g %g %g %g", c, pc->c[c][0], pc->c[c][1], pc->c[c][2], pc->c[c][3]);
+            Log("    pc%u = %g %g %g %g", c, pcRing->c[c][0], pcRing->c[c][1], pcRing->c[c][2], pcRing->c[c][3]);
     }
     {
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -7227,6 +7262,14 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
             Log("perf:   shaders %.2f | indices %.2f | pipeline %.2f | constants %.2f | textures %.2f | submit %.2f ms/frame",
                 g_perf.section[0] * 1000.0 / g_perf.frames, g_perf.section[1] * 1000.0 / g_perf.frames, g_perf.section[2] * 1000.0 / g_perf.frames,
                 g_perf.section[3] * 1000.0 / g_perf.frames, g_perf.section[4] * 1000.0 / g_perf.frames, g_perf.section[5] * 1000.0 / g_perf.frames);
+        if (perf && g_perf.frames)
+        {
+            Log("perf:   constants: lists/floats %.2f | bools %.2f | fetches %.2f | viewport %.2f | indices %.2f | rest %.2f ms/frame",
+                g_sub[0] * 1000.0 / g_perf.frames, g_sub[1] * 1000.0 / g_perf.frames, g_sub[2] * 1000.0 / g_perf.frames, g_sub[3] * 1000.0 / g_perf.frames,
+                g_sub[4] * 1000.0 / g_perf.frames, g_sub[5] * 1000.0 / g_perf.frames);
+            for (double& v : g_sub)
+                v = 0;
+        }
         if (perf)
             Log("perf:   cpu%s | slowest frame %.1f ms, %llu over 20 ms", RegpuGuestCpuUsage(window).c_str(), g_perf.maxFrame,
                 (unsigned long long)g_perf.slowFrames);

@@ -179,6 +179,10 @@ void LogRegs(uint32_t index, const uint32_t* valuesBE, uint32_t count)
 }
 
 void WriteBackNow(uint32_t address, uint32_t value);
+namespace PendingWrites
+{
+void Add(uint64_t fence, uint32_t address, uint32_t value);
+}
 
 // ---- Parallel draw segments ------------------------------------------------------------
 // Between resolves (and fences, swaps, waits, interrupts) the draws of a frame are
@@ -427,7 +431,7 @@ void WorkerLoop()
                 FrameOnSwap(uint64_t(a[0]) | uint64_t(a[1]) << 32, a[2]);
                 break;
             case work::kWriteBack:
-                WriteBackNow(a[0], a[1]);
+                PendingWrites::Add(RendererFenceSubmit(), a[0], a[1]); // after the host GPU, as on the command processor
                 break;
             case work::kStore:
                 StoreBE32(a[0], a[1]);
