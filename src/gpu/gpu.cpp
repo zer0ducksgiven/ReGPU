@@ -84,7 +84,8 @@ struct Gpu
     // Predicated tiling: type-3 packets with the predicate bit run only
     // when (binSelect & binMask) != 0. D3D replays each frame per tile and
     // predicates its once-per-frame packets (swap callbacks, fences).
-    bool dropDraws = false; // inside a replayed tile pass whose draws the first tile drew (TileMerge)
+    bool dropDraws = false; // this draw is a later tile's, which the first tile drew (TileMerge)
+    bool inReplay = false;  // running a buffer that replays a tile pass for a later tile (TileMerge)
     uint64_t droppedDraws = 0;
     uint64_t binMask = ~0ull;
     uint64_t binSelect = ~0ull;
@@ -378,7 +379,7 @@ void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         int32_t rect[4];
         RendererScreenScissor(rect);
-        g_gpu.dropDraws = !work::Active() && RendererTileDrop(gpureg::Get(0x2000 /* RB_SURFACE_INFO */), rect, RendererIsResolveDraw(), initiator);
+        g_gpu.dropDraws = !work::Active() && RendererTileDrop(gpureg::Get(0x2000 /* RB_SURFACE_INFO */), rect, RendererIsResolveDraw(), initiator, g_gpu.inReplay);
     }
     if (g_gpu.dropDraws)
     {
@@ -817,8 +818,13 @@ uint32_t ExecutePacket(uint32_t ptr)
             if (const auto [it, inserted] = runs.try_emplace(key, now); !inserted && it->second.windowOffset == 0 && now.windowOffset != 0 &&
                 it->second.surface == now.surface && !work::Active())
                 replay = RendererTileReplay(now.surface, it->second.rect, now.rect);
-            (void)replay; // (learning only: draws are dropped by their scissor, in SubmitDraw)
+            // (Its draws are dropped in SubmitDraw up to the tile's first resolve: they include the
+            // tile's own clears, whose scissor is not the tile's, and which would wipe what the
+            // first tile drew there.)
+            const bool outer = g_gpu.inReplay;
+            g_gpu.inReplay = outer || replay;
             ExecuteBuffer(PhysToGuest(arg(0) & ~3u), arg(1) & 0xFFFFF);
+            g_gpu.inReplay = outer;
         }
         break;
     case 0x3D: // MEM_WRITE: address, values...

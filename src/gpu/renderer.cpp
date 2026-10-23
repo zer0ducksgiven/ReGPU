@@ -3959,9 +3959,13 @@ static LiveSwitch g_noForeignTile("REGPU_NO_FOREIGN_TILE"); // A/B for the paint
 // tiles drop their draws up to their own first resolve. Resolves stay per tile (each copies its
 // tile to its own address), and what follows a tile's first resolve (passes that sample it) is
 // drawn tile by tile as before.
-// EXPERIMENTAL, off by default (REGPU_TILE_MERGE=1 turns it on): PGR4's races ran at ~97 fps
-// instead of ~75 with it, but the area of the later tiles still came out wrong in places (menus
-// with a mid-pass resolve and composite; with the phase tracking, the race too). Not finished.
+// A resolve keeps its clear inside the first tile (ReGPU otherwise extends a full-width clear down
+// the surface for the next tile, which wiped what the first tile drew there).
+// EXPERIMENTAL, off by default (REGPU_TILE_MERGE=1 turns it on): PGR4 races ~63 -> ~85 fps, menus
+// ~75 -> ~96. Still wrong: in the race one road marking in the bottom third comes out dark (a
+// dropped later-tile draw the widened first tile does not reproduce: REGPU_TILE_MERGE_KEEP=1
+// keeps them and the picture matches), and the profile menu shows a small black speck. Debug:
+// REGPU_TRACE_TILE_PHASE, REGPU_TRACE_TILE_WIDEN, REGPU_TILE_MERGE_KEEP, REGPU_TILE_MERGE_DROP_RESOLVES.
 namespace TileMerge
 {
 struct Entry
@@ -3994,9 +3998,11 @@ struct Phase
     bool laterResolved[4]{};
     int current = -1; // the tile running: 0 the first, 1.. the later ones
     uint32_t counts[4]{}; // REGPU_TRACE_TILES: first tile before / after its first resolve, later tiles the same
+    uint32_t bases[2]{};  // REGPU_TRACE_TILES: colour | depth EDRAM bases of the first and the later tiles' last draws
 };
 Phase g_phase;
 thread_local bool t_widened = false; // WindowScissor's last answer was widened
+bool g_mergedResolve = false;        // the resolve about to run is a merged first tile's (its clear stays in the tile)
 // Surfaces whose later tiles clear with rectangles sized to the tile before resolving (PGR4's
 // menus): the first tile's scissor does not widen those, so the scene behind is not merged there.
 std::set<uint32_t> g_unsafe;
@@ -4966,7 +4972,9 @@ void Resolve()
     D3D12_RECT clearRect = rect;
     const uint32_t surfacePitch = gpureg::Get(RB_SURFACE_INFO) & 0x3FFF;
     static LiveSwitch noClearExtend("REGPU_NO_CLEAR_EXTEND");
-    if (!noClearExtend && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, kWidth) && rect.left == 0)
+    // (Not in a merged tile pass (TileMerge): the later tiles' rows are drawn already.)
+    const bool merged = std::exchange(TileMerge::g_mergedResolve, false);
+    if (!noClearExtend && !merged && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, kWidth) && rect.left == 0)
         clearRect.bottom = PassHeight();
     if ((control >> 8) & 1) // colour clear (ARGB)
     {
@@ -6100,12 +6108,20 @@ uint64_t RendererFenceSubmit() { return FenceSubmitImpl(); }
 
 void RendererScreenScissor(int32_t rect[4]) { ScreenScissor(rect); }
 
-bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uint32_t initiator)
+bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uint32_t initiator, bool replay)
 {
+    static LiveSwitch tracePhase("REGPU_TRACE_TILE_PHASE"); // the tile pass's resolves and draw counts
+    TileMerge::Phase& p = TileMerge::g_phase;
+    if (tracePhase && resolve)
+        Log("tile resolve: surface %08X (pass %08X) scissor %d,%d-%d,%d replay %d current %d first resolved %d later resolved %d, draws %u %u %u %u", surface,
+            p.surface, rect[0], rect[1], rect[2], rect[3], int(replay), p.current, int(p.firstResolved), int(p.laterResolved[0]), p.counts[0], p.counts[1],
+            p.counts[2], p.counts[3]);
     const TileMerge::Table* t = TileMerge::g_table.load(std::memory_order_acquire);
     if (!t || !TileMerge::Enabled() || TileMerge::g_unsafe.count(surface))
         return false;
-    TileMerge::Phase& p = TileMerge::g_phase;
+    if (false)
+        Log("tile resolve: scissor %d,%d-%d,%d replay %d current %d first resolved %d later resolved %d, draws %u %u %u %u", rect[0], rect[1], rect[2], rect[3],
+            int(replay), p.current, int(p.firstResolved), int(p.laterResolved[0]), p.counts[0], p.counts[1], p.counts[2], p.counts[3]);
     for (const TileMerge::Entry& e : t->entries)
     {
         if (e.surface != surface || e.learnedFrame >= g_r.frame)
@@ -6115,15 +6131,21 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
             // The first tile: a new pass when we come from a later tile (or another surface).
             if (p.surface != surface || p.inLater)
             {
-                if (static LiveSwitch traceTiles("REGPU_TRACE_TILES"); traceTiles && p.surface)
-                    Log("tile pass %08X: first tile %u + %u draws (before/after its first resolve), later %u + %u", p.surface, p.counts[0], p.counts[1],
-                        p.counts[2], p.counts[3]);
+                if (tracePhase && p.surface)
+                    Log("tile pass %08X: first tile %u + %u draws (before/after its first resolve), later %u + %u; bases %08X / %08X", p.surface, p.counts[0],
+                        p.counts[1], p.counts[2], p.counts[3], p.bases[0], p.bases[1]);
                 p = { surface };
             }
             p.current = 0;
             p.counts[p.firstResolved ? 1 : 0]++;
+            p.bases[0] = (gpureg::Get(RB_COLOR_INFO) & 0xFFF) << 16 | (gpureg::Get(RB_DEPTH_INFO) & 0xFFF);
             if (resolve)
-                p.firstResolved = true; // (before the renderer sees it: the resolve itself is not widened)
+            {
+                // (Before the renderer sees it: the resolve itself is not widened, and its clear
+                // must not reach the later tiles' rows, which this tile has drawn already.)
+                TileMerge::g_mergedResolve = true; // (every one: PGR4 ends a tile with a copy, then a clearing resolve)
+                p.firstResolved = true;
+            }
             return false;
         }
         for (uint32_t i = 0; i < e.laterCount; i++)
@@ -6134,8 +6156,12 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
                 p.inLater = true;
                 p.current = int(i) + 1;
                 p.counts[p.laterResolved[i] ? 3 : 2]++;
+                p.bases[1] = (gpureg::Get(RB_COLOR_INFO) & 0xFFF) << 16 | (gpureg::Get(RB_DEPTH_INFO) & 0xFFF);
                 if (resolve)
                 {
+                    static LiveSwitch dropResolves("REGPU_TILE_MERGE_DROP_RESOLVES"); // debug
+                    if (dropResolves)
+                        return true;
                     p.laterResolved[i] = true;
                     return false;
                 }
@@ -6157,7 +6183,10 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
             p.firstResolved = true;
         else
             p.laterResolved[p.current - 1] = true;
+        return false;
     }
+    // (Draws with a scissor of their own stay: D3D gives each tile the draw's scissor cut to the
+    // tile, so a decal across the tiles' border reached the first tile cut short.)
     return false;
 }
 
@@ -7093,6 +7122,16 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         return;
     }
     D3D12_RECT hostScissor = ToHost(scissor);
+    if (static LiveSwitch traceWidened("REGPU_TRACE_TILE_WIDEN"); traceWidened && TileMerge::t_widened)
+    {
+        static uint64_t logged = 0;
+        if (logged != g_r.frame)
+        {
+            logged = g_r.frame;
+            Log("tile merge draw: scissor %ld,%ld-%ld,%ld host %ld,%ld-%ld,%ld viewport y %g h %g shift %g pass %ux%u", scissor.left, scissor.top, scissor.right,
+                scissor.bottom, hostScissor.left, hostScissor.top, hostScissor.right, hostScissor.bottom, vp.TopLeftY, vp.Height, shiftY, PassWidth(), PassHeight());
+        }
+    }
     // A scissor narrower than the screen in a wide pass clips 2D content (a minimap),
     // which the vertex shader keeps in the centred 16:9 area: map it the same way. Not for
     // screen layers (post-processing done in halves would leave a seam).
