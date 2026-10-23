@@ -978,9 +978,17 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    // Positions the title gives in screen space (no viewport scale or offset: its\n"
              "    // rectangle clears and filter passes, authored for D3D9's integer pixel centres,\n"
              "    // e.g. -0.5 .. 255.5) must cover the last row and column too: shift by half a pixel.\n"
-             "    if ((vte.x & 0x30Fu) == 0x300u) p.xy += 0.5;\n"
-             "    // vscale.w/voffset.w: pixel scale of MSAA clear rectangles (renderer.cpp).\n"
+             "    // vscale.w/voffset.w: pixel scale of MSAA clear rectangles (renderer.cpp), applied before the\n"
+             "    // half-pixel shift: scaled after it, a 4x view's rectangle started a whole pixel in and left the\n"
+             "    // first row and column uncleared (vte.x bit 31, REGPU_OLD_CLEAR_SHIFT: the old order).\n"
+             "    // vte.x bit 30 (texture-less, upscaled surface): edges snapped to the guest pixels whose\n"
+             "    // centres they cover instead, so each host pixel takes its guest pixel's coverage.\n"
+             "    bool halfPixel = (vte.x & 0x30Fu) == 0x300u;\n"
+             "    bool snap = halfPixel && (vte.x & (1u << 30));\n"
+             "    if (snap) p.xy = ceil(p.xy);\n"
+             "    if (halfPixel && !snap && (vte.x & (1u << 31))) p.xy += 0.5;\n"
              "    if (vscale.w > 0.0) p.xy *= float2(vscale.w, voffset.w);\n"
+             "    if (halfPixel && !snap && !(vte.x & (1u << 31))) p.xy += 0.5;\n"
              "    p.xy += pointOffset;\n"
              "    if (vte.x & (1u << 8)) w = 1.0;\n"
              "    float2 ndc = float2(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0);\n"
@@ -1019,6 +1027,7 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    case 6: if (!(oC[0].a >= pinfo2.x)) discard; break;\n"
              "    }\n"
              "    if (pinfo2.w > 0.0) oC[0].rgb = clamp(oC[0].rgb, 0.0, pinfo2.w); // 7e3 target range\n"
+             "    else if (pinfo2.w < 0.0) oC[0] = saturate(oC[0]); // fixed-point target\n"
              + std::string(e.exportsDepth ? "    PSOut o; o.c = oC[0]; o.d = saturate(oD.x); return o;\n}\n" : "    return oC[0];\n}\n");
     }
     result.hlsl = h;

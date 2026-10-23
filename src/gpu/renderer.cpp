@@ -6955,6 +6955,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->voffset[2] = RegFloat(PA_CL_VPORT_ZOFFSET);
     vc->vte[0] = gpureg::Get(PA_CL_VTE_CNTL);
     vc->vte[1] = vc->vte[2] = vc->vte[3] = 0;
+    // Flags for the screen-space position code (hlsl.cpp), in bits the register doesn't use:
+    // bit 31 REGPU_OLD_CLEAR_SHIFT (A/B: half-pixel shift before the MSAA-view scale); bit 30 snaps a
+    // texture-less screen-space draw's edges to whole guest pixels on an upscaled surface. The console
+    // covers a guest pixel by its centre; scaled, the half-pixel shift is more than half a host pixel,
+    // and a rectangle with integer edges (a shadow map's clear) lost its first row and column.
+    // REGPU_NO_RECT_SNAP=1: no snap.
+    static LiveSwitch oldClearShift("REGPU_OLD_CLEAR_SHIFT"), noRectSnap("REGPU_NO_RECT_SNAP");
+    if (oldClearShift)
+        vc->vte[0] |= 1u << 31;
+    if (!noRectSnap && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots && (ScaleX() != 1.0f || ScaleY() != 1.0f))
+        vc->vte[0] |= 1u << 30;
     Sub(3); // viewport, MSAA scale
     // Triangle lists and restart-free strips from an index buffer: a real indexed draw.
     static LiveSwitch noIndexed("REGPU_NO_INDEXED");
@@ -7001,10 +7012,15 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
     const uint32_t colorControl = gpureg::Get(RB_COLORCONTROL);
-    // Depth-only passes (EDRAM mode 5) keep the alpha test: a shadow map can have
-    // cut-out geometry that otherwise lands in it as solid blocks (jagged shadow under the
-    // object). REGPU_NO_DEPTH_ALPHATEST=1 skips it.
-    static const bool depthAlphaTest = getenv("REGPU_NO_DEPTH_ALPHATEST") == nullptr;
+    // Depth-only passes (EDRAM mode 5) keep the alpha test for draws that sample a texture: a
+    // shadow map can have cut-out geometry that otherwise lands in it as solid blocks (jagged
+    // shadow under the object). A texture-less draw has no cut-out to make: Top Spin 4 clears its
+    // shadow map's depth with a quad whose colour, and so alpha, is 0, and the console writes it
+    // (alpha-tested, the clear was lost and the stale depth shadowed the map's whole square).
+    // REGPU_NO_DEPTH_ALPHATEST=1: no alpha test in depth-only passes; REGPU_DEPTH_ALPHATEST_ALL=1:
+    // texture-less draws tested too (before).
+    static LiveSwitch noDepthAlphaTest("REGPU_NO_DEPTH_ALPHATEST"), testAll("REGPU_DEPTH_ALPHATEST_ALL");
+    const bool depthAlphaTest = !noDepthAlphaTest && (testAll || ps.info.usedTextureSlots || vs.info.usedTextureSlots);
     pc->info[0] = (colorControl >> 3) & 1 && (edramMode != 5 || depthAlphaTest) ? (colorControl & 7) : 7;
     pc->info2[0] = RegFloat(RB_ALPHA_REF);
     pc->info2[1] = 1.0f / ScaleX();
@@ -7012,8 +7028,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // Our colour target is half float: a 7e3 surface (formats 3 and 12, the title's HDR scene)
     // saturates at 31.875, so its output is clamped to that, as the hardware does (the bloom
     // reads those values).
+    // A fixed-point surface (k_8_8_8_8, its _GAMMA, k_2_10_10_10, 0 1 2 10) takes the output clamped
+    // to 0..1 before blending (-1: saturate). Unclamped, a multiply blend brightened where the output
+    // was a little over 1 (Top Spin 4's contact-shadow decals: light squares under every foot).
+    // REGPU_NO_UNORM_CLAMP=1: not clamped.
+    static LiveSwitch noUnormClamp("REGPU_NO_UNORM_CLAMP");
     const uint32_t colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF;
-    pc->info2[3] = colorFormat == 3 || colorFormat == 12 ? 31.875f : 0.0f;
+    const bool unorm = colorFormat == 0 || colorFormat == 1 || colorFormat == 2 || colorFormat == 10;
+    pc->info2[3] = colorFormat == 3 || colorFormat == 12 ? 31.875f : unorm && !noUnormClamp ? -1.0f : 0.0f;
 
     Sub(5); // the rest
     Section(4);
@@ -7130,6 +7152,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         memo.samplesResolve = g_drawSamplesResolve;
         g_drawSamplesResolve |= samplesBefore;
     }
+    pc->info[2] = 0;
     // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
     // and must keep spanning the width (squeezing them warped the image outside 16:9).
     vc->vwide[3] = g_drawSamplesResolve ? 0.0f : 1.0f;
@@ -8078,6 +8101,14 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             uint8_t* mapped = nullptr;
             d.buffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
             std::vector<uint8_t> out(size_t(d.width) * d.height * 4);
+            // Depth: the values between the clear values (0, 1) stretched over the grey range, so a
+            // map of depths close together (a shadow map) shows its shapes.
+            float lo = 1.0f, hi = 0.0f;
+            if (d.format == DXGI_FORMAT_R32_FLOAT)
+                for (UINT y = 0; y < d.height; y++)
+                    for (UINT x = 0; x < d.width; x++)
+                        if (const float f = reinterpret_cast<const float*>(mapped + size_t(y) * d.pitch)[x]; f > 0.0f && f < 1.0f)
+                            lo = std::min(lo, f), hi = std::max(hi, f);
             for (UINT y = 0; y < d.height; y++)
                 for (UINT x = 0; x < d.width; x++)
                 {
@@ -8103,7 +8134,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
                         d.maxDepth = std::max(d.maxDepth, f);
                         if (f > 0.0f && f < 1.0f)
                             d.midCount++;
-                        o[0] = o[1] = o[2] = uint8_t(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f);
+                        const float g = f <= 0.0f ? 0.0f : f >= 1.0f ? 1.0f : hi > lo ? 0.1f + 0.8f * (f - lo) / (hi - lo) : 0.5f;
+                        o[0] = o[1] = o[2] = uint8_t(g * 255.0f + 0.5f);
                         o[3] = 255;
                     }
                     else
@@ -8112,8 +8144,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
                 }
             d.buffer->Unmap(0, nullptr);
             if (d.format == DXGI_FORMAT_R32_FLOAT)
-                Log("resolve dump: depth %08X %ux%u min %g max %g strictly-inside %llu", d.base, d.width, d.height, d.minDepth, d.maxDepth,
-                    (unsigned long long)d.midCount);
+                Log("resolve dump: depth %08X %ux%u min %g max %g strictly-inside %llu (%g to %g, drawn stretched)", d.base, d.width, d.height,
+                    d.minDepth, d.maxDepth, (unsigned long long)d.midCount, lo, hi);
             std::filesystem::create_directories("out/res");
             char name[96];
             snprintf(name, sizeof(name), "out/res/%08X_%ux%u_v%d.png", d.base, d.width, d.height, d.variant);
