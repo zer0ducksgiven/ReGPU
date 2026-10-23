@@ -504,6 +504,52 @@ void WriteBackNow(uint32_t address, uint32_t value)
     *GuestPtr<uint32_t>(PhysToGuest(address & ~3u)) = GpuSwap(value, address);
 }
 
+// Fence writes waiting for the host GPU to reach the draws before them, written in order by
+// their own thread.
+namespace PendingWrites
+{
+struct Write
+{
+    uint64_t fence;
+    uint32_t address, value;
+};
+std::mutex g_mutex;
+std::condition_variable g_cv;
+std::deque<Write> g_queue;
+
+void Main()
+{
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    std::unique_lock lock(g_mutex);
+    for (;;)
+    {
+        g_cv.wait(lock, [] { return !g_queue.empty(); });
+        const Write w = g_queue.front();
+        lock.unlock();
+        RendererFenceWait(w.fence, event);
+        WriteBackNow(w.address, w.value);
+        lock.lock();
+        g_queue.pop_front(); // after the write: Add sees it pending until then, keeping the order
+    }
+}
+
+void Add(uint64_t fence, uint32_t address, uint32_t value)
+{
+    std::lock_guard lock(g_mutex);
+    if (!fence && g_queue.empty())
+    {
+        WriteBackNow(address, value);
+        return;
+    }
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(Main).detach(); });
+    if (!fence)
+        fence = g_queue.back().fence;
+    g_queue.push_back({ fence, address, value });
+    g_cv.notify_one();
+}
+}
+
 // Memory writes from the command stream (fences): after the draws before them.
 void WriteBack(uint32_t address, uint32_t value)
 {
@@ -516,8 +562,7 @@ void WriteBack(uint32_t address, uint32_t value)
         work::End(2);
         return;
     }
-    RendererFenceSync();
-    WriteBackNow(address, value);
+    PendingWrites::Add(RendererFenceSubmit(), address, value);
 }
 
 uint32_t ReadBack(uint32_t address)

@@ -5662,27 +5662,31 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
     w.x0 = x0, w.x1 = x1, w.y0 = y0, w.y1 = y1;
 }
 
-// Before a fence write from the command stream: run what has been recorded and let the host
-// GPU finish it, so the title only sees the fence once the draws before it have really read
-// their data. Written at record time, it reused vertex and index buffers the GPU had yet to
-// read (PGR4: torn geometry spiking into the sky for a frame, crowd poses snapping).
-// REGPU_EARLY_FENCES writes them at record time again (A/B; faster).
-void FenceSyncImpl()
+// Before a fence write from the command stream: what has been recorded is submitted and a host
+// fence marks its end, so the title only sees the fence once the draws before it have really read
+// their data. Written at record time, it reused vertex and index buffers the GPU had yet to read
+// (PGR4: torn geometry spiking into the sky for a frame, crowd poses snapping). The command
+// processor used to wait for the GPU here, which kept the CPU and GPU from ever overlapping
+// (PGR4 ran at 25 fps); the write now waits on its own thread (gpu.cpp).
+// REGPU_EARLY_FENCES writes them at record time again (A/B).
+uint64_t FenceSubmitImpl()
 {
     static LiveSwitch early("REGPU_EARLY_FENCES");
     if (early || !g_r.ok)
-        return;
-    // Nothing recorded since the last sync: nothing to wait for.
-    static uint64_t lastFrame = ~0ull;
+        return 0;
+    // Nothing recorded since the last one: the same point in the queue.
+    static uint64_t lastFrame = ~0ull, lastValue = 0;
     static uint32_t lastDraws = ~0u;
     const uint32_t draws = g_r.drawsThisFrame.load();
     if (lastFrame == g_r.frame && lastDraws == draws)
-        return;
+        return lastValue;
     lastFrame = g_r.frame;
     lastDraws = draws;
     BeginFrameIfNeeded();
     SplitMainList();
-    WaitForQueueIdle();
+    lastValue = g_r.nextFence++;
+    g_r.queue->Signal(g_r.fence.Get(), lastValue);
+    return lastValue;
 }
 
 void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info)
@@ -5861,7 +5865,15 @@ bool RendererIsResolveDraw()
     return (gpureg::Get(RB_MODECONTROL) & 7) == 6;
 }
 
-void RendererFenceSync() { FenceSyncImpl(); }
+uint64_t RendererFenceSubmit() { return FenceSubmitImpl(); }
+
+void RendererFenceWait(uint64_t value, void* event)
+{
+    if (g_r.fence->GetCompletedValue() >= value)
+        return;
+    g_r.fence->SetEventOnCompletion(value, HANDLE(event));
+    WaitForSingleObject(HANDLE(event), 2000);
+}
 
 void RendererOcclusionBegin()
 {

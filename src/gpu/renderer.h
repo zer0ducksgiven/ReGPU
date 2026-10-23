@@ -41,8 +41,12 @@ bool RendererIsResolveDraw();
 // Occlusion queries (EVENT_WRITE_ZPD): Begin starts counting the samples later draws pass;
 // End stops and gives the count in console samples (of the same query in the last completed
 // frame), false while there is none yet.
-// Before a fence write: the host GPU finishes what has been recorded (see renderer.cpp).
-void RendererFenceSync();
+// Before a fence write: what has been recorded is submitted, and the host GPU fence value
+// that marks its end comes back (0: nothing to wait for). The write itself waits for that
+// value on another thread (gpu.cpp), so the command processor reads on.
+uint64_t RendererFenceSubmit();
+// Blocks until the host GPU has reached a value from RendererFenceSubmit.
+void RendererFenceWait(uint64_t value, void* event);
 void RendererOcclusionBegin();
 bool RendererOcclusionEnd(uint32_t& samples);
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.
