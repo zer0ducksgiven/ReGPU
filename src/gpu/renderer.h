@@ -47,6 +47,16 @@ bool RendererIsResolveDraw();
 uint64_t RendererFenceSubmit();
 // Blocks until the host GPU has reached a value from RendererFenceSubmit.
 void RendererFenceWait(uint64_t value, void* event);
+// Predicated tiling merged (see renderer.cpp, TileMerge): the window scissor of the current
+// registers in screen space, and what was learned about a surface's tiles.
+void RendererScreenScissor(int32_t rect[4]);
+// A replayed tile pass seen on surface `surface` with this scissor, the first tile's being
+// `first`: learns the tiles; true when the replay's draws can be dropped (the first tile
+// already drew them all).
+bool RendererTileReplay(uint32_t surface, const int32_t first[4], const int32_t replay[4]);
+// Each draw on its way to the renderer, with its window scissor (screen space): true when it is
+// a later tile's draw that the first tile drew (dropped). Keeps track of where the tile pass is.
+bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uint32_t initiator);
 void RendererOcclusionBegin();
 bool RendererOcclusionEnd(uint32_t& samples);
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.

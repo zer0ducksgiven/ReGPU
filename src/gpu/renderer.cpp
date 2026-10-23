@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <tuple>
 #include <set>
 #include <shared_mutex>
 #include <unordered_set>
@@ -3948,6 +3949,93 @@ static LiveSwitch g_noForeignTile("REGPU_NO_FOREIGN_TILE"); // A/B for the paint
 // Tiling: each tile pass is shifted into EDRAM by the window offset and
 // clipped to the tile. We render in screen space, so draws (and resolves)
 // stay unshifted and are clipped to the tile's screen rectangle.
+// Predicated tiling, merged. A title rendering into EDRAM too small for its scene (PGR4: 1280x720
+// with MSAA) replays the same command buffers once per tile, each clipped to its tile: every draw
+// was recorded two or three times (PGR4: 3270 of 8100 draws a frame were the second tile). We
+// render the whole surface at once, so the first tile can draw the scene for all of them and the
+// others' draws are dropped. The command processor finds replays (gpu.cpp: a buffer run again in
+// a frame with another window offset) and learns each surface's tiles here. From the next frame
+// on, up to its first resolve the first tile's scissor is widened to all the tiles, and the other
+// tiles drop their draws up to their own first resolve. Resolves stay per tile (each copies its
+// tile to its own address), and what follows a tile's first resolve (passes that sample it) is
+// drawn tile by tile as before.
+// EXPERIMENTAL, off by default (REGPU_TILE_MERGE=1 turns it on): PGR4's races ran at ~97 fps
+// instead of ~75 with it, but the area of the later tiles still came out wrong in places (menus
+// with a mid-pass resolve and composite; with the phase tracking, the race too). Not finished.
+namespace TileMerge
+{
+struct Entry
+{
+    uint32_t surface = 0;
+    int32_t first[4]{}, all[4]{};
+    int32_t later[4][4]{}; // the other tiles' rectangles
+    uint32_t laterCount = 0;
+    uint64_t learnedFrame = 0;
+};
+struct Table
+{
+    std::vector<Entry> entries;
+};
+std::atomic<const Table*> g_table{ nullptr };
+std::mutex g_mutex;
+
+bool Enabled()
+{
+    static LiveSwitch on("REGPU_TILE_MERGE");
+    return on;
+}
+
+// Where the current tile pass is (the command processor's thread): the surface, whether the
+// first tile has resolved, and which later tiles have.
+struct Phase
+{
+    uint32_t surface = 0;
+    bool firstResolved = false, inLater = false;
+    bool laterResolved[4]{};
+    int current = -1; // the tile running: 0 the first, 1.. the later ones
+    uint32_t counts[4]{}; // REGPU_TRACE_TILES: first tile before / after its first resolve, later tiles the same
+};
+Phase g_phase;
+thread_local bool t_widened = false; // WindowScissor's last answer was widened
+// Surfaces whose later tiles clear with rectangles sized to the tile before resolving (PGR4's
+// menus): the first tile's scissor does not widen those, so the scene behind is not merged there.
+std::set<uint32_t> g_unsafe;
+
+// The first tile's scissor widened to all the tiles, when this is a learned first tile before its
+// first resolve.
+bool Widen(uint32_t surface, int32_t r[4])
+{
+    const Table* t = g_table.load(std::memory_order_acquire);
+    if (!t || !Enabled() || (g_phase.surface == surface && g_phase.firstResolved) || g_unsafe.count(surface))
+        return false;
+    for (const Entry& e : t->entries)
+        if (e.surface == surface && e.first[0] == r[0] && e.first[1] == r[1] && e.first[2] == r[2] && e.first[3] == r[3])
+        {
+            memcpy(r, e.all, sizeof(e.all));
+            return true;
+        }
+    return false;
+}
+}
+
+// The window scissor of the registers, in screen space, before clamping to the pass.
+void ScreenScissor(int32_t r[4])
+{
+    const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
+    const int32_t wx = int32_t(offsetReg << 17) >> 17, wy = int32_t((offsetReg >> 16) << 17) >> 17;
+    const bool vertexOffset = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1;
+    const uint32_t tl = gpureg::Get(PA_SC_WINDOW_SCISSOR_TL), br = gpureg::Get(PA_SC_WINDOW_SCISSOR_BR);
+    r[0] = int32_t(tl & 0x3FFF), r[1] = int32_t((tl >> 16) & 0x3FFF), r[2] = int32_t(br & 0x3FFF), r[3] = int32_t((br >> 16) & 0x3FFF);
+    if (!(tl >> 31))
+    {
+        r[0] += wx; r[2] += wx; r[1] += wy; r[3] += wy;
+    }
+    if (vertexOffset)
+    {
+        r[0] -= wx; r[2] -= wx; r[1] -= wy; r[3] -= wy;
+    }
+}
+
 D3D12_RECT WindowScissor()
 {
     const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
@@ -3962,6 +4050,12 @@ D3D12_RECT WindowScissor()
     if (vertexOffset)
     {
         x0 -= wx; x1 -= wx; y0 -= wy; y1 -= wy; // back to screen space
+    }
+    {
+        int32_t r[4] = { x0, y0, x1, y1 };
+        TileMerge::t_widened = TileMerge::Widen(gpureg::Get(0x2000 /* RB_SURFACE_INFO */), r);
+        if (TileMerge::t_widened)
+            x0 = r[0], y0 = r[1], x1 = r[2], y1 = r[3];
     }
     // Taller than the screen on a pass narrower than it: a tall render target (see PassHeight).
     const uint32_t surfaceInfo = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
@@ -6004,6 +6098,118 @@ bool RendererIsResolveDraw()
 
 uint64_t RendererFenceSubmit() { return FenceSubmitImpl(); }
 
+void RendererScreenScissor(int32_t rect[4]) { ScreenScissor(rect); }
+
+bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uint32_t initiator)
+{
+    const TileMerge::Table* t = TileMerge::g_table.load(std::memory_order_acquire);
+    if (!t || !TileMerge::Enabled() || TileMerge::g_unsafe.count(surface))
+        return false;
+    TileMerge::Phase& p = TileMerge::g_phase;
+    for (const TileMerge::Entry& e : t->entries)
+    {
+        if (e.surface != surface || e.learnedFrame >= g_r.frame)
+            continue;
+        if (memcmp(e.first, rect, sizeof(e.first)) == 0)
+        {
+            // The first tile: a new pass when we come from a later tile (or another surface).
+            if (p.surface != surface || p.inLater)
+            {
+                if (static LiveSwitch traceTiles("REGPU_TRACE_TILES"); traceTiles && p.surface)
+                    Log("tile pass %08X: first tile %u + %u draws (before/after its first resolve), later %u + %u", p.surface, p.counts[0], p.counts[1],
+                        p.counts[2], p.counts[3]);
+                p = { surface };
+            }
+            p.current = 0;
+            p.counts[p.firstResolved ? 1 : 0]++;
+            if (resolve)
+                p.firstResolved = true; // (before the renderer sees it: the resolve itself is not widened)
+            return false;
+        }
+        for (uint32_t i = 0; i < e.laterCount; i++)
+            if (memcmp(e.later[i], rect, sizeof(e.later[i])) == 0)
+            {
+                if (p.surface != surface)
+                    return false; // not seen its first tile: draw as is
+                p.inLater = true;
+                p.current = int(i) + 1;
+                p.counts[p.laterResolved[i] ? 3 : 2]++;
+                if (resolve)
+                {
+                    p.laterResolved[i] = true;
+                    return false;
+                }
+                if (!p.laterResolved[i] && (initiator & 0x3F) == 8) // a rectangle list: a clear of the tile
+                {
+                    TileMerge::g_unsafe.insert(surface);
+                    Log("tile merge: surface %08X clears its tiles with rectangles, not merged", surface);
+                    return false;
+                }
+                static LiveSwitch keep("REGPU_TILE_MERGE_KEEP"); // debug: widen the first tile, keep the others' draws
+                return !p.laterResolved[i] && !keep;
+            }
+    }
+    // A resolve with a scissor of its own during the pass (PGR4's menus resolve the scene mid-pass
+    // and composite from it): it ends the merged part of the tile running.
+    if (resolve && p.surface == surface && p.current >= 0)
+    {
+        if (p.current == 0)
+            p.firstResolved = true;
+        else
+            p.laterResolved[p.current - 1] = true;
+    }
+    return false;
+}
+
+bool RendererTileReplay(uint32_t surface, const int32_t first[4], const int32_t replay[4])
+{
+    if (!TileMerge::Enabled())
+        return false;
+    const uint64_t now = g_r.frame;
+    std::lock_guard lock(TileMerge::g_mutex);
+    const TileMerge::Table* old = TileMerge::g_table.load(std::memory_order_acquire);
+    TileMerge::Entry* found = nullptr;
+    if (old)
+        for (const auto& x : old->entries)
+            if (x.surface == surface && memcmp(x.first, first, sizeof(x.first)) == 0)
+                found = const_cast<TileMerge::Entry*>(&x);
+    // Learned in an earlier frame and covering this replay: its draws were drawn by the first tile.
+    if (found && found->learnedFrame < now && replay[0] >= found->all[0] && replay[1] >= found->all[1] && replay[2] <= found->all[2] &&
+        replay[3] <= found->all[3])
+        return true;
+    auto* t = new TileMerge::Table(old ? *old : TileMerge::Table{});
+    TileMerge::Entry* e = nullptr;
+    for (auto& x : t->entries)
+        if (x.surface == surface && memcmp(x.first, first, sizeof(x.first)) == 0)
+            e = &x;
+    if (!e)
+    {
+        if (t->entries.size() >= 16)
+        {
+            delete t;
+            return false;
+        }
+        e = &t->entries.emplace_back();
+        e->surface = surface;
+        memcpy(e->first, first, sizeof(e->first));
+        memcpy(e->all, first, sizeof(e->all));
+    }
+    bool known = false;
+    for (uint32_t i = 0; i < e->laterCount; i++)
+        known = known || memcmp(e->later[i], replay, sizeof(e->later[i])) == 0;
+    if (!known && e->laterCount < 4)
+        memcpy(e->later[e->laterCount++], replay, sizeof(e->later[0]));
+    e->all[0] = std::min(e->all[0], replay[0]);
+    e->all[1] = std::min(e->all[1], replay[1]);
+    e->all[2] = std::max(e->all[2], replay[2]);
+    e->all[3] = std::max(e->all[3], replay[3]);
+    e->learnedFrame = now;
+    Log("tile merge: surface %08X first tile %d,%d-%d,%d, all tiles %d,%d-%d,%d", surface, first[0], first[1], first[2], first[3], e->all[0], e->all[1],
+        e->all[2], e->all[3]);
+    TileMerge::g_table.store(t, std::memory_order_release); // (the old table is kept: readers may hold it)
+    return false;
+}
+
 void RendererFenceWait(uint64_t value, void* event)
 {
     if (g_r.fence->GetCompletedValue() >= value)
@@ -6832,8 +7038,34 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
         const int32_t wy = ((gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1) ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
         const bool full = scissor.left <= 0 && scissor.top <= 0 && scissor.right >= LONG(PassWidth()) && scissor.bottom >= LONG(PassHeight());
-        if (!full)
+        // REGPU_TRACE_TILES=1: draws per frame in tile passes (by tile rectangle) and full ones.
+        if (static LiveSwitch traceTiles("REGPU_TRACE_TILES"); traceTiles)
         {
+            static std::map<std::tuple<LONG, LONG, LONG, LONG>, uint32_t> byRect;
+            static uint32_t fullDraws = 0;
+            static uint64_t frame = 0;
+            if (frame != g_r.frame)
+            {
+                if (frame && g_r.frame % 60 == 0)
+                {
+                    std::string text;
+                    for (const auto& [r, n] : byRect)
+                        text += " [" + std::to_string(std::get<0>(r)) + "," + std::to_string(std::get<1>(r)) + "-" + std::to_string(std::get<2>(r)) + "," +
+                            std::to_string(std::get<3>(r)) + "]=" + std::to_string(n);
+                    Log("tiles: %u full-pass draws;%s", fullDraws, text.c_str());
+                }
+                byRect.clear();
+                fullDraws = 0;
+                frame = g_r.frame;
+            }
+            if (full)
+                fullDraws++;
+            else
+                byRect[{ scissor.left, scissor.top, scissor.right, scissor.bottom }]++;
+        }
+        if (!full || TileMerge::t_widened)
+        {
+            // (A merged first tile is the tile pass now: its draws are not shifted into an older tile.)
             g_tile.originY = -wy;
             g_tile.rect = scissor;
             g_tile.surface = gpureg::Get(RB_SURFACE_INFO);

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <unordered_map>
 #include <deque>
 #include <chrono>
 #include <thread>
@@ -83,6 +84,8 @@ struct Gpu
     // Predicated tiling: type-3 packets with the predicate bit run only
     // when (binSelect & binMask) != 0. D3D replays each frame per tile and
     // predicates its once-per-frame packets (swap callbacks, fences).
+    bool dropDraws = false; // inside a replayed tile pass whose draws the first tile drew (TileMerge)
+    uint64_t droppedDraws = 0;
     uint64_t binMask = ~0ull;
     uint64_t binSelect = ~0ull;
     std::atomic<uint64_t> skippedPredicated{ 0 };
@@ -371,6 +374,17 @@ void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwo
 
 void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    // A later tile's draw that the first tile drew for all of them (TileMerge).
+    {
+        int32_t rect[4];
+        RendererScreenScissor(rect);
+        g_gpu.dropDraws = !work::Active() && RendererTileDrop(gpureg::Get(0x2000 /* RB_SURFACE_INFO */), rect, RendererIsResolveDraw(), initiator);
+    }
+    if (g_gpu.dropDraws)
+    {
+        g_gpu.droppedDraws++;
+        return;
+    }
     if (seg::Enabled())
     {
         if (RendererIsResolveDraw() || !RendererParallelReady())
@@ -770,7 +784,42 @@ uint32_t ExecutePacket(uint32_t ptr)
     {
     case 0x3F: // INDIRECT_BUFFER
     case 0x37: // INDIRECT_BUFFER_PFD
-        ExecuteBuffer(PhysToGuest(arg(0) & ~3u), arg(1) & 0xFFFFF);
+        // REGPU_TRACE_IB=1: the indirect buffers run (address, dwords, window offset, scissor), 400 of them.
+        if (static LiveSwitch traceIb("REGPU_TRACE_IB"); traceIb)
+        {
+            static int logged = 0;
+            if (logged++ < 400)
+                Log("ib: %08X %u dwords, window offset %08X scissor %08X %08X, swaps %llu", arg(0), arg(1) & 0xFFFFF, gpureg::Get(0x2080),
+                    gpureg::Get(0x2081), gpureg::Get(0x2082), (unsigned long long)g_gpu.swaps.load());
+        }
+        {
+            // Predicated tiling merged (renderer.cpp, TileMerge): a buffer run again this frame
+            // with another window offset is a replay of a tile pass. Its packets still run
+            // (fences, interrupts); its draws are dropped once the first tile draws them all.
+            struct Run
+            {
+                uint32_t windowOffset, surface;
+                int32_t rect[4];
+            };
+            static std::unordered_map<uint64_t, Run> runs;
+            static uint64_t runsSwap = ~0ull;
+            if (runsSwap != g_gpu.swaps.load())
+            {
+                runs.clear();
+                runsSwap = g_gpu.swaps.load();
+            }
+            const uint64_t key = uint64_t(arg(0)) << 32 | (arg(1) & 0xFFFFF);
+            Run now{ gpureg::Get(0x2080 /* PA_SC_WINDOW_OFFSET */), gpureg::Get(0x2000 /* RB_SURFACE_INFO */), {} };
+            RendererScreenScissor(now.rect);
+            bool replay = false;
+            // (The first tile sits at the origin: window offset 0; the others are offset.)
+            // Not with the draw thread yet: merged there, the second tile's area came out unrendered.
+            if (const auto [it, inserted] = runs.try_emplace(key, now); !inserted && it->second.windowOffset == 0 && now.windowOffset != 0 &&
+                it->second.surface == now.surface && !work::Active())
+                replay = RendererTileReplay(now.surface, it->second.rect, now.rect);
+            (void)replay; // (learning only: draws are dropped by their scissor, in SubmitDraw)
+            ExecuteBuffer(PhysToGuest(arg(0) & ~3u), arg(1) & 0xFFFFF);
+        }
         break;
     case 0x3D: // MEM_WRITE: address, values...
         for (uint32_t i = 1; i < count; i++)
