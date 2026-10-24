@@ -268,6 +268,14 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     if ((tinfo[slot].x >> 19) & 1u) uv.y = clamp(uv.y, 0.5 / texelSize.y, 1.0 - 0.5 / texelSize.y);
     if (tbias[slot].z > 0.0) uv *= tbias[slot].zw; // declared image inside a wider resolved texture (renderer.cpp)
     uint mode = tinfo[slot].x & 3u;
+    // Vertex shaders read data tables this way (PGR4's riders: bone matrices, three texels a bone):
+    // the fetch constant's filter applies, point sampling exactly one texel. Always linear here,
+    // each matrix row was blended with its neighbours and the bodies came out mangled.
+    // (fxc wants a literal sampler per call: one branch each.)
+    if (vertexStage && mode == 2)
+        return t.SampleLevel(sPointClamp, uv, max(bias, 0));
+    if (vertexStage && mode == 3)
+        return t.SampleLevel(sPointWrap, uv, max(bias, 0));
     if (vertexStage)
         return t.SampleLevel(sLinearClamp, uv, max(bias, 0));
     if (mode == 1) return REGPU_SAMPLE_BIAS_2D(t, sLinearClamp, uv, bias);
@@ -497,8 +505,11 @@ struct Emitter
         if (a.vectorOp >= 20 && a.vectorOp <= 23)
         {
             static const char* cmp[] = { "== 0.0", "!= 0.0", "> 0.0", ">= 0.0" };
-            body += "{ bool c = (" + A + ".w " + cmp[a.vectorOp - 20] + ") && (" + B + ".w == 0.0); p = c; v = c ? 0.0 : (" + A +
-                ".x + 1.0).xxxx; } ";
+            // SETP_*_PUSH (Xenia ucode.h): p = src0.w == 0 && src1.w <op> 0; dest = 0 when
+            // src0.x == 0 && src1.x <op> 0, else src0.x + 1. (The comparison was on the wrong
+            // operand: skinned meshes' extra bones never applied, PGR4's riders came out pinched.)
+            body += "{ p = (" + A + ".w == 0.0) && (" + B + ".w " + cmp[a.vectorOp - 20] + "); bool c = (" + A + ".x == 0.0) && (" + B + ".x " +
+                cmp[a.vectorOp - 20] + "); v = c ? 0.0 : (" + A + ".x + 1.0).xxxx; } ";
         }
         else if (a.vectorOp >= 24 && a.vectorOp <= 27)
         {

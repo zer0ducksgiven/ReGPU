@@ -6806,6 +6806,7 @@ bool DebugSkipDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (!enabled)
         return false;
     static uint32_t from = 0, to = 0, info = ~0u;
+    static uint64_t infoVs = 0; // "infovs HASH": the first draw of that vertex shader
     static uint64_t readFrame = 0, infoFrame = 0;
     if (g_r.frame >= readFrame + 30)
     {
@@ -6817,19 +6818,34 @@ bool DebugSkipDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             char word[16] = {};
             if (fscanf(f, "%u %u", &from, &to) != 2)
                 from = to = 0;
-            if (fscanf(f, "%15s %u", word, &info) != 2 || strcmp(word, "info") != 0)
+            char hex[32] = {};
+            if (fscanf(f, "%15s %31s", word, hex) != 2)
+                info = ~0u;
+            else if (!strcmp(word, "info"))
+                info = uint32_t(atoi(hex));
+            else if (!strcmp(word, "infovs"))
+                info = 0xFFFFFFFEu, infoVs = strtoull(hex, nullptr, 16);
+            else
                 info = ~0u;
             fclose(f);
         }
     }
     const uint32_t n = g_r.drawsThisFrame.load();
-    if (n == info && infoFrame + 60 < g_r.frame)
+    if ((n == info || (info == 0xFFFFFFFEu && C().vsHash == infoVs)) && infoFrame + 60 < g_r.frame)
     {
         infoFrame = g_r.frame;
         Log("draw info %u: initiator %08X index base %08X size %08X vs %016llx ps %016llx", n, initiator, dmaBase, dmaSize, (unsigned long long)C().vsHash,
             (unsigned long long)C().psHash);
         for (uint32_t k = 0; k < 8; k++)
             Log("  vertex fetch %u: %08X %08X", k, gpureg::Get(gpureg::FetchConstants + k * 2), gpureg::Get(gpureg::FetchConstants + k * 2 + 1));
+        for (uint32_t slot = 0; slot < 32; slot++)
+        {
+            const TextureFetch f = ReadTextureFetch(slot);
+            if (f.Type() == 2)
+                Log("  texture fetch %u: %08X %08X %08X %08X %08X %08X (dimension %u, %ux%u, format %u, filter mag %u min %u, address %08X)", slot, f.dwords[0], f.dwords[1],
+                    f.dwords[2], f.dwords[3], f.dwords[4], f.dwords[5], f.Dimension(), f.Width(), f.Height(), f.Format(), (f.dwords[3] >> 19) & 3,
+                    (f.dwords[3] >> 21) & 3, f.Address());
+        }
         Log("  surface %08X colour %08X depth %08X mode %08X window offset %08X scissor %08X %08X", gpureg::Get(RB_SURFACE_INFO), gpureg::Get(RB_COLOR_INFO),
             gpureg::Get(RB_DEPTH_INFO), gpureg::Get(RB_MODECONTROL), gpureg::Get(PA_SC_WINDOW_OFFSET), gpureg::Get(PA_SC_WINDOW_SCISSOR_TL),
             gpureg::Get(PA_SC_WINDOW_SCISSOR_BR));
