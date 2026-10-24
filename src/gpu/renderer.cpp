@@ -1286,7 +1286,7 @@ void Init()
     // Guest physical memory for the GPU, in place: vertex fetches read it
     // without copies.
     ComPtr<ID3D12Device13> d13;
-    HRESULT hr = d->QueryInterface(IID_PPV_ARGS(&d13));
+    HRESULT hr = getenv("REGPU_FORCE_DEVICE3") ? E_NOINTERFACE : d->QueryInterface(IID_PPV_ARGS(&d13)); // (REGPU_FORCE_DEVICE3: test the fallback)
     if (SUCCEEDED(hr))
         hr = d13->OpenExistingHeapFromFileMapping(RegpuPhysicalSection(), IID_PPV_ARGS(&g_r.physicalHeap));
     if (FAILED(hr) && d13)
@@ -1294,9 +1294,24 @@ void Init()
         Log("renderer: OpenExistingHeapFromFileMapping failed %08X; trying the view address", unsigned(hr));
         hr = d13->OpenExistingHeapFromAddress1(GuestPtr(0xA0000000), 0x20000000, IID_PPV_ARGS(&g_r.physicalHeap));
     }
-    if (FAILED(hr))
-        Log("renderer: mapping guest memory: %s failed %08X", d13 ? "OpenExistingHeapFromAddress1" : "ID3D12Device13", unsigned(hr));
-    else
+    // Older runtimes (Windows 10, older drivers) have no ID3D12Device13, but ID3D12Device3 (Windows 10
+    // 1709+) opens a heap over the whole allocation an address is in: the 512 MB view of guest
+    // physical memory at 0xA0000000 is exactly that. The self-test below checks the GPU sees it.
+    // (From the FM2 port: 211 fps against 150 on the copy path there.)
+    if (FAILED(hr) && !d13)
+    {
+        ComPtr<ID3D12Device3> d3;
+        if (SUCCEEDED(hr = d->QueryInterface(IID_PPV_ARGS(&d3))))
+            hr = d3->OpenExistingHeapFromAddress(GuestPtr(0xA0000000), IID_PPV_ARGS(&g_r.physicalHeap));
+        if (SUCCEEDED(hr))
+            Log("renderer: guest memory opened through ID3D12Device3 (no ID3D12Device13), %llu MB",
+                (unsigned long long)(g_r.physicalHeap->GetDesc().SizeInBytes >> 20));
+        else
+            Log("renderer: mapping guest memory: no ID3D12Device13, and ID3D12Device3 failed %08X", unsigned(hr));
+    }
+    else if (FAILED(hr))
+        Log("renderer: mapping guest memory: OpenExistingHeapFromAddress1 failed %08X", unsigned(hr));
+    if (SUCCEEDED(hr))
     {
         D3D12_RESOURCE_DESC bd{};
         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1322,6 +1337,12 @@ void Init()
         g_r.physicalHeap.Reset();
     }
     Log("renderer: guest memory %s", g_r.physical ? "mapped for the GPU (zero-copy vertex fetch)" : "not mappable; vertex data is copied");
+    // For a port's launcher ("Reduced performance" warning): what this PC actually got.
+    if (FILE* f = _wfopen((regpu::GetConfig().userDir / "zero_copy.txt").c_str(), L"w"))
+    {
+        fputs(g_r.physical ? "1" : "0", f);
+        fclose(f);
+    }
 
     // Views for the EDRAM surfaces (created on first use).
     hd.NumDescriptors = kMaxSurfaces;
@@ -7078,15 +7099,19 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     auto* pcRing = reinterpret_cast<PSConstants*>(f.ringCpu + psOffset);
     thread_local VSConstants vcStage;
     thread_local PSConstants pcStage;
-    auto* vc = &vcStage;
-    auto* pc = &pcStage;
+    // Not in low performance mode (Config::lowPerformance): on an old CPU (FM2 on an FX-8350) the
+    // block copies cost more than the scattered writes they replace. REGPU_CONSTANTS_IN_RING=1 too.
+    static LiveSwitch inRingSwitch("REGPU_CONSTANTS_IN_RING");
+    const bool inRing = inRingSwitch || regpu::GetConfig().lowPerformance;
+    auto* vc = inRing ? vcRing : &vcStage;
+    auto* pc = inRing ? pcRing : &pcStage;
     const bool hooked = regpu::GetHost().onDraw && (vs.tag || ps.tag); // onDraw reads and writes vc->c
     {
         // Byte-swapped block copy of both constant banks (1024 dwords each).
         const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
         // Only the constants each shader reads (the rest of the block is never read).
         const auto* src = reinterpret_cast<const __m128i*>(gpureg::File() + gpureg::AluConstants * 4);
-        auto* dv = reinterpret_cast<__m128i*>(hooked ? vc->c : vcRing->c);
+        auto* dv = reinterpret_cast<__m128i*>(hooked && !inRing ? vc->c : vcRing->c);
         auto* dp = reinterpret_cast<__m128i*>(pcRing->c);
         static LiveSwitch allConstants("REGPU_ALL_CONSTANTS"); // A/B
         const uint32_t nv = allConstants ? 256 : std::min(vs.info.constantsUsed, 256u), np = allConstants ? 256 : std::min(ps.info.constantsUsed, 256u);
@@ -7336,10 +7361,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // shadow under the object). A texture-less draw has no cut-out to make: Top Spin 4 clears its
     // shadow map's depth with a quad whose colour, and so alpha, is 0, and the console writes it
     // (alpha-tested, the clear was lost and the stale depth shadowed the map's whole square).
+    // Only a texture the pixel shader samples makes a cut-out (FM2: the race's sun shadow map lost
+    // its casters and clears to a pass-through alpha of 0 while the vertex shader sampled one).
     // REGPU_NO_DEPTH_ALPHATEST=1: no alpha test in depth-only passes; REGPU_DEPTH_ALPHATEST_ALL=1:
-    // texture-less draws tested too (before).
-    static LiveSwitch noDepthAlphaTest("REGPU_NO_DEPTH_ALPHATEST"), testAll("REGPU_DEPTH_ALPHATEST_ALL");
-    const bool depthAlphaTest = !noDepthAlphaTest && (testAll || ps.info.usedTextureSlots || vs.info.usedTextureSlots);
+    // every draw tested (before); REGPU_DEPTH_ALPHATEST_VS=1: a vertex-shader texture counts too.
+    static LiveSwitch noDepthAlphaTest("REGPU_NO_DEPTH_ALPHATEST"), testAll("REGPU_DEPTH_ALPHATEST_ALL"), testVs("REGPU_DEPTH_ALPHATEST_VS");
+    const bool depthAlphaTest = !noDepthAlphaTest && (testAll || ps.info.usedTextureSlots || (testVs && vs.info.usedTextureSlots));
     pc->info[0] = (colorControl >> 3) & 1 && (edramMode != 5 || depthAlphaTest) ? (colorControl & 7) : 7;
     pc->info2[0] = RegFloat(RB_ALPHA_REF);
     pc->info2[1] = 1.0f / ScaleX();
@@ -7677,6 +7704,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         g_current.push_back(d);
     }
+    if (!inRing)
     {
         const size_t vsFrom = hooked ? 0 : offsetof(VSConstants, b), psFrom = offsetof(PSConstants, b);
         memcpy(reinterpret_cast<uint8_t*>(vcRing) + vsFrom, reinterpret_cast<const uint8_t*>(vc) + vsFrom, sizeof(VSConstants) - vsFrom);

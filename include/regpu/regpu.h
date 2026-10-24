@@ -35,6 +35,9 @@ struct Config
     // direct fetch). About 11 KB a draw goes to constants alone: titles with thousands of draws need
     // more, or their last draws are dropped. REGPU_RING_MB overrides it.
     uint32_t uploadRingMB = 0;
+    // Old CPUs: renderer optimisations that help fast PCs but cost slow ones are off (the staged draw
+    // constants: an FX-8350 lost time copying them).
+    bool lowPerformance = false;
 
     // The scene's resolution as a fraction of the output (1 when upscaling is off).
     float SceneScale() const;

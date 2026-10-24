@@ -14,6 +14,7 @@ Commands (sent as typed):
   wait 30 | wait 2.5s                frames, or seconds
   shot [path]                        the next frame as a PNG (default out/live.png)
   capture                            what F12 does (trace the next frame into out/capture)
+  rdcapture                          a RenderDoc capture of the next frame (started under RenderDoc: REGPU_WRAP)
   log [n]                            the last n lines of the log
   peek ADDR [bytes] | poke ADDR HEX  guest memory (hex addresses, big-endian bytes)
   ps HASH EXPR | ps HASH tint R,G,B  that pixel shader returns EXPR (HLSL over r[], input.o[], ...) or a flat
@@ -79,7 +80,10 @@ def start(assignments):
     # REGPU_GAME_ARGS: its command-line arguments; REGPU_GAME_CWD: where to run it (default: beside it).
     args = os.environ.get('REGPU_GAME_ARGS', '').split()
     cwd = os.environ.get('REGPU_GAME_CWD') or os.path.dirname(os.path.abspath(game))
-    p = subprocess.Popen([os.path.abspath(game)] + args, cwd=cwd, env=env, stdout=log, stderr=log,
+    # REGPU_WRAP: a launcher to start the game through, its arguments '|'-separated (RenderDoc:
+    # renderdoccmd|capture|-w; then "rdcapture" takes a capture).
+    wrap = [w for w in os.environ.get('REGPU_WRAP', '').split('|') if w]
+    p = subprocess.Popen(wrap + [os.path.abspath(game)] + args, cwd=cwd, env=env, stdout=log, stderr=log,
                          creationflags=flags)
     for _ in range(120):
         time.sleep(0.5)

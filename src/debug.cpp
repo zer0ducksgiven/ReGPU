@@ -25,6 +25,10 @@
 #include "log.h"
 #include "memory.h"
 #include "settings.h"
+#if __has_include("C:/Program Files/RenderDoc/renderdoc_app.h")
+#include "C:/Program Files/RenderDoc/renderdoc_app.h"
+#define REGPU_HAVE_RENDERDOC 1
+#endif
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -238,6 +242,24 @@ std::string Handle(const std::string& line)
             return Error("no frame came (the game may be loading or paused)");
         }
         return Ok("\"path\":\"" + Escape(path) + "\",\"frame\":" + std::to_string(g_frame));
+    }
+    // rdcapture: a RenderDoc capture of the next frame (the game started under RenderDoc, e.g. with
+    // regpuctl's REGPU_WRAP). From the FM2 port.
+    if (cmd == "rdcapture")
+    {
+#ifdef REGPU_HAVE_RENDERDOC
+        HMODULE rd = GetModuleHandleA("renderdoc.dll");
+        if (!rd)
+            return Error("not running under RenderDoc");
+        auto getApi = reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(rd, "RENDERDOC_GetAPI"));
+        RENDERDOC_API_1_1_2* api = nullptr;
+        if (!getApi || !getApi(eRENDERDOC_API_Version_1_1_2, reinterpret_cast<void**>(&api)) || !api)
+            return Error("RENDERDOC_GetAPI failed");
+        api->TriggerCapture();
+        return Ok("\"note\":\"captured at the next present\"");
+#else
+        return Error("built without RenderDoc's renderdoc_app.h");
+#endif
     }
     if (cmd == "capture")
     {
