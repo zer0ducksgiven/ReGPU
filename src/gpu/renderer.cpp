@@ -232,6 +232,10 @@ constexpr UINT kFrames = 3;
 // menus alone then need well over 64 MB a frame, and draws past the end were dropped (black
 // bands and missing letters). REGPU_RING_MB overrides.
 UINT64 kRingSize = 64ull << 20;
+// A frame that runs out of ring asks for twice as much: each slot rebuilds its ring at that size
+// at its next start (its GPU work done), so only that one frame drops draws.
+constexpr UINT64 kRingMax = 2048ull << 20;
+std::atomic<UINT64> g_ringWant{ 0 };
 UINT64 g_ringPeak = 0;
 constexpr UINT kDescriptorsPerFrame = 8192; // per frame: ring + guest memory views, then resolve-blit views
 constexpr UINT kBindless = 1u << 16;      // permanent texture descriptors (0 null 2D, 1 null cube)
@@ -342,6 +346,7 @@ struct FrameResources
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12Resource> ring;
     uint8_t* ringCpu = nullptr;
+    UINT64 ringSize = 0; // this slot's ring (grows, see RingAlloc)
     std::atomic<UINT64> ringUsed{ 0 }; // draw workers allocate concurrently
     // Guest ranges already uploaded this frame: (address << 32 | bytes) -> (offset, sample hash).
     std::unordered_map<uint64_t, std::pair<UINT64, uint64_t>> uploads;
@@ -1339,6 +1344,7 @@ void Init()
         Check(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.allocator)), "CreateCommandAllocator");
         f.ring = CreateBuffer(kRingSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
+        f.ringSize = kRingSize;
         f.descriptorBase = i * kDescriptorsPerFrame;
     }
     Check(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_r.frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&g_r.realList)),
@@ -1677,8 +1683,16 @@ void BeginFrameIfNeeded()
     if (const UINT64 used = f.ringUsed.load(); used > g_ringPeak)
     {
         g_ringPeak = used;
-        if (used > kRingSize / 2)
-            Log("renderer: upload ring peak %llu MB of %llu", (unsigned long long)(used >> 20), (unsigned long long)(kRingSize >> 20));
+        if (used > f.ringSize / 2)
+            Log("renderer: upload ring peak %llu MB of %llu", (unsigned long long)(used >> 20), (unsigned long long)(f.ringSize >> 20));
+    }
+    if (const UINT64 want = g_ringWant.load(); want > f.ringSize)
+    {
+        f.garbage.push_back(f.ring); // the old ring may still be referenced by views until this frame's end
+        f.ring = CreateBuffer(want, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
+        f.ringSize = want;
+        Log("renderer: upload ring grown to %llu MB", (unsigned long long)(want >> 20));
     }
     f.ringUsed = 0;
     f.uploads.clear();
@@ -1688,7 +1702,7 @@ void BeginFrameIfNeeded()
         raw.Format = DXGI_FORMAT_R32_TYPELESS;
         raw.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         raw.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        raw.Buffer.NumElements = UINT(kRingSize / 4);
+        raw.Buffer.NumElements = UINT(f.ringSize / 4);
         raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         g_r.device->CreateShaderResourceView(f.ring.Get(), &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride));
         if (g_r.physical)
@@ -1719,11 +1733,14 @@ UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
     for (;;)
     {
         offset = (used + alignment - 1) & ~(alignment - 1);
-        if (offset + bytes > kRingSize || f.ringUsed.compare_exchange_weak(used, offset + bytes, std::memory_order_relaxed))
+        if (offset + bytes > f.ringSize || f.ringUsed.compare_exchange_weak(used, offset + bytes, std::memory_order_relaxed))
             break;
     }
-    if (offset + bytes > kRingSize)
+    if (offset + bytes > f.ringSize)
     {
+        for (UINT64 want = g_ringWant.load(), grown = std::min(std::max(f.ringSize * 2, offset + bytes), kRingMax);
+             want < grown && !g_ringWant.compare_exchange_weak(want, grown);)
+            ;
         static UINT64 lastFull = 0;
         static int fullLogs = 0;
         if ((RendererTracing() || fullLogs < 20) && lastFull != g_r.frame && ++fullLogs)
@@ -3184,6 +3201,8 @@ ID3D12Resource* GetVolumeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     return cached.resource.Get();
 }
 
+ResolvedTexture* ResolveCurrent(uint32_t base);
+
 ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
 {
     TextureScope textureScope;
@@ -3204,10 +3223,11 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     bool resolved = false;
     for (uint32_t i = 0; i < 6; i++)
     {
-        auto it = g_r.resolved.find((fetch.Address() + i * stride) & 0x1FFFFFFF);
-        if (it != g_r.resolved.end() && it->second.format != DXGI_FORMAT_R32_FLOAT && it->second.width >= w && it->second.height >= h)
+        // (Through the stale check: a face address the title reused for a texture of its own.)
+        const ResolvedTexture* r = ResolveCurrent(fetch.Address() + i * stride);
+        if (r && r->format != DXGI_FORMAT_R32_FLOAT && r->width >= w && r->height >= h)
         {
-            faces[i] = &it->second;
+            faces[i] = r;
             resolved = true;
         }
     }
@@ -3229,7 +3249,14 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             ch = uint32_t(std::lround(double(h) * faces[i]->hostHeight / faces[i]->height));
             break;
         }
-    if (!cached.resource || cached.width != cw || cached.height != ch || cached.format != want)
+    // Cube maps read from memory keep their mip levels (each level holds all six faces, padded as a
+    // 2D level is; the packed tail of 16x16 and below is not read). Resolved cubes have one level.
+    static LiveSwitch noCubeMips("REGPU_NO_CUBE_MIPS"); // A/B
+    UINT16 mips = 1;
+    if (!resolved && !noCubeMips && fetch.MipAddress() && fetch.Tiled() && !(w & (w - 1)))
+        for (uint32_t l = 1; l <= fetch.MipMaxLevel() && (w >> l) > 16; l++)
+            mips++;
+    if (!cached.resource || cached.width != cw || cached.height != ch || cached.format != want || cached.resource->GetDesc().MipLevels != mips)
     {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -3238,7 +3265,7 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         td.Width = cw;
         td.Height = ch;
         td.DepthOrArraySize = 6;
-        td.MipLevels = 1;
+        td.MipLevels = mips;
         td.SampleDesc.Count = 1;
         td.Format = want;
         if (cached.resource)
@@ -3285,7 +3312,7 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
             dst.pResource = cached.resource.Get();
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dst.SubresourceIndex = i;
+            dst.SubresourceIndex = i * mips;
             src.pResource = faces[i]->resource.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             const D3D12_BOX box{ 0, 0, 0, std::min(cw, faces[i]->hostWidth), std::min(ch, faces[i]->hostHeight), 1 };
@@ -3300,23 +3327,64 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     {
         // Static: hash all six faces, decode on change.
         const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
-        const uint64_t hash = ContentHash(source, size_t(stride) * 6) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Endian()) << 44);
+        uint64_t hash = ContentHash(source, size_t(stride) * 6) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Endian()) << 44) ^ (uint64_t(mips) << 52);
+        // Each level's face address: level 0 at the base, levels 1+ from the mip address, every level
+        // holding its six faces one after another.
+        uint32_t levelBase[16]{}, levelStride[16]{};
+        levelBase[0] = fetch.Address();
+        levelStride[0] = stride;
+        for (UINT16 l = 1, address = 0; l < mips; l++)
+        {
+            TextureFetch level = fetch;
+            level.dwords[0] &= ~(0x1FFu << 22);
+            level.dwords[2] = (level.dwords[2] & ~0x3FFFFFFu) | ((w >> l) - 1) | (((h >> l) - 1) << 13);
+            levelBase[l] = (l == 1 ? fetch.MipAddress() : levelBase[l - 1] + levelStride[l - 1] * 6);
+            levelStride[l] = TextureFaceStride(level);
+            (void)address;
+        }
+        if (mips > 1)
+            hash ^= ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(levelBase[1])), size_t(levelBase[mips - 1] - levelBase[1]) + size_t(levelStride[mips - 1]) * 6) * 31;
         if (cached.contentHash == hash)
             return cached.resource.Get();
         const UINT rowPitch = (w * 4 + 255) & ~255u;
         const UINT64 faceBytes = (UINT64(rowPitch) * h + 511) & ~511ull;
-        const UINT64 offset = RingAlloc(faceBytes * 6, 512);
+        const UINT64 offset = RingAlloc(faceBytes * 6 * 2, 512); // all levels fit in twice level 0
         if (offset == ~0ull)
             return nullptr;
         C().list->ResourceBarrier(1, &b);
+        UINT64 at = offset;
         for (uint32_t i = 0; i < 6; i++)
+            for (UINT16 l = 0; l < mips; l++)
         {
+            const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
             TextureFetch face = fetch;
-            face.dwords[1] = (face.dwords[1] & 0xFFF) | ((fetch.Address() + i * stride) & 0xFFFFF000);
+            face.dwords[1] = (face.dwords[1] & 0xFFF) | ((levelBase[l] + i * levelStride[l]) & 0xFFFFF000);
             face.dwords[5] = (face.dwords[5] & ~(3u << 9)) | (1u << 9); // decode as 2D
+            if (l)
+            {
+                face.dwords[0] &= ~(0x1FFu << 22); // pitch: the level's own width
+                face.dwords[2] = (face.dwords[2] & ~0x3FFFFFFu) | (lw - 1) | ((lh - 1) << 13);
+            }
             std::vector<uint8_t> rgba;
             if (!DecodeTexture(face, rgba))
-                rgba.assign(size_t(w) * h * 4, 0);
+                rgba.assign(size_t(lw) * lh * 4, 0);
+            if (l)
+            {
+                const UINT lPitch = (lw * 4 + 255) & ~255u;
+                for (uint32_t y = 0; y < lh; y++)
+                    memcpy(Frame().ringCpu + at + UINT64(y) * lPitch, &rgba[size_t(y) * lw * 4], size_t(lw) * 4);
+                D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+                dst.pResource = cached.resource.Get();
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.SubresourceIndex = l + i * mips;
+                src.pResource = Frame().ring.Get();
+                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint.Offset = at;
+                src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, lw, lh, 1, lPitch };
+                C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                at += (UINT64(lPitch) * lh + 511) & ~511ull;
+                continue;
+            }
             if (getenv("REGPU_DUMP_CUBES"))
             {
                 char name[80];
@@ -3329,10 +3397,10 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
             dst.pResource = cached.resource.Get();
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dst.SubresourceIndex = i;
+            dst.SubresourceIndex = i * mips;
             src.pResource = Frame().ring.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            src.PlacedFootprint.Offset = offset + faceBytes * i;
+            src.PlacedFootprint.Offset = at;
             src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, rowPitch };
             C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
@@ -3357,10 +3425,10 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
     for (uint32_t i = 1; i <= fetch.MipMaxLevel() && (w >> i || h >> i); i++)
     {
         const uint32_t lw = std::max(w >> i, 1u), lh = std::max(h >> i, 1u);
-        auto it = g_r.resolved.find(address & 0x1FFFFFFF);
-        if (it == g_r.resolved.end() || it->second.format != level0.format || it->second.width < lw || it->second.height < lh)
+        const ResolvedTexture* r = ResolveCurrent(address);
+        if (!r || r->format != level0.format || r->width < lw || r->height < lh)
             break;
-        levels.push_back(&it->second);
+        levels.push_back(r);
         const uint32_t bytes = ((lw + 31) & ~31u) * ((lh + 31) & ~31u) * bpp;
         address += std::max((bytes + 4095) & ~4095u, 4096u);
     }
@@ -3449,12 +3517,10 @@ void NoteResolvedMemory(uint32_t base, ResolvedTexture& r)
     r.stale = false;
 }
 
-const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
+// The resolve at a base when it still holds what is in memory there, else nullptr (see ResolvedFor).
+ResolvedTexture* ResolveCurrent(uint32_t base)
 {
-    const char* name = TextureFormatName(fetch.Format());
-    if (name && (strncmp(name, "DXT", 3) == 0 || strncmp(name, "DXN", 3) == 0 || strncmp(name, "CTX", 3) == 0))
-        return nullptr;
-    auto it = g_r.resolved.find(fetch.Address() & 0x1FFFFFFF);
+    auto it = g_r.resolved.find(base & 0x1FFFFFFF);
     if (it == g_r.resolved.end())
         return nullptr;
     // A resolve not repeated lately whose memory has changed since: the title reused the address for a
@@ -3477,6 +3543,14 @@ const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
             return nullptr;
     }
     return &r;
+}
+
+const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
+{
+    const char* name = TextureFormatName(fetch.Format());
+    if (name && (strncmp(name, "DXT", 3) == 0 || strncmp(name, "DXN", 3) == 0 || strncmp(name, "CTX", 3) == 0))
+        return nullptr;
+    return ResolveCurrent(fetch.Address());
 }
 
 // Decodes (if changed) and uploads a texture; returns its resource.
@@ -3881,7 +3955,7 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
     {
         const uint32_t base = GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u));
         const uint32_t endian = dmaSize >> 30;
-        const uint32_t available = (dmaSize & 0xFFFFFF) * (is32 ? 1 : 2);
+        const uint32_t available = (dmaSize & 0xFFFFFF) /* in indices, as Xenia (num_words) */;
         for (uint32_t i = 0; i < count && i < available; i++)
         {
             const uint32_t raw = ReadIndex(base, i, is32, endian);
@@ -3994,7 +4068,7 @@ IndexListEntry* CachedIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t d
     uint64_t sample = 0;
     if (source == 0)
     {
-        const uint32_t available = (dmaSize & 0xFFFFFF) * (is32 ? 1 : 2);
+        const uint32_t available = (dmaSize & 0xFFFFFF) /* in indices, as Xenia (num_words) */;
         const uint32_t bytes = std::min(count, available) * (is32 ? 4 : 2);
         sample = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u))), bytes);
     }
@@ -6847,7 +6921,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const uint32_t prim = initiator & 0x3F, indexSource = (initiator >> 6) & 3, indexCount = initiator >> 16;
     const bool restartOn = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 21) & 1;
     static LiveSwitch noDirectIndex("REGPU_NO_DIRECT_INDEX");
-    const bool directIndex = g_r.physical && !noDirectIndex && (indexSource == 0 || indexSource == 2) &&
+    // A draw asking for more indices than its index buffer holds reads zeros past its end (as the
+    // Xenos does): the CPU path bounds the reads (BuildIndexList), the GPU's direct reads would not.
+    const bool indexOverrun = indexSource == 0 && indexCount > (dmaSize & 0xFFFFFF);
+    const bool directIndex = g_r.physical && !noDirectIndex && !indexOverrun && (indexSource == 0 || indexSource == 2) &&
         (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
     IndexListEntry* indexEntry = directIndex ? nullptr : CachedIndexList(initiator, dmaBase, dmaSize);
@@ -7099,6 +7176,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             vc->vf[k][0] = address & 0x1FFFFFFF;
             vc->vf[k][1] = d1 & 3;
             vc->vf[k][2] = 1;
+            vc->vf[k][3] = bytes / 4;
             continue;
         }
         // REGPU_TRACE_MIDSIZE=1: log copied buffers of 16-64 KB that change within a frame (they must stay copied)
@@ -7127,6 +7205,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         vc->vf[k][0] = uint32_t(dataOffset);
         vc->vf[k][1] = d1 & 3;
+        vc->vf[k][3] = bytes / 4;
     }
     Sub(2); // vertex fetches (uploads)
     // Perspective geometry in a wide pass (see ViewExtent): the game's camera already projects

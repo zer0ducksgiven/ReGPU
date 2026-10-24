@@ -15,7 +15,7 @@ cbuffer VSConstants : register(b0)
     float4 vc[256];
     uint4 vb[2];      // 256 bool constants
     uint4 vl[8];      // 32 loop constants: count | start << 8 | step << 16
-    uint4 vf[96];     // vertex fetch: x byte offset (gmem, or gphys if z), y endian
+    uint4 vf[96];     // vertex fetch: x byte offset (gmem, or gphys if z), y endian, w size in dwords
     uint4 vinfo;      // x index list byte offset, y position mode (0 clip, 1 screen) | 2 points, z/w target size
     float4 vpoint;    // xy constant point diameter (pixels), z/w min/max diameter
     float4 vscale;    // PA_CL_VPORT_X/Y/ZSCALE
@@ -73,6 +73,11 @@ uint Swap(uint v, uint e)
 
 uint LoadGuest(uint fetch, uint dword)
 {
+    // Past the end of the buffer the Xenos fetches 0. The car shadow volumes rely on it: their 10-vertex
+    // buffer is indexed far beyond its end (the index picks a corner constant), and the memory after it
+    // read as NaN positions, whose depth failed every test, so the shadows never reached the stencil.
+    if (dword >= vf[fetch].w)
+        return 0;
     uint a = vf[fetch].x + dword * 4;
     return Swap(vf[fetch].z ? gphys.Load(a) : gmem.Load(a), vf[fetch].y);
 }
@@ -851,6 +856,42 @@ bool TranslateVertexFetchLayout(const Shader& shader, TranslatedShader& out)
     return true;
 }
 
+// The register file as separate variables (r0, r1, ...) rather than an array: registers are only
+// ever indexed by a constant here, and fxc handles large local arrays badly (some shaders came out
+// wrong: purple). Renames r[N] in a translated body and returns the registers it uses.
+static std::vector<uint32_t> ScalarRegisters(std::string& body)
+{
+    std::string out;
+    out.reserve(body.size());
+    std::vector<bool> used(64, false);
+    for (size_t i = 0; i < body.size(); i++)
+    {
+        const bool start = body[i] == 'r' && i + 1 < body.size() && body[i + 1] == '[' &&
+            (i == 0 || !(isalnum(uint8_t(body[i - 1])) || body[i - 1] == '_' || body[i - 1] == '.'));
+        size_t j = i + 2;
+        while (start && j < body.size() && isdigit(uint8_t(body[j])))
+            j++;
+        if (start && j > i + 2 && j < body.size() && body[j] == ']')
+        {
+            const uint32_t n = uint32_t(std::stoul(body.substr(i + 2, j - i - 2)));
+            if (n < 64)
+            {
+                used[n] = true;
+                out += "r" + std::to_string(n);
+                i = j;
+                continue;
+            }
+        }
+        out += body[i];
+    }
+    body.swap(out);
+    std::vector<uint32_t> list;
+    for (uint32_t n = 0; n < 64; n++)
+        if (used[n])
+            list.push_back(n);
+    return list;
+}
+
 TranslatedShader TranslateShader(const Shader& shader)
 {
     TranslatedShader result;
@@ -868,12 +909,17 @@ TranslatedShader TranslateShader(const Shader& shader)
     }
 
     std::string h = kPreamble;
+    std::vector<uint32_t> regs = ScalarRegisters(e.out);
+    std::string decl;
     if (!shader.pixel)
     {
-        h += "void GuestVS(uint vindex, out float4 opos, out float4 o[16], out float4 opts)\n{\n"
-             "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
+        if (std::find(regs.begin(), regs.end(), 0u) == regs.end())
+            regs.push_back(0); // the vertex index
+        for (uint32_t n : regs)
+            decl += "    float4 r" + std::to_string(n) + " = 0;\n";
+        h += "void GuestVS(uint vindex, out float4 opos, out float4 o[16], out float4 opts)\n{\n" + decl +
              "    [unroll] for (int j = 0; j < 16; j++) o[j] = 0;\n"
-             "    r[0].x = float(vindex); opos = float4(0, 0, 0, 1); opts = 0; float ps = 0; bool p = false; int a0 = 0, aL = 0;\n";
+             "    r0.x = float(vindex); opos = float4(0, 0, 0, 1); opts = 0; float ps = 0; bool p = false; int a0 = 0, aL = 0;\n";
         h += e.out;
         h += "}\n"
              "void GuestVS(uint vindex, out float4 opos, out float4 o[16])\n{\n"
@@ -1014,12 +1060,16 @@ TranslatedShader TranslateShader(const Shader& shader)
                  "    float4 oD = float4(input.pos.z, 0, 0, 0);\n";
         else
             h += "float4 main(VSOut input) : SV_Target0\n{\n";
-        h += "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
-             "    [unroll] for (int j = 0; j < 16; j++) r[j] = input.o[j];\n"
+        // Interpolators land in r0-r15; the generated parameter in the register pinfo.y names.
+        std::string inputs;
+        for (uint32_t n : regs)
+            decl += "    float4 r" + std::to_string(n) + (n < 16 ? " = input.o[" + std::to_string(n) + "];\n" : " = 0;\n");
+        for (uint32_t n : regs)
+            if (n < 16)
+                inputs += "    if (pinfo.y == " + std::to_string(n) + "u) r" + std::to_string(n) + " = float4(input.pos.xy * pinfo2.yz, input.pcoord);\n";
+        h += decl +
              "    float4 oC[4]; [unroll] for (int k = 0; k < 4; k++) oC[k] = 0;\n"
-             "    float ps = 0; bool p = false; int a0 = 0, aL = 0;\n"
-             "    // Generated parameter: pixel position, point sprite coordinate.\n"
-             "    if (pinfo.y < 16u) r[pinfo.y] = float4(input.pos.xy * pinfo2.yz, input.pcoord);\n";
+             "    float ps = 0; bool p = false; int a0 = 0, aL = 0;\n" + inputs;
         h += e.out;
         h += "    switch (pinfo.x)\n    {\n"
              "    case 0: discard; break;\n"
