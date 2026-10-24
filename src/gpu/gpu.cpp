@@ -1275,11 +1275,36 @@ void CommandProcessorLoop(PPCContext& ctx)
             continue;
         }
         const uint32_t wptr = Reg(CP_RB_WPTR) % size;
+        // REGPU_PERF: how long the CP waits on an empty ring for the title rather than working. It
+        // spins, so its CPU use reads 100% either way; a CP that is idle part of each frame is not
+        // what limits the frame rate.
+        static bool perf = getenv("REGPU_PERF") != nullptr;
+        static std::chrono::steady_clock::time_point idleSince, logSince = std::chrono::steady_clock::now();
+        static double idleSeconds = 0;
+        static bool idle = false;
         if (g_gpu.rptr == wptr)
         {
             seg::Flush(); // nothing more queued: translate what there is
+            if (perf && !idle)
+            {
+                idle = true;
+                idleSince = std::chrono::steady_clock::now();
+            }
             Sleep(0);
             continue;
+        }
+        if (perf)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (idle)
+                idleSeconds += std::chrono::duration<double>(now - idleSince).count();
+            idle = false;
+            if (const double window = std::chrono::duration<double>(now - logSince).count(); window >= 2.0)
+            {
+                Log("perf: command processor idle %.0f%% of the time (waiting on the title to queue work)", idleSeconds / window * 100.0);
+                idleSeconds = 0;
+                logSince = now;
+            }
         }
         bool replaced = false;
         while (!replaced && g_gpu.rptr != wptr)
