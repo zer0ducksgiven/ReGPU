@@ -7741,9 +7741,37 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     if (!inRing)
     {
+        // Only the vertex fetch and texture entries this draw's shaders read: the tables are sized for
+        // 96 fetch constants and 32 slots, a draw uses a few, and the rest was ~3 KB of padding per draw
+        // (17 MB a frame of upload writes in PGR4's races). The ring bytes skipped are never read.
+        // REGPU_FULL_CONSTANT_BLOCKS=1 copies the whole blocks (A/B).
+        static LiveSwitch fullBlocks("REGPU_FULL_CONSTANT_BLOCKS");
         const size_t vsFrom = hooked ? 0 : offsetof(VSConstants, b), psFrom = offsetof(PSConstants, b);
-        memcpy(reinterpret_cast<uint8_t*>(vcRing) + vsFrom, reinterpret_cast<const uint8_t*>(vc) + vsFrom, sizeof(VSConstants) - vsFrom);
-        memcpy(reinterpret_cast<uint8_t*>(pcRing) + psFrom, reinterpret_cast<const uint8_t*>(pc) + psFrom, sizeof(PSConstants) - psFrom);
+        auto put = [](void* ring, const void* stage, size_t from, size_t to) {
+            if (to > from)
+                memcpy(static_cast<uint8_t*>(ring) + from, static_cast<const uint8_t*>(stage) + from, to - from);
+        };
+        if (fullBlocks)
+        {
+            put(vcRing, vc, vsFrom, sizeof(VSConstants));
+            put(pcRing, pc, psFrom, sizeof(PSConstants));
+        }
+        else
+        {
+            uint32_t fetches = 0;
+            for (uint32_t k : vs.info.vertexFetchConstants)
+                fetches = std::max(fetches, k + 1);
+            const size_t layouts = std::min<size_t>(vs.info.vertexFetchLayout.size(), 32);
+            const uint32_t slots = usedSlots ? 32 - uint32_t(__builtin_clz(usedSlots)) : 0;
+            put(vcRing, vc, vsFrom, offsetof(VSConstants, vf));
+            put(vcRing, vc, offsetof(VSConstants, vf), offsetof(VSConstants, vf) + fetches * sizeof(vc->vf[0]));
+            put(vcRing, vc, offsetof(VSConstants, info), offsetof(VSConstants, vfl));
+            put(vcRing, vc, offsetof(VSConstants, vfl), offsetof(VSConstants, vfl) + layouts * sizeof(vc->vfl[0]));
+            put(vcRing, vc, offsetof(VSConstants, vuser), sizeof(VSConstants));
+            put(pcRing, pc, psFrom, offsetof(PSConstants, tinfo));
+            put(pcRing, pc, offsetof(PSConstants, tinfo), offsetof(PSConstants, tinfo) + slots * sizeof(pc->tinfo[0]));
+            put(pcRing, pc, offsetof(PSConstants, tbias), offsetof(PSConstants, tbias) + slots * sizeof(pc->tbias[0]));
+        }
     }
     C().list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     C().list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
