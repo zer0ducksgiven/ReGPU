@@ -545,8 +545,10 @@ ComPtr<ID3D12QueryHeap> g_timestamps;
 
 // REGPU_GPU_PASSES=1: GPU time per pass (between render target switches and resolves),
 // summed by pass and logged every 2 s, to find where GPU time goes.
-const bool g_gpuPasses = getenv("REGPU_GPU_PASSES") != nullptr;
-constexpr UINT kPassMarks = 1024;
+// REGPU_GPU_SHADERS=1 also marks every draw, labelled by its shaders (approximate: the GPU overlaps draws).
+const bool g_gpuShaders = getenv("REGPU_GPU_SHADERS") != nullptr;
+const bool g_gpuPasses = getenv("REGPU_GPU_PASSES") != nullptr || g_gpuShaders;
+constexpr UINT kPassMarks = 4096;
 ComPtr<ID3D12QueryHeap> g_passQueries;
 ComPtr<ID3D12Resource> g_passReadback;
 struct PassMarkInfo
@@ -1449,7 +1451,7 @@ FrameResources& Frame();
 
 void PassMark(const char* fmt, uint32_t a, uint32_t b)
 {
-    if (!g_gpuPasses || !g_passQueries)
+    if (!g_gpuPasses || !g_passQueries || !C().list)
         return;
     const UINT frameIndex = UINT(&Frame() - g_r.frames);
     auto& marks = g_passMarks[frameIndex];
@@ -1630,6 +1632,8 @@ void BeginFrameIfNeeded()
             const uint64_t* ts = t + size_t(frameIndex) * kPassMarks;
             for (size_t i = 0; i + 1 < marks.size(); i++)
             {
+                if (ts[i + 1] < ts[i])
+                    continue; // marks from lists that ran out of order
                 auto& total = g_passTotals[marks[i].label];
                 total.first += double(ts[i + 1] - ts[i]) * 1000.0 / double(frequency);
                 total.second += marks[i].draws;
@@ -1652,7 +1656,7 @@ void BeginFrameIfNeeded()
             }
             std::sort(top.rbegin(), top.rend());
             Log("gpu passes: %.2f ms/frame over %llu frames", sum / g_passFrames, (unsigned long long)g_passFrames);
-            for (size_t i = 0; i < top.size() && i < 14; i++)
+            for (size_t i = 0; i < top.size() && i < (g_gpuShaders ? 30u : 14u); i++)
                 Log("gpu passes: %6.3f ms  %5.0f draws  %s", top[i].first / g_passFrames, double(g_passTotals[top[i].second].second) / g_passFrames,
                     top[i].second.c_str());
             g_passTotals.clear();
@@ -2408,7 +2412,8 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     } logSlow{ getStart, cs, path };
     const ucode::Shader parsed = ucode::Parse(codeBE.data(), uint32_t(codeBE.size()), pixel);
     static LiveSwitch noCanonical("REGPU_NO_CANONICAL");
-    const uint64_t canonical = pixel || noCanonical || IsPsEditAlias(hash) ? 0 : CanonicalKey(parsed);
+    // Baked vertex fetch puts each copy's layout in its code, so copies can't share one compile.
+    const uint64_t canonical = pixel || noCanonical || BakedVertexFetch() || IsPsEditAlias(hash) ? 0 : CanonicalKey(parsed);
     if (canonical)
         path = g_canonical.count(canonical) ? (g_canonical[canonical]->IsReady() ? "full, layout fallback" : "full, base not ready") : "full, new canonical";
     if (canonical)
@@ -2801,10 +2806,17 @@ struct PipelineLibrary
         Log("renderer: pipeline library %s (%zu bytes loaded)", library ? "ready" : "unavailable", loaded.size());
     }
 
-    static std::wstring Name(const PipelineKey& k)
+    // The shaders' compiled code is part of the name: the game's shader hashes alone stay the same
+    // when the translation changes (a translator fix, REGPU_DYNAMIC_VFETCH), and a stale entry under
+    // the name then failed to load and blocked storing the new one, rebuilding it every launch
+    // (FM2 port: 181-496 of 498 pipelines rebuilt each launch, 0 after).
+    static std::wstring Name(const PipelineKey& k, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd)
     {
-        wchar_t name[96];
-        swprintf(name, 96, L"%016llx_%016llx_%08x_%08x_%08x_%08x", (unsigned long long)k.vs, (unsigned long long)k.ps, k.blend, k.depth, k.stencilMaskMode, k.flags);
+        const uint64_t code = Fnv(pd.VS.pShaderBytecode, pd.VS.BytecodeLength, 3) * 0x9E3779B97F4A7C15ull ^
+            (pd.PS.pShaderBytecode ? Fnv(pd.PS.pShaderBytecode, pd.PS.BytecodeLength, 4) : 0);
+        wchar_t name[128];
+        swprintf(name, 128, L"%016llx_%016llx_%08x_%08x_%08x_%08x_%016llx", (unsigned long long)k.vs, (unsigned long long)k.ps, k.blend, k.depth,
+            k.stencilMaskMode, k.flags, (unsigned long long)code);
         return name;
     }
 
@@ -2813,7 +2825,7 @@ struct PipelineLibrary
         *hit = false;
         if (library)
         {
-            const std::wstring name = Name(key);
+            const std::wstring name = Name(key, pd);
             {
                 std::shared_lock lock(access);
                 if (SUCCEEDED(library->LoadGraphicsPipeline(name.c_str(), &pd, IID_PPV_ARGS(&pso))))
@@ -6659,6 +6671,8 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
 
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    if (g_gpuShaders)
+        PassMark("vs %08X ps %08X", uint32_t(C().vsHash), uint32_t(C().psHash));
     if (!g_perfTiming)
     {
         DrawImpl(initiator, dmaBase, dmaSize);
@@ -6672,6 +6686,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     g_perf.drawSeconds += seconds;
     g_frameEvents.worstDrawMs = std::max(g_frameEvents.worstDrawMs, seconds * 1000.0);
     g_perf.draws++;
+    g_passDraws++;
 }
 
 namespace
