@@ -6834,7 +6834,8 @@ bool DebugSkipDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             gpureg::Get(RB_DEPTH_INFO), gpureg::Get(RB_MODECONTROL), gpureg::Get(PA_SC_WINDOW_OFFSET), gpureg::Get(PA_SC_WINDOW_SCISSOR_TL),
             gpureg::Get(PA_SC_WINDOW_SCISSOR_BR));
     }
-    if (n >= from && n < to)
+    // (Never a resolve: skipped, the scene copies stop updating and the screen keeps the last picture.)
+    if (n >= from && n < to && (gpureg::Get(RB_MODECONTROL) & 7) != 6)
     {
         g_r.drawsThisFrame++; // (keeps the numbering of the draws after it)
         return true;
@@ -7188,6 +7189,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     Sub(1); // bools, loops
     memset(vc->vf, 0, sizeof(vc->vf));
+    // vf[k].w: the buffer's size, past which a fetch reads 0 (as the Xenos does). REGPU_NO_FETCH_BOUNDS=1
+    // reads past it (A/B).
+    static LiveSwitch noBounds("REGPU_NO_FETCH_BOUNDS");
     for (uint32_t k : vs.info.vertexFetchConstants)
     {
         const uint32_t d0 = gpureg::Get(gpureg::FetchConstants + k * 2), d1 = gpureg::Get(gpureg::FetchConstants + k * 2 + 1);
@@ -7201,7 +7205,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             vc->vf[k][0] = address & 0x1FFFFFFF;
             vc->vf[k][1] = d1 & 3;
             vc->vf[k][2] = 1;
-            vc->vf[k][3] = bytes / 4;
+            vc->vf[k][3] = noBounds ? ~0u : bytes / 4;
             continue;
         }
         // REGPU_TRACE_MIDSIZE=1: log copied buffers of 16-64 KB that change within a frame (they must stay copied)
@@ -7230,7 +7234,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         vc->vf[k][0] = uint32_t(dataOffset);
         vc->vf[k][1] = d1 & 3;
-        vc->vf[k][3] = bytes / 4;
+        vc->vf[k][3] = noBounds ? ~0u : bytes / 4;
     }
     Sub(2); // vertex fetches (uploads)
     // Perspective geometry in a wide pass (see ViewExtent): the game's camera already projects
