@@ -4378,7 +4378,14 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     ResolvedTexture& dest = g_r.resolved[base];
     const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
     EnsureResolved(dest, width, height, hostWidth, hostHeight, format);
-    if (dest.frame != g_r.frame) // (once per frame: tiles land in the same image)
+    // What memory holds under the image, for the stale check (ResolveCurrent): once per frame, as tiles
+    // land in the same image. An image resolved every frame (shadow maps, bloom) only needs it every
+    // 8th: the check waits until a resolve has not been repeated for 8 frames, so its baseline is
+    // never older than that. Hashing each of PGR4's 31 resolves a frame took 0.9 ms on an FX-8350.
+    // (Write-backs record our own writes as they happen.) REGPU_RESOLVE_BASELINE_EVERY_FRAME=1: every frame.
+    static LiveSwitch baselineEveryFrame("REGPU_RESOLVE_BASELINE_EVERY_FRAME");
+    const bool continuing = dest.frame + 1 == g_r.frame && g_r.frame - dest.memChecked < 8 && !dest.stale;
+    if (dest.frame != g_r.frame && (baselineEveryFrame || !continuing))
         NoteResolvedMemory(base, dest);
     dest.frame = g_r.frame;
     const D3D12_RECT sr{ rect.left, rect.top, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom, height) };
