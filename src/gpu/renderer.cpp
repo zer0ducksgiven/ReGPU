@@ -54,6 +54,7 @@
 #include "render/presenter.h"
 #include "gpu/renderer.h"
 #include "gpu/shader_scan.h"
+#include "gpu/resolve_pack.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -5101,6 +5102,9 @@ void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_
 void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint32_t info, bool depth, const D3D12_RECT& rect,
     const regpu::Writeback& request);
 
+// REGPU_WRITEBACK_8888_ONLY=1: resolve write-backs only for 8_8_8_8 colour (and depth), as before (A/B).
+LiveSwitch g_writeback8888Only("REGPU_WRITEBACK_8888_ONLY");
+
 void Resolve()
 {
     g_resolveEpoch++; // texture bindings may now map to a new resolve
@@ -5238,13 +5242,21 @@ void Resolve()
                 }
                 return v;
             }();
-            if (!depth && destFormat == 6 && rect.left == 0 && rect.top == 0 &&
+            if (!depth && (destFormat == 6 || !g_writeback8888Only) && rect.left == 0 && rect.top == 0 &&
                 std::find(sizes.begin(), sizes.end(), std::pair<uint32_t, uint32_t>(width, height)) != sizes.end())
                 request.mode = regpu::Writeback::Mode::Now;
         }
-        if (request.mode == regpu::Writeback::Mode::Now && !depth && destFormat == 6)
+        // REGPU_RESOLVE_WRITEBACK_MAX=<pixels>: every smaller resolve the game didn't ask for is also
+        // written, deferred (the console writes every resolve to memory; small ones, like an
+        // average-luminance target, are what a title reads back on the CPU).
+        static const uint64_t writebackMax = getenv("REGPU_RESOLVE_WRITEBACK_MAX") ? strtoull(getenv("REGPU_RESOLVE_WRITEBACK_MAX"), nullptr, 10) : 0;
+        if (request.mode == regpu::Writeback::Mode::None && uint64_t(width) * height <= writebackMax)
+            request.mode = regpu::Writeback::Mode::Deferred;
+        // Any destination format the copy can write (from the FM4 port; 8888 only before).
+        const bool anyFormat = destFormat == 6 || !g_writeback8888Only;
+        if (request.mode == regpu::Writeback::Mode::Now && !depth && anyFormat)
             WriteResolveToGuest(base, width, height, info);
-        else if (request.mode == regpu::Writeback::Mode::Deferred && (depth || destFormat == 6))
+        else if (request.mode == regpu::Writeback::Mode::Deferred && (depth || anyFormat))
             QueueDeferredWriteback(base, width, height, info, depth, rect, request);
     }
     // Clears after a tile's resolve prepare the EDRAM for the next tile, which
@@ -6118,11 +6130,37 @@ struct DeferredWriteback
 {
     ComPtr<ID3D12Resource> buffer;
     UINT pitch = 0, hostW = 0, hostH = 0;
+    DXGI_FORMAT hostFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     uint32_t base = 0, width = 0, height = 0, info = 0, x0 = 0, x1 = 0, y0 = 0, y1 = 0;
     bool depth = false;
+    // Fence-ordered write-back (FenceWritebacks): generation << 2 | state (0 waiting, 1 being written,
+    // 2 written); the generation changes each time the entry is reused, so a late claim cannot take
+    // the next use's entry.
+    std::atomic<uint64_t> state{ 0 };
 };
-std::vector<DeferredWriteback> g_deferredWritebacks[kFrames];
+// A deque: entries keep their address while the fence writer thread may hold them.
+std::deque<DeferredWriteback> g_deferredWritebacks[kFrames];
 size_t g_deferredUsed[kFrames] = {};
+size_t g_deferredFenced[kFrames] = {}; // entries already handed to the fence writer
+
+// With fences written after the host GPU (the fence writer thread, gpu.cpp), each deferred write-back
+// is written to guest memory just before the first fence after it: a title that reads a small resolved
+// image once it sees the next fence (as on the console) finds it there, and the command processor never
+// waits. Entries not written by then land at their frame slot's next start, as before. From the FM4
+// port. REGPU_NO_FENCE_WRITEBACKS=1: only at the frame slot (A/B).
+bool FenceWritebacks()
+{
+    static const bool on = !getenv("REGPU_NO_FENCE_WRITEBACKS");
+    return on;
+}
+struct FencedWriteback
+{
+    DeferredWriteback* w;
+    uint64_t fence, generation;
+    UINT slot;
+};
+std::mutex g_fencedMutex;
+std::deque<FencedWriteback> g_fenced;
 
 uint32_t EncodeDepth20e4(float v)
 {
@@ -6136,41 +6174,113 @@ uint32_t EncodeDepth20e4(float v)
     return uint32_t(exponent) << 20 | std::min<uint32_t>(uint32_t(std::lround(mantissa * 1048576.0)), 0xFFFFF);
 }
 
+// Writes the game pixels [x0, x1) x [y0, y1) of a resolve to guest memory as the GPU stores its
+// destination: tiled (32-texel aligned pitch), in the destination format (RB_COPY_DEST_INFO
+// bits 7-12) with the copy's red/blue swap and endian mode (gpu/resolve_pack). `pixels` is the
+// host texture read back (RGBA8, RGBA16F, or R32F for depth), hostW x hostH texels `pitch` bytes
+// apart, covering the game pixels at the host's render scale. Each game pixel is the average of
+// the texels it covers for colour, the one at its centre for depth (where the console's pixel
+// sampled; REGPU_WRITEBACK_POINT takes that for colour too). Depth goes out as the console stores
+// a D24FS8 copy: 32-bit words, the 20e4 float depth in the top 24 bits. (From the FM4 port: 8888
+// only before, and the top-left texel of each scaled pixel.)
+void WriteResolvePixels(const uint8_t* pixels, UINT pitch, DXGI_FORMAT hostFormat, UINT hostW, UINT hostH, uint32_t base, uint32_t width,
+    uint32_t info, bool depth, uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1)
+{
+    static LiveSwitch pointColor("REGPU_WRITEBACK_POINT");
+    const uint32_t endian = info & 7, destFormat = depth ? 6 : (info >> 7) & 0x3F;
+    const bool swapRB = !depth && ((info >> 24) & 1);
+    uint32_t log2Bytes = 2;
+    if (!depth && !regpu::resolve::DestLog2Bytes(destFormat, log2Bytes))
+        return;
+    const uint32_t bytes = 1u << log2Bytes, pitchTexels = (width + 31) & ~31u;
+    const UINT hostBpp = hostFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+    const bool point = depth || pointColor;
+    uint8_t* guest = GuestPtr<uint8_t>(GpuPhysToGuest(base));
+    // The host texels [first, last) that game pixel i of n covers when the n pixels span `host`
+    // texels: at least one, and only the one at its centre when point sampling.
+    const auto span = [point](uint32_t i, uint32_t n, UINT host, UINT& first, UINT& last) {
+        if (point)
+        {
+            first = std::min<UINT>(UINT(uint64_t(2 * i + 1) * host / (2 * uint64_t(n))), host - 1);
+            last = first + 1;
+            return;
+        }
+        first = std::min<UINT>(UINT(uint64_t(i) * host / n), host - 1);
+        last = std::clamp<UINT>(UINT(uint64_t(i + 1) * host / n), first + 1, host);
+    };
+    for (uint32_t y = y0; y < y1; y++)
+    {
+        UINT hy0, hy1;
+        span(y - y0, y1 - y0, hostH, hy0, hy1);
+        for (uint32_t x = x0; x < x1; x++)
+        {
+            UINT hx0, hx1;
+            span(x - x0, x1 - x0, hostW, hx0, hx1);
+            uint32_t words[4] = {};
+            if (depth)
+                words[0] = EncodeDepth20e4(*reinterpret_cast<const float*>(pixels + size_t(hy0) * pitch + size_t(hx0) * 4)) << 8;
+            else
+            {
+                float c[4] = {};
+                for (UINT hy = hy0; hy < hy1; hy++)
+                    for (UINT hx = hx0; hx < hx1; hx++)
+                    {
+                        const uint8_t* px = pixels + size_t(hy) * pitch + size_t(hx) * hostBpp;
+                        for (int k = 0; k < 4; k++)
+                        {
+                            uint16_t h;
+                            memcpy(&h, px + k * 2, 2);
+                            c[k] += hostBpp == 8 ? regpu::resolve::HalfToFloat(h) : float(px[k]) / 255.0f;
+                        }
+                    }
+                const float n = float((hx1 - hx0) * (hy1 - hy0));
+                for (float& v : c)
+                    v /= n;
+                if (swapRB)
+                    std::swap(c[0], c[2]);
+                regpu::resolve::PackPixel(destFormat, c, words);
+            }
+            const size_t at = TextureTiledOffset(x, y, pitchTexels, log2Bytes);
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(words);
+            for (uint32_t k = 0; k < bytes; k++)
+                guest[regpu::resolve::SwappedByte(at + k, endian)] = b[k];
+        }
+    }
+}
+
+// Writes one entry's pixels if this caller claims it (state waiting, generation as expected).
+bool ClaimAndWrite(DeferredWriteback& w, uint64_t generation)
+{
+    uint64_t expected = generation << 2;
+    if (!w.state.compare_exchange_strong(expected, (generation << 2) | 1))
+        return false;
+    const uint8_t* pixels = nullptr;
+    if (SUCCEEDED(w.buffer->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&pixels)))) && pixels)
+    {
+        WriteResolvePixels(pixels, w.pitch, w.hostFormat, w.hostW, w.hostH, w.base, w.width, w.info, w.depth, w.x0, w.x1, w.y0, w.y1);
+        const D3D12_RANGE none{ 0, 0 };
+        w.buffer->Unmap(0, &none);
+    }
+    w.state = (generation << 2) | 2;
+    return true;
+}
+
 void FinishDeferredWritebacks(UINT frameIndex)
 {
+    {
+        // This slot's entries leave the fence writer's list: they are finished here.
+        std::lock_guard lock(g_fencedMutex);
+        std::erase_if(g_fenced, [&](const FencedWriteback& f) { return f.slot == frameIndex; });
+    }
+    g_deferredFenced[frameIndex] = 0;
     for (size_t i = 0; i < g_deferredUsed[frameIndex]; i++)
     {
         DeferredWriteback& w = g_deferredWritebacks[frameIndex][i];
-        const uint8_t* pixels = nullptr;
-        if (FAILED(w.buffer->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&pixels)))) || !pixels)
-            continue;
-        const uint32_t endian = w.info & 7, pitchTexels = (w.width + 31) & ~31u;
-        // Read on the CPU, which takes the words as they are: red stays in bits 16-23 when the copy
-        // swaps (written swapped, the CPU's reader gets red and blue exchanged).
-        const bool swapRB = ((w.info >> 24) & 1) == 0;
-        uint8_t* guest = GuestPtr<uint8_t>(GpuPhysToGuest(w.base));
-        const double sx = double(w.hostW) / double(w.x1 - w.x0), sy = double(w.hostH) / double(w.y1 - w.y0);
-        for (uint32_t y = w.y0; y < w.y1; y++)
-        {
-            const uint8_t* line = pixels + size_t(std::min<double>((y - w.y0) * sy, w.hostH - 1)) * w.pitch;
-            for (uint32_t x = w.x0; x < w.x1; x++)
-            {
-                const size_t hx = std::min<size_t>(size_t((x - w.x0) * sx), w.hostW - 1);
-                uint32_t word;
-                if (w.depth)
-                    word = EncodeDepth20e4(reinterpret_cast<const float*>(line)[hx]) << 8;
-                else
-                {
-                    const uint8_t* px = line + hx * 4;
-                    const uint32_t red = swapRB ? px[2] : px[0], green = px[1], blue = swapRB ? px[0] : px[2];
-                    word = uint32_t(px[3]) << 24 | red << 16 | green << 8 | blue;
-                }
-                const uint32_t stored = endian == 0 ? word : __builtin_bswap32(word);
-                memcpy(guest + TextureTiledOffset(x, y, pitchTexels, 2), &stored, 4);
-            }
-        }
-        const D3D12_RANGE none{ 0, 0 };
-        w.buffer->Unmap(0, &none);
+        // Written by the fence writer already (or being written: wait for it), else written here.
+        const uint64_t generation = w.state.load() >> 2;
+        if (!ClaimAndWrite(w, generation))
+            while ((w.state.load() & 3) == 1)
+                std::this_thread::yield();
         if (auto it = g_r.resolved.find(w.base); it != g_r.resolved.end())
             NoteResolvedMemory(w.base, it->second); // our own write: not a reuse of the memory
     }
@@ -6183,7 +6293,8 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
 {
     const auto it = g_r.resolved.find(base);
     if (it == g_r.resolved.end() || !it->second.resource ||
-        it->second.format != (depth ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM))
+        (depth ? it->second.format != DXGI_FORMAT_R32_FLOAT
+               : it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM && it->second.format != DXGI_FORMAT_R16G16B16A16_FLOAT))
         return;
     const uint32_t x0 = std::min(request.x0, width), x1 = std::min(request.x1, width);
     const uint32_t y0 = std::max<uint32_t>(std::min(request.y0, height), uint32_t(std::max<LONG>(rect.top, 0)));
@@ -6195,10 +6306,12 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
     if (g_deferredUsed[g_r.frameIndex] == slot.size())
         slot.emplace_back();
     DeferredWriteback& w = slot[g_deferredUsed[g_r.frameIndex]++];
+    w.state = ((w.state.load() >> 2) + 1) << 2; // a new use: next generation, waiting
     const UINT hostX0 = UINT(uint64_t(x0) * r.hostWidth / width), hostY0 = UINT(uint64_t(y0) * r.hostHeight / height);
     w.hostW = std::max<UINT>(1, std::min<UINT>(UINT(uint64_t(x1) * r.hostWidth / width), r.hostWidth) - hostX0);
     w.hostH = std::max<UINT>(1, std::min<UINT>(UINT(uint64_t(y1) * r.hostHeight / height), r.hostHeight) - hostY0);
-    w.pitch = (w.hostW * 4 + 255) & ~255u;
+    w.hostFormat = r.format;
+    w.pitch = (w.hostW * (r.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4) + 255) & ~255u;
     const UINT64 bytes = UINT64(w.pitch) * w.hostH;
     if (!w.buffer || w.buffer->GetDesc().Width < bytes)
         w.buffer = CreateBuffer(std::max<UINT64>(bytes, 1u << 20), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -6236,13 +6349,25 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
 uint64_t FenceSubmitImpl()
 {
     static LiveSwitch early("REGPU_EARLY_FENCES");
-    if (early || !g_r.ok)
+    if (!g_r.ok)
         return 0;
+    // With record-time fences, a fence that follows a small resolve write-back of this frame still goes
+    // after the host GPU (and the write-back), on the fence writer: the title finds the image in memory
+    // once it sees that fence. Record-time fences behind it queue after it on the writer, so values stay
+    // in order. REGPU_NO_WRITEBACK_FENCES=1: every fence at record time (the write-backs land later).
+    if (early)
+    {
+        static const bool writebackFences = !getenv("REGPU_NO_WRITEBACK_FENCES");
+        if (!writebackFences || !FenceWritebacks() || g_deferredUsed[g_r.frameIndex] <= g_deferredFenced[g_r.frameIndex])
+            return 0;
+    }
     // Nothing recorded since the last one: the same point in the queue.
     static uint64_t lastFrame = ~0ull, lastValue = 0;
     static uint32_t lastDraws = ~0u;
     const uint32_t draws = g_r.drawsThisFrame.load();
-    if (lastFrame == g_r.frame && lastDraws == draws)
+    const UINT slot = g_r.frameIndex;
+    const bool newWritebacks = FenceWritebacks() && g_deferredUsed[slot] > g_deferredFenced[slot];
+    if (lastFrame == g_r.frame && lastDraws == draws && !newWritebacks)
         return lastValue;
     lastFrame = g_r.frame;
     lastDraws = draws;
@@ -6251,20 +6376,32 @@ uint64_t FenceSubmitImpl()
     SubmitLists(0, nullptr); // (the signal must follow this fence's draws)
     lastValue = g_r.nextFence++;
     g_r.queue->Signal(g_r.fence.Get(), lastValue);
+    if (FenceWritebacks())
+    {
+        // The write-backs recorded before this fence: the fence writer lands them before the fence.
+        std::lock_guard lock(g_fencedMutex);
+        for (size_t i = g_deferredFenced[slot]; i < g_deferredUsed[slot]; i++)
+        {
+            DeferredWriteback& w = g_deferredWritebacks[slot][i];
+            g_fenced.push_back({ &w, lastValue, w.state.load() >> 2, slot });
+        }
+        g_deferredFenced[slot] = g_deferredUsed[slot];
+    }
     return lastValue;
 }
 
 void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info)
 {
     const auto it = g_r.resolved.find(base);
-    if (it == g_r.resolved.end() || !it->second.resource || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM || !width || !height)
+    if (it == g_r.resolved.end() || !it->second.resource || !width || !height ||
+        (it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM && it->second.format != DXGI_FORMAT_R16G16B16A16_FLOAT))
         return;
     ResolvedTexture& r = it->second;
     // Run what has been recorded (the resolve's copy included) and let the GPU finish it.
     BeginFrameIfNeeded();
     SplitMainList();
     WaitForQueueIdle();
-    const UINT pitch = (r.hostWidth * 4 + 255) & ~255u;
+    const UINT pitch = (r.hostWidth * (r.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4) + 255) & ~255u;
     ComPtr<ID3D12Resource> buffer = CreateBuffer(UINT64(pitch) * r.hostHeight, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     ID3D12GraphicsCommandList* list = AcquireList();
     D3D12_RESOURCE_BARRIER bar{};
@@ -6277,7 +6414,7 @@ void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_
     D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
     dst.pResource = buffer.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, r.hostWidth, r.hostHeight, 1, pitch };
+    dst.PlacedFootprint.Footprint = { r.format, r.hostWidth, r.hostHeight, 1, pitch };
     src.pResource = r.resource.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
@@ -6291,37 +6428,11 @@ void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_
     buffer->Map(0, nullptr, reinterpret_cast<void**>(&pixels));
     if (!pixels)
         return;
-    // The surface in memory: tiled, 32-texel aligned, one A8R8G8B8 word per pixel (red and blue
-    // exchanged when the copy has the swap bit; the title's fetch swizzle expects that), in the
-    // byte order the copy's endian field names (2: big-endian words, 0: little-endian).
-    const uint32_t endian = info & 7;
-    // Written back because the CPU reads it, and the CPU takes the words as they are: red stays in
-    // bits 16-23 when the copy swaps (written swapped, the reader gets red and blue exchanged).
-    const bool swapRB = ((info >> 24) & 1) == 0;
-    const uint32_t pitchTexels = (width + 31) & ~31u, rows = (height + 31) & ~31u;
-    uint8_t* guest = GuestPtr<uint8_t>(GpuPhysToGuest(base));
-    for (uint32_t y = 0; y < height; y++)
-    {
-        const uint8_t* line = pixels + size_t(y * r.hostHeight / height) * pitch;
-        for (uint32_t x = 0; x < width; x++)
-        {
-            const uint8_t* px = line + size_t(x * r.hostWidth / width) * 4;
-            const uint32_t red = swapRB ? px[2] : px[0], green = px[1], blue = swapRB ? px[0] : px[2], alpha = px[3];
-            const uint32_t word = alpha << 24 | red << 16 | green << 8 | blue;
-            uint8_t* out = guest + TextureTiledOffset(x, y, pitchTexels, 2);
-            if (endian == 0)
-                memcpy(out, &word, 4); // little-endian
-            else
-            {
-                const uint32_t be = __builtin_bswap32(word);
-                memcpy(out, &be, 4);
-            }
-        }
-    }
-    (void)rows;
+    WriteResolvePixels(pixels, pitch, r.format, r.hostWidth, r.hostHeight, base, width, info, false, 0, width, 0, height);
     buffer->Unmap(0, nullptr);
     NoteResolvedMemory(base, r); // our own write: not a reuse of the memory
-    Log("resolve: wrote %ux%u back to guest memory at %08X (endian %u, swap %d)", width, height, base, endian, int(swapRB));
+    Log("resolve: wrote %ux%u back to guest memory at %08X (format %u, endian %u, swap %u)", width, height, base, (info >> 7) & 0x3F, info & 7,
+        (info >> 24) & 1);
 }
 
 struct Workers
@@ -6590,6 +6701,24 @@ bool RendererTileReplay(uint32_t surface, const int32_t first[4], const int32_t 
         e->all[2], e->all[3]);
     TileMerge::g_table.store(t, std::memory_order_release); // (the old table is kept: readers may hold it)
     return false;
+}
+
+// The fence writer thread, once the host GPU has reached `completed`: the write-backs handed over
+// with a fence value up to it are written to guest memory (before the fence itself).
+void RendererFinishFencedWritebacks(uint64_t completed)
+{
+    for (;;)
+    {
+        FencedWriteback f;
+        {
+            std::lock_guard lock(g_fencedMutex);
+            if (g_fenced.empty() || g_fenced.front().fence > completed)
+                return;
+            f = g_fenced.front();
+            g_fenced.pop_front();
+        }
+        ClaimAndWrite(*f.w, f.generation);
+    }
 }
 
 void RendererFenceWait(uint64_t value, void* event)

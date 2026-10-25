@@ -195,8 +195,10 @@ void LogRegs(uint32_t index, const uint32_t* valuesBE, uint32_t count)
 void WriteBackNow(uint32_t address, uint32_t value);
 namespace PendingWrites
 {
-void Add(uint64_t fence, uint32_t address, uint32_t value);
+void Add(uint64_t fence, uint32_t address, uint32_t value, bool raw = false);
+void Drain();
 }
+void OrderedStore(uint32_t address, uint32_t value);
 
 // ---- Parallel draw segments ------------------------------------------------------------
 // Between resolves (and fences, swaps, waits, interrupts) the draws of a frame are
@@ -462,7 +464,7 @@ void WorkerLoop()
                 PendingWrites::Add(RendererFenceSubmit(), a[0], a[1]); // after the host GPU, as on the command processor
                 break;
             case work::kStore:
-                StoreBE32(a[0], a[1]);
+                OrderedStore(a[0], a[1]);
                 break;
             default:
                 break;
@@ -544,9 +546,10 @@ struct Write
 {
     uint64_t fence;
     uint32_t address, value;
+    bool raw; // a plain big-endian store (a scratch register write-back), not a fence write
 };
 std::mutex g_mutex;
-std::condition_variable g_cv;
+std::condition_variable g_cv, g_done;
 std::deque<Write> g_queue;
 
 void Main()
@@ -559,27 +562,57 @@ void Main()
         const Write w = g_queue.front();
         lock.unlock();
         RendererFenceWait(w.fence, event);
-        WriteBackNow(w.address, w.value);
+        RendererFinishFencedWritebacks(w.fence); // resolve write-backs before the fence
+        if (w.raw)
+            StoreBE32(w.address, w.value);
+        else
+            WriteBackNow(w.address, w.value);
         lock.lock();
         g_queue.pop_front(); // after the write: Add sees it pending until then, keeping the order
+        g_done.notify_all();
     }
 }
 
-void Add(uint64_t fence, uint32_t address, uint32_t value)
+void Add(uint64_t fence, uint32_t address, uint32_t value, bool raw)
 {
     std::lock_guard lock(g_mutex);
     if (!fence && g_queue.empty())
     {
-        WriteBackNow(address, value);
+        if (raw)
+            StoreBE32(address, value);
+        else
+            WriteBackNow(address, value);
         return;
     }
     static std::once_flag started;
     std::call_once(started, [] { std::thread(Main).detach(); });
     if (!fence)
         fence = g_queue.back().fence;
-    g_queue.push_back({ fence, address, value });
+    g_queue.push_back({ fence, address, value, raw });
     g_cv.notify_one();
 }
+
+// Blocks until every queued write has landed.
+void Drain()
+{
+    std::unique_lock lock(g_mutex);
+    g_done.wait(lock, [] { return g_queue.empty(); });
+}
+}
+
+// Completion signals other than fence writes keep their order behind the fence writes still waiting
+// for the host GPU: a scratch register write-back lands after them (OrderedStore), and an interrupt
+// packet waits for them (the title may read a fence in its handler). Acting at once, a title could
+// see a later signal before an earlier fence and reuse memory the GPU still reads (from the FM4
+// port). REGPU_NO_FENCE_ORDER=1: they act at once, as before (A/B).
+LiveSwitch g_noFenceOrder("REGPU_NO_FENCE_ORDER");
+
+void OrderedStore(uint32_t address, uint32_t value)
+{
+    if (!g_noFenceOrder)
+        PendingWrites::Add(0, address, value, true);
+    else
+        StoreBE32(address, value);
 }
 
 // Memory writes from the command stream (fences): after the draws before them.
@@ -683,7 +716,7 @@ void WriteRegister(uint32_t index, uint32_t value)
                 work::End(2);
             }
             else
-                StoreBE32(address, value);
+                OrderedStore(address, value);
         }
     }
 }
@@ -985,6 +1018,8 @@ uint32_t ExecutePacket(uint32_t ptr)
     case 0x54: // INTERRUPT: cpu mask
         seg::Flush();
         work::Drain(); // after the draws before it, like the hardware
+        if (!g_noFenceOrder)
+            PendingWrites::Drain(); // and after the fence writes before it
         for (uint32_t cpu = 0; cpu < 6; cpu++)
         {
             if ((arg(0) >> cpu) & 1)

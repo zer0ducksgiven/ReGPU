@@ -47,6 +47,8 @@ bool RendererIsResolveDraw();
 uint64_t RendererFenceSubmit();
 // Blocks until the host GPU has reached a value from RendererFenceSubmit.
 void RendererFenceWait(uint64_t value, void* event);
+// The fence writer, after RendererFenceWait(value): resolve write-backs recorded before it land in guest memory.
+void RendererFinishFencedWritebacks(uint64_t completed);
 // Predicated tiling merged (see renderer.cpp, TileMerge): the window scissor of the current
 // registers in screen space, and what was learned about a surface's tiles.
 void RendererScreenScissor(int32_t rect[4]);
