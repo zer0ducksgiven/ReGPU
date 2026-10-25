@@ -1495,6 +1495,42 @@ void SelectSurfaces(bool force)
 // dropped textures) go back to the free list; their resources are released
 // once the GPU is done with the frame that last used them.
 UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t kind);
+// The per-draw functions' switches, at namespace scope: as function-local statics each one checked
+// its initialisation guard on every draw (dozens a draw).
+LiveSwitch g_sw_REGPU_ALL_CONSTANTS("REGPU_ALL_CONSTANTS");
+LiveSwitch g_sw_REGPU_ASYNC_SHADERS("REGPU_ASYNC_SHADERS");
+LiveSwitch g_sw_REGPU_CONSTANTS_BY_COUNT("REGPU_CONSTANTS_BY_COUNT");
+LiveSwitch g_sw_REGPU_CONSTANTS_IN_RING("REGPU_CONSTANTS_IN_RING");
+LiveSwitch g_sw_REGPU_DEPTH_ALPHATEST_ALL("REGPU_DEPTH_ALPHATEST_ALL");
+LiveSwitch g_sw_REGPU_DEPTH_ALPHATEST_VS("REGPU_DEPTH_ALPHATEST_VS");
+LiveSwitch g_sw_REGPU_DUMP_TEXTURES("REGPU_DUMP_TEXTURES");
+LiveSwitch g_sw_REGPU_FULL_CONSTANT_BLOCKS("REGPU_FULL_CONSTANT_BLOCKS");
+LiveSwitch g_sw_REGPU_NO_DEPTH_ALPHATEST("REGPU_NO_DEPTH_ALPHATEST");
+LiveSwitch g_sw_REGPU_NO_DIRECT_FETCH("REGPU_NO_DIRECT_FETCH");
+LiveSwitch g_sw_REGPU_NO_DIRECT_INDEX("REGPU_NO_DIRECT_INDEX");
+LiveSwitch g_sw_REGPU_NO_FETCH_BOUNDS("REGPU_NO_FETCH_BOUNDS");
+LiveSwitch g_sw_REGPU_NO_GPU_SWIZZLE("REGPU_NO_GPU_SWIZZLE");
+LiveSwitch g_sw_REGPU_NO_HUD_SQUEEZE("REGPU_NO_HUD_SQUEEZE");
+LiveSwitch g_sw_REGPU_NO_INDEXED("REGPU_NO_INDEXED");
+LiveSwitch g_sw_REGPU_NO_KILL_SKIP("REGPU_NO_KILL_SKIP");
+LiveSwitch g_sw_REGPU_NO_LIVE_CUBE("REGPU_NO_LIVE_CUBE");
+LiveSwitch g_sw_REGPU_NO_MIPS("REGPU_NO_MIPS");
+LiveSwitch g_sw_REGPU_NO_MSAA_SCALE("REGPU_NO_MSAA_SCALE");
+LiveSwitch g_sw_REGPU_NO_NATIVE_BC("REGPU_NO_NATIVE_BC");
+LiveSwitch g_sw_REGPU_NO_RECT_SNAP("REGPU_NO_RECT_SNAP");
+LiveSwitch g_sw_REGPU_NO_RENDER("REGPU_NO_RENDER");
+LiveSwitch g_sw_REGPU_NO_SHADER_SCAN("REGPU_NO_SHADER_SCAN");
+LiveSwitch g_sw_REGPU_NO_UNORM_CLAMP("REGPU_NO_UNORM_CLAMP");
+LiveSwitch g_sw_REGPU_OLD_CLAMP("REGPU_OLD_CLAMP");
+LiveSwitch g_sw_REGPU_OLD_CLEAR_SHIFT("REGPU_OLD_CLEAR_SHIFT");
+LiveSwitch g_sw_REGPU_TEXTURE_CHECK_EVERY4("REGPU_TEXTURE_CHECK_EVERY4");
+LiveSwitch g_sw_REGPU_TEXTURE_CHECK_STAGGER("REGPU_TEXTURE_CHECK_STAGGER");
+LiveSwitch g_sw_REGPU_TRACE_CONSTANTS_USED("REGPU_TRACE_CONSTANTS_USED");
+LiveSwitch g_sw_REGPU_TRACE_MIDSIZE("REGPU_TRACE_MIDSIZE");
+LiveSwitch g_sw_REGPU_TRACE_TEXCHANGE("REGPU_TRACE_TEXCHANGE");
+LiveSwitch g_sw_REGPU_TRACE_TILES("REGPU_TRACE_TILES");
+LiveSwitch g_sw_REGPU_TRACE_TILE_WIDEN("REGPU_TRACE_TILE_WIDEN");
+
 // Each thread remembers this frame's descriptors (eviction only takes ones unused for frames).
 // kind: 0 2D, 1 cube, 2 3D.
 UINT BindlessIndex(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t kind)
@@ -3644,7 +3680,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     }
     const uint32_t w = fetch.Width(), h = fetch.Height();
     auto& cached = g_r.textures[TextureKey(fetch.Address(), fetch.Format(), w, h)];
-    static LiveSwitch dumpAll("REGPU_DUMP_TEXTURES");
+    LiveSwitch &dumpAll = g_sw_REGPU_DUMP_TEXTURES;
     const bool forceDecode = dumpAll && RendererTracing();
     if (cached.resource && cached.checkedFrame == g_r.frame && !forceDecode)
     {
@@ -3658,12 +3694,12 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     // Every frame by default: titles that stream textures reuse their memory (PGR4's scenery), and
     // a texture rechecked every 4th or 16th frame showed the previous one there for a few frames.
     // REGPU_TEXTURE_CHECK_STAGGER=1 brings the staggered checks back (A/B; faster).
-    static LiveSwitch stagger("REGPU_TEXTURE_CHECK_STAGGER");
+    LiveSwitch &stagger = g_sw_REGPU_TEXTURE_CHECK_STAGGER;
     const bool checkAlways = !stagger;
     const uint64_t textureKey = TextureKey(fetch.Address(), fetch.Format(), w, h);
     // Unchanged for 300 checks (a few seconds): every 16th frame (a CPU-side update shows up at most
     // ~0.1 s late). REGPU_TEXTURE_CHECK_EVERY4=1 keeps every 4th (A/B).
-    static LiveSwitch every4("REGPU_TEXTURE_CHECK_EVERY4");
+    LiveSwitch &every4 = g_sw_REGPU_TEXTURE_CHECK_EVERY4;
     const uint64_t checkMask = !every4 && cached.unchanged >= 300 ? 15 : 3;
     if (cached.resource && !checkAlways && !forceDecode && cached.unchanged >= 30 && ((g_r.frame + (textureKey >> 32)) & checkMask) != 0)
     {
@@ -3675,7 +3711,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     cached.checkedFrame = g_r.frame;
     // DXT formats stay compressed on the GPU (BC1-BC4): no decode, a quarter to an eighth of
     // the upload. D3D12 needs block-aligned sizes; others are decoded to RGBA8.
-    static LiveSwitch noNativeBC("REGPU_NO_NATIVE_BC");
+    LiveSwitch &noNativeBC = g_sw_REGPU_NO_NATIVE_BC;
     const uint32_t kind = TextureBCKind(fetch.Format());
     const uint32_t bc = !noNativeBC && ((w % 4 == 0 && h % 4 == 0) || kind == 6) && !forceDecode ? kind : 0;
     const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
@@ -3696,7 +3732,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         return cached.resource.Get();
     }
     // REGPU_TRACE_TEXCHANGE=1: textures whose contents changed (address, frame, checks unchanged before).
-    if (static LiveSwitch traceChange("REGPU_TRACE_TEXCHANGE"); traceChange && cached.resource)
+    if (LiveSwitch &traceChange = g_sw_REGPU_TRACE_TEXCHANGE; traceChange && cached.resource)
         Log("texchange: %08X %s %ux%u frame %llu after %u unchanged", fetch.Address(), TextureFormatName(fetch.Format()), w, h,
             (unsigned long long)g_r.frame, cached.unchanged);
     const auto uploadStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3719,7 +3755,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     } uploadLog{ uploadStart, fetch, wasNew };
     // The title's own mip levels (distant surfaces sample the smaller, averaged ones: without
     // them the road and grass shimmer and look grainy). Down to the packed tail.
-    static LiveSwitch noMips("REGPU_NO_MIPS"); // A/B
+    LiveSwitch &noMips = g_sw_REGPU_NO_MIPS; // A/B
     std::vector<TextureFetch> levels{ fetch };
     for (uint32_t l = 1; !noMips && !forceDecode; l++)
     {
@@ -6920,7 +6956,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (DebugSkipDraw(initiator, dmaBase, dmaSize))
         return;
     g_drawSamplesResolve = false;
-    static LiveSwitch noRender("REGPU_NO_RENDER");
+    LiveSwitch &noRender = g_sw_REGPU_NO_RENDER;
     if (noRender)
         return;
     if (!g_r.ok)
@@ -6946,7 +6982,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // background scan is enough.
         const bool unseen = g_r.shaders.find(C().vsHash) == g_r.shaders.end() || g_r.shaders.find(C().psHash) == g_r.shaders.end();
         static auto lastScan = std::chrono::steady_clock::time_point{};
-        static LiveSwitch noScan("REGPU_NO_SHADER_SCAN");
+        LiveSwitch &noScan = g_sw_REGPU_NO_SHADER_SCAN;
         if (unseen && !noScan)
         {
             if (g_scanKnown.count(C().vsHash) || g_scanKnown.count(C().psHash))
@@ -6980,7 +7016,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     const CompiledShader& ps = GetShader(C().psHash, C().psCode, true);
     Section(1);
-    static LiveSwitch asyncShaders("REGPU_ASYNC_SHADERS");
+    LiveSwitch &asyncShaders = g_sw_REGPU_ASYNC_SHADERS;
     const bool shadersPending = vs.state.load(std::memory_order_acquire) == CompiledShader::Pending || ps.state.load(std::memory_order_acquire) == CompiledShader::Pending;
     if (shadersPending && SkippableDraw(edramMode == 5, gpureg::Get(RB_BLENDCONTROL0)))
     {
@@ -7013,7 +7049,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // everything else is expanded here.
     const uint32_t prim = initiator & 0x3F, indexSource = (initiator >> 6) & 3, indexCount = initiator >> 16;
     const bool restartOn = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 21) & 1;
-    static LiveSwitch noDirectIndex("REGPU_NO_DIRECT_INDEX");
+    LiveSwitch &noDirectIndex = g_sw_REGPU_NO_DIRECT_INDEX;
     // A draw asking for more indices than its index buffer holds reads zeros past its end (as the
     // Xenos does): the CPU path bounds the reads (BuildIndexList), the GPU's direct reads would not.
     const bool indexOverrun = indexSource == 0 && indexCount > (dmaSize & 0xFFFFFF);
@@ -7173,7 +7209,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     thread_local PSConstants pcStage;
     // Not in low performance mode (Config::lowPerformance): on an old CPU (FM2 on an FX-8350) the
     // block copies cost more than the scattered writes they replace. REGPU_CONSTANTS_IN_RING=1 too.
-    static LiveSwitch inRingSwitch("REGPU_CONSTANTS_IN_RING");
+    LiveSwitch &inRingSwitch = g_sw_REGPU_CONSTANTS_IN_RING;
     const bool inRing = inRingSwitch || regpu::GetConfig().lowPerformance;
     auto* vc = inRing ? vcRing : &vcStage;
     auto* pc = inRing ? pcRing : &pcStage;
@@ -7185,9 +7221,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const auto* src = reinterpret_cast<const __m128i*>(gpureg::File() + gpureg::AluConstants * 4);
         auto* dv = reinterpret_cast<__m128i*>(hooked && !inRing ? vc->c : vcRing->c);
         auto* dp = reinterpret_cast<__m128i*>(pcRing->c);
-        static LiveSwitch allConstants("REGPU_ALL_CONSTANTS"); // A/B
+        LiveSwitch &allConstants = g_sw_REGPU_ALL_CONSTANTS; // A/B
         const uint32_t nv = allConstants ? 256 : std::min(vs.info.constantsUsed, 256u), np = allConstants ? 256 : std::min(ps.info.constantsUsed, 256u);
-        if (static LiveSwitch traceUsed("REGPU_TRACE_CONSTANTS_USED"); traceUsed)
+        if (LiveSwitch &traceUsed = g_sw_REGPU_TRACE_CONSTANTS_USED; traceUsed)
         {
             static uint64_t sv = 0, sp = 0, n = 0, lastFrame = 0;
             sv += nv, sp += np, n++;
@@ -7200,7 +7236,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         // Only the constants each shader reads (by its mask; the game's onDraw hook may read any).
         // REGPU_CONSTANTS_BY_COUNT copies all up to the highest one again (A/B).
-        static LiveSwitch byCount("REGPU_CONSTANTS_BY_COUNT");
+        LiveSwitch &byCount = g_sw_REGPU_CONSTANTS_BY_COUNT;
         auto copy = [&](__m128i* dst, const __m128i* from, const std::array<uint64_t, 4>& mask, uint32_t n, bool all) {
             if (all || byCount)
             {
@@ -7262,14 +7298,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     memset(vc->vf, 0, sizeof(vc->vf));
     // vf[k].w: the buffer's size, past which a fetch reads 0 (as the Xenos does). REGPU_NO_FETCH_BOUNDS=1
     // reads past it (A/B).
-    static LiveSwitch noBounds("REGPU_NO_FETCH_BOUNDS");
+    LiveSwitch &noBounds = g_sw_REGPU_NO_FETCH_BOUNDS;
     for (uint32_t k : vs.info.vertexFetchConstants)
     {
         const uint32_t d0 = gpureg::Get(gpureg::FetchConstants + k * 2), d1 = gpureg::Get(gpureg::FetchConstants + k * 2 + 1);
         const uint32_t address = d0 & 0xFFFFFFFC, bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
         // Large buffers (static geometry) are read in place; small ones may be
         // rewritten before the GPU runs this frame, so they are copied.
-        static LiveSwitch noDirect("REGPU_NO_DIRECT_FETCH");
+        LiveSwitch &noDirect = g_sw_REGPU_NO_DIRECT_FETCH;
         static const uint32_t directBytes = getenv("REGPU_DIRECT_FETCH_KB") ? uint32_t(atoi(getenv("REGPU_DIRECT_FETCH_KB"))) * 1024u : kDirectFetchBytes;
         if (g_r.physical && !noDirect && bytes >= directBytes && !DynamicBuffer(address, bytes))
         {
@@ -7280,7 +7316,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             continue;
         }
         // REGPU_TRACE_MIDSIZE=1: log copied buffers of 16-64 KB that change within a frame (they must stay copied)
-        static LiveSwitch traceMid("REGPU_TRACE_MIDSIZE");
+        LiveSwitch &traceMid = g_sw_REGPU_TRACE_MIDSIZE;
         static const uint32_t traceMinBytes = traceMid ? uint32_t(atoi(getenv("REGPU_TRACE_MIDSIZE"))) * 1024u : 0;
         if (traceMid && bytes >= traceMinBytes)
         {
@@ -7318,7 +7354,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const bool gameWidened = g_gameWidescreen.load(std::memory_order_relaxed);
         vc->vwide[0] = gameWidened ? 1.0f : 1.0f / extent;
         vc->vwide[1] = wide / extent;
-        static LiveSwitch noSqueeze("REGPU_NO_HUD_SQUEEZE"); // A/B: 2D stretched with the view
+        LiveSwitch &noSqueeze = g_sw_REGPU_NO_HUD_SQUEEZE; // A/B: 2D stretched with the view
         vc->vwide[2] = noSqueeze ? 1.0f : 1.0f / wide;
         vc->vwide[3] = 1; // set after the textures are bound (below)
     }
@@ -7335,7 +7371,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // The title clears its (non-MSAA) shadow depth maps through views of the same EDRAM
     // with MSAA on: a pixel of a 4x surface covers 2x2 samples of the linear layout we
     // render in, a pixel of a 2x surface 1x2. Scale those clear rectangles to match.
-    static LiveSwitch noMsaaScale("REGPU_NO_MSAA_SCALE");
+    LiveSwitch &noMsaaScale = g_sw_REGPU_NO_MSAA_SCALE;
     if (!noMsaaScale && (initiator & 0x3F) == 8 && (gpureg::Get(RB_COLOR_MASK) & 0xF) == 0 && (gpureg::Get(RB_SURFACE_INFO) & 0x3FFF) < 1000)
     {
         const uint32_t msaa = (gpureg::Get(RB_SURFACE_INFO) >> 16) & 3;
@@ -7380,14 +7416,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // covers a guest pixel by its centre; scaled, the half-pixel shift is more than half a host pixel,
     // and a rectangle with integer edges (a shadow map's clear) lost its first row and column.
     // REGPU_NO_RECT_SNAP=1: no snap.
-    static LiveSwitch oldClearShift("REGPU_OLD_CLEAR_SHIFT"), noRectSnap("REGPU_NO_RECT_SNAP");
+    LiveSwitch &oldClearShift = g_sw_REGPU_OLD_CLEAR_SHIFT, &noRectSnap = g_sw_REGPU_NO_RECT_SNAP;
     if (oldClearShift)
         vc->vte[0] |= 1u << 31;
     if (!noRectSnap && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots && (ScaleX() != 1.0f || ScaleY() != 1.0f))
         vc->vte[0] |= 1u << 30;
     Sub(3); // viewport, MSAA scale
     // Triangle lists and restart-free strips from an index buffer: a real indexed draw.
-    static LiveSwitch noIndexed("REGPU_NO_INDEXED");
+    LiveSwitch &noIndexed = g_sw_REGPU_NO_INDEXED;
     D3D12_INDEX_BUFFER_VIEW indexView{};
     uint32_t indexedCount = 0;
     if (directIndex && !noIndexed && indexSource == 0 && (prim == 4 || prim == 6))
@@ -7440,7 +7476,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // its casters and clears to a pass-through alpha of 0 while the vertex shader sampled one).
     // REGPU_NO_DEPTH_ALPHATEST=1: no alpha test in depth-only passes; REGPU_DEPTH_ALPHATEST_ALL=1:
     // every draw tested (before); REGPU_DEPTH_ALPHATEST_VS=1: a vertex-shader texture counts too.
-    static LiveSwitch noDepthAlphaTest("REGPU_NO_DEPTH_ALPHATEST"), testAll("REGPU_DEPTH_ALPHATEST_ALL"), testVs("REGPU_DEPTH_ALPHATEST_VS");
+    LiveSwitch &noDepthAlphaTest = g_sw_REGPU_NO_DEPTH_ALPHATEST, &testAll = g_sw_REGPU_DEPTH_ALPHATEST_ALL, &testVs = g_sw_REGPU_DEPTH_ALPHATEST_VS;
     const bool depthAlphaTest = !noDepthAlphaTest && (testAll || ps.info.usedTextureSlots || (testVs && vs.info.usedTextureSlots));
     pc->info[0] = (colorControl >> 3) & 1 && (edramMode != 5 || depthAlphaTest) ? (colorControl & 7) : 7;
     pc->info2[0] = RegFloat(RB_ALPHA_REF);
@@ -7453,7 +7489,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // to 0..1 before blending (-1: saturate). Unclamped, a multiply blend brightened where the output
     // was a little over 1 (Top Spin 4's contact-shadow decals: light squares under every foot).
     // REGPU_NO_UNORM_CLAMP=1: not clamped.
-    static LiveSwitch noUnormClamp("REGPU_NO_UNORM_CLAMP");
+    LiveSwitch &noUnormClamp = g_sw_REGPU_NO_UNORM_CLAMP;
     const uint32_t colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF;
     const bool unorm = colorFormat == 0 || colorFormat == 1 || colorFormat == 2 || colorFormat == 10;
     pc->info2[3] = colorFormat == 3 || colorFormat == 12 ? 31.875f : unorm && !noUnormClamp ? -1.0f : 0.0f;
@@ -7511,7 +7547,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const bool volume = fetch.Dimension() == 2;
         ID3D12Resource* texture = cube ? GetCubeTexture(fetch, format) : volume ? GetVolumeTexture(fetch, format) : GetTexture(fetch, format, native);
         // Debug: REGPU_NO_LIVE_CUBE=1 binds the fallback for cubes the title rendered (live reflections).
-        if (static LiveSwitch noLiveCube("REGPU_NO_LIVE_CUBE"); noLiveCube && cube && ResolvedFor(fetch))
+        if (LiveSwitch &noLiveCube = g_sw_REGPU_NO_LIVE_CUBE; noLiveCube && cube && ResolvedFor(fetch))
             texture = nullptr;
         const uint32_t kind = cube ? 1u : volume ? 2u : 0u;
         const uint32_t index = texture ? BindlessIndex(texture, format, kind) : kind;
@@ -7519,7 +7555,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             CaptureTexture(fetch, slot, cube, texture != nullptr, index, native, g_textureFailure);
         // w: dimension (1 2D, 3 cube); bit 31 + bits 8-19: the fetch swizzle, applied in the
         // shader for textures that live on the GPU (resolves). Decoded ones are swizzled already.
-        static LiveSwitch noGpuSwizzle("REGPU_NO_GPU_SWIZZLE");
+        LiveSwitch &noGpuSwizzle = g_sw_REGPU_NO_GPU_SWIZZLE;
         const ResolvedTexture* resolvedPtr = ResolvedFor(fetch);
         const bool onGpu = (!noGpuSwizzle && fetch.Type() == 2 && resolvedPtr != nullptr) || native;
         // Our resolved textures keep red and blue in place; when the title
@@ -7540,7 +7576,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // 19-20 (mag): 0 point. With only one axis clamped (kerbs: clamped across, repeating
         // along) the wrapping sampler is used and the shader clamps that axis (bits 18, 19).
         const uint32_t clampX = (fetch.dwords[0] >> 10) & 7, clampY = (fetch.dwords[0] >> 13) & 7;
-        static LiveSwitch oldClamp("REGPU_OLD_CLAMP"); // A/B: X's mode for both axes (before the kerb fix)
+        LiveSwitch &oldClamp = g_sw_REGPU_OLD_CLAMP; // A/B: X's mode for both axes (before the kerb fix)
         const bool clamp = oldClamp ? clampX != 0 : clampX != 0 && clampY != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
         ti[0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
@@ -7579,7 +7615,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // held: titles rely on cut-out kills there passing (Top Spin 4's player shadows: a texture
     // looked up at the unwritten coordinate, read as 0 here, cut whole bodies out of the shadow map).
     // In depth-only passes such kills are skipped (bit 2). REGPU_NO_KILL_SKIP=1: kept.
-    if (static LiveSwitch noKillSkip("REGPU_NO_KILL_SKIP"); !noKillSkip && edramMode == 5 && !vs.info.interpolatorsWritten)
+    if (LiveSwitch &noKillSkip = g_sw_REGPU_NO_KILL_SKIP; !noKillSkip && edramMode == 5 && !vs.info.interpolatorsWritten)
         pc->info[2] |= 4u;
     // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
     // and must keep spanning the width (squeezing them warped the image outside 16:9).
@@ -7598,7 +7634,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const int32_t wy = ((gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1) ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
         const bool full = scissor.left <= 0 && scissor.top <= 0 && scissor.right >= LONG(PassWidth()) && scissor.bottom >= LONG(PassHeight());
         // REGPU_TRACE_TILES=1: draws per frame in tile passes (by tile rectangle) and full ones.
-        if (static LiveSwitch traceTiles("REGPU_TRACE_TILES"); traceTiles)
+        if (LiveSwitch &traceTiles = g_sw_REGPU_TRACE_TILES; traceTiles)
         {
             static std::map<std::tuple<LONG, LONG, LONG, LONG>, uint32_t> byRect;
             static uint32_t fullDraws = 0;
@@ -7652,7 +7688,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         return;
     }
     D3D12_RECT hostScissor = ToHost(scissor);
-    if (static LiveSwitch traceWidened("REGPU_TRACE_TILE_WIDEN"); traceWidened && TileMerge::t_widened)
+    if (LiveSwitch &traceWidened = g_sw_REGPU_TRACE_TILE_WIDEN; traceWidened && TileMerge::t_widened)
     {
         static uint64_t logged = 0;
         if (logged != g_r.frame)
@@ -7785,7 +7821,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // 96 fetch constants and 32 slots, a draw uses a few, and the rest was ~3 KB of padding per draw
         // (17 MB a frame of upload writes in PGR4's races). The ring bytes skipped are never read.
         // REGPU_FULL_CONSTANT_BLOCKS=1 copies the whole blocks (A/B).
-        static LiveSwitch fullBlocks("REGPU_FULL_CONSTANT_BLOCKS");
+        LiveSwitch &fullBlocks = g_sw_REGPU_FULL_CONSTANT_BLOCKS;
         const size_t vsFrom = hooked ? 0 : offsetof(VSConstants, b), psFrom = offsetof(PSConstants, b);
         auto put = [](void* ring, const void* stage, size_t from, size_t to) {
             if (to > from)
