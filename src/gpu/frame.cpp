@@ -57,7 +57,13 @@ std::unordered_map<uint64_t, ShaderUpload> g_uploads, g_uploadsOld;
 struct UploadAt
 {
     uint64_t at = ~0ull, key = 0;
+    // The record itself, found at rotation `rotation`: alive until the second rotation after (records
+    // move to the old map at the next and are freed at the one after), so a repeat load skips both
+    // map lookups (~1% of the command processor) while it is.
+    ShaderUpload* upload = nullptr;
+    uint64_t rotation = 0;
 };
+uint64_t g_rotations = 0;
 UploadAt g_uploadsAt[16384];
 UploadAt& UploadSlot(uint64_t at) { return g_uploadsAt[((at * 0x9E3779B97F4A7C15ull) >> 50) & 16383]; }
 constexpr size_t kUploadGeneration = 8192;
@@ -79,6 +85,7 @@ void RotateUploads()
         return;
     g_uploadsOld.clear();
     std::swap(g_uploads, g_uploadsOld);
+    g_rotations++;
     g_uploads.reserve(kUploadGeneration * 2);
 }
 
@@ -189,16 +196,21 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
         g_uploads.reserve(kUploadGeneration * 2);
     UploadAt& slot = UploadSlot(at);
     if (slot.at == at)
-        if (const ShaderUpload* u = FindUpload(slot.key); u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
+    {
+        ShaderUpload* u = slot.upload && g_rotations <= slot.rotation + 1 ? slot.upload : FindUpload(slot.key);
+        if (u && u != slot.upload)
+            slot.upload = u, slot.rotation = g_rotations;
+        if (u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
         {
             RendererSetShader(uint32_t(type), microcodeBE, u->used, u->hash);
             return;
         }
+    }
     const uint64_t key = FastKey(microcodeBE, dwords, uint32_t(type));
     if (const ShaderUpload* u = FindUpload(key); u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
     {
         RendererSetShader(uint32_t(type), microcodeBE, u->used, u->hash);
-        slot = { at, key };
+        slot = { at, key, const_cast<ShaderUpload*>(u), g_rotations };
         return; // seen before: already logged and dumped
     }
     const uint32_t raw = dwords;
@@ -206,8 +218,8 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
     const uint64_t hash = Fnv1a(microcodeBE, dwords) ^ uint64_t(type);
     RendererSetShader(uint32_t(type), microcodeBE, dwords, hash);
     RotateUploads();
-    g_uploads[key] = ShaderUpload{ std::vector<uint32_t>(microcodeBE, microcodeBE + raw), dwords, hash };
-    slot = { at, key };
+    ShaderUpload& upload = g_uploads[key] = ShaderUpload{ std::vector<uint32_t>(microcodeBE, microcodeBE + raw), dwords, hash };
+    slot = { at, key, &upload, g_rotations };
     if (!g_shaders.insert(hash).second)
         return;
     if (g_shaders.size() % 50 == 1)
