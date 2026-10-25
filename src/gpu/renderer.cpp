@@ -739,11 +739,13 @@ thread_local uint64_t g_bindingsFrame = ~0ull, g_bindingsEpoch = ~0ull;
 // The frame to trace (draws and resolves logged, the image and resolves written out):
 // REGPU_TRACE_DRAWS=<frame>, or the one after F12 is pressed in the game window.
 std::atomic<uint64_t> g_hotkeyFrame{ 0 };
+// (Read once at startup: a function-local static checks its initialisation guard on every call, and
+// RendererTracing asks several times a draw.)
+const uint64_t g_traceDrawsEnv = getenv("REGPU_TRACE_DRAWS") ? strtoull(getenv("REGPU_TRACE_DRAWS"), nullptr, 10) : 0;
 uint64_t TraceFrame()
 {
-    static const uint64_t env = getenv("REGPU_TRACE_DRAWS") ? strtoull(getenv("REGPU_TRACE_DRAWS"), nullptr, 10) : 0;
     const uint64_t hot = g_hotkeyFrame.load(std::memory_order_relaxed);
-    return hot ? hot : env;
+    return hot ? hot : g_traceDrawsEnv;
 }
 
 // Why GetTexture last found nothing to bind (the draw then samples the white fallback): shown in
@@ -5350,6 +5352,7 @@ struct Hold
 } g_hold;
 
 void HoldPresent();
+void SubmitLists(UINT n, ID3D12CommandList* const* lists);
 
 // Spins until done() is true. Presents the overlay roughly 8 times a second once the wait
 // has lasted 150 ms.
@@ -5737,7 +5740,7 @@ void HoldPresent()
     if (!ok)
         return;
     ID3D12CommandList* lists[] = { g_hold.list.Get() };
-    g_r.queue->ExecuteCommandLists(1, lists);
+    SubmitLists(1, lists);
     PresenterPresent();
     // Wait for it: the allocator and upload buffer are reused at the next hold.
     const UINT64 value = g_r.nextFence++;
@@ -5826,7 +5829,7 @@ void BootPresent(const std::vector<uint8_t>& rgba)
     if (!ok)
         return;
     ID3D12CommandList* lists[] = { g_hold.list.Get() };
-    g_r.queue->ExecuteCommandLists(1, lists);
+    SubmitLists(1, lists);
     PresenterPresent();
     const UINT64 value = g_r.nextFence++;
     g_r.queue->Signal(g_r.fence.Get(), value);
@@ -5968,7 +5971,35 @@ void ListPrologue(RecordedList& list)
     list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
 
-// Executes the main list so far and continues the frame in a fresh one.
+// Command lists closed but not yet submitted, in order. Parallel segments end the main list and add
+// their pieces several dozen times a frame; submitted one segment at a time, each submission left the
+// GPU idle a moment (FM2: GPU time per frame 5.0 -> 6.5 ms with 3 draw workers). They are queued here
+// and go with the next real submission (the frame's, a fence's, or one that must reach the GPU now).
+// REGPU_NO_DEFER_LISTS=1: at once.
+std::mutex g_pendingMutex;
+std::vector<ID3D12CommandList*> g_pendingLists;
+
+// Submits the queued lists, then these.
+void SubmitLists(UINT n, ID3D12CommandList* const* lists)
+{
+    std::lock_guard lock(g_pendingMutex);
+    g_pendingLists.insert(g_pendingLists.end(), lists, lists + n);
+    if (!g_pendingLists.empty())
+        g_r.queue->ExecuteCommandLists(UINT(g_pendingLists.size()), g_pendingLists.data());
+    g_pendingLists.clear();
+}
+
+// Queues lists for the next submission (or submits them, with REGPU_NO_DEFER_LISTS).
+void QueueLists(UINT n, ID3D12CommandList* const* lists)
+{
+    static const bool now = getenv("REGPU_NO_DEFER_LISTS") != nullptr;
+    if (now)
+        return SubmitLists(n, lists);
+    std::lock_guard lock(g_pendingMutex);
+    g_pendingLists.insert(g_pendingLists.end(), lists, lists + n);
+}
+
+// Ends the main list so far (queued for submission) and continues the frame in a fresh one.
 void EndOcclusionQuery();
 
 void SplitMainList()
@@ -5979,7 +6010,7 @@ void SplitMainList()
     ID3D12GraphicsCommandList* done = g_r.recorder.Real();
     done->Close();
     ID3D12CommandList* lists[] = { done };
-    g_r.queue->ExecuteCommandLists(1, lists);
+    QueueLists(1, lists);
     g_r.recorder.Rebind(AcquireList());
     ListPrologue(g_r.recorder);
     g_drawState.Invalidate();
@@ -5989,6 +6020,7 @@ void SplitMainList()
 // Waits until everything submitted to the queue so far has finished.
 void WaitForQueueIdle()
 {
+    SubmitLists(0, nullptr); // (queued lists first: the signal follows them)
     const UINT64 value = g_r.nextFence++;
     g_r.queue->Signal(g_r.fence.Get(), value);
     if (g_r.fence->GetCompletedValue() < value)
@@ -6145,6 +6177,7 @@ uint64_t FenceSubmitImpl()
     lastDraws = draws;
     BeginFrameIfNeeded();
     SplitMainList();
+    SubmitLists(0, nullptr); // (the signal must follow this fence's draws)
     lastValue = g_r.nextFence++;
     g_r.queue->Signal(g_r.fence.Get(), lastValue);
     return lastValue;
@@ -6181,7 +6214,7 @@ void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_
     list->ResourceBarrier(1, &bar);
     list->Close();
     ID3D12CommandList* lists[] = { list };
-    g_r.queue->ExecuteCommandLists(1, lists);
+    SubmitLists(1, lists);
     WaitForQueueIdle();
     uint8_t* pixels = nullptr;
     buffer->Map(0, nullptr, reinterpret_cast<void**>(&pixels));
@@ -6673,7 +6706,7 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
     lists.push_back(prepReal);
     for (ID3D12GraphicsCommandList* l : g_workers.lists)
         lists.push_back(l);
-    g_r.queue->ExecuteCommandLists(UINT(lists.size()), lists.data());
+    QueueLists(UINT(lists.size()), lists.data());
 }
 
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
@@ -8570,7 +8603,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         EndOcclusionQuery();
     C().list->Close();
     ID3D12CommandList* lists[] = { C().list->Real() };
-    g_r.queue->ExecuteCommandLists(1, lists);
+    SubmitLists(1, lists);
     if (presenting)
         PresenterPresent();
     Frame().fence = g_r.nextFence++;
