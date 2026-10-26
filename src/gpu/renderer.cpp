@@ -8301,6 +8301,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     Section(6);
     g_r.drawsThisFrame++;
+    // REGPU_SUBMIT_DRAWS=<n>: submit the frame so far every n draws (never inside an occlusion query), so
+    // the GPU starts on it while the rest is recorded (pgr4-native). Off by default: FM2's race, already
+    // GPU-bound, lost 4-17% at n = 128-512. It may help a game whose GPU waits on recording.
+    static const uint32_t submitEvery = getenv("REGPU_SUBMIT_DRAWS") ? uint32_t(atoi(getenv("REGPU_SUBMIT_DRAWS"))) : 0;
+    static uint32_t sinceSubmit = 0;
+    if (submitEvery && !C().worker && ++sinceSubmit >= submitEvery && !g_occlusionOpen)
+    {
+        sinceSubmit = 0;
+        SplitMainList();
+        SubmitLists(0, nullptr);
+    }
 }
 
 }
