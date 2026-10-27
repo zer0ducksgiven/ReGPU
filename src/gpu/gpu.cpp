@@ -55,6 +55,11 @@ void SetReg(uint32_t index, uint32_t value)
 // Physical addresses as the GPU sees them map onto our physical heap.
 uint32_t PhysToGuest(uint32_t phys) { return 0xA0000000 + (phys & 0x1FFFFFFF); }
 
+void PresentSwap(uint64_t frame, uint32_t frontBuffer); // command processor thread
+void PaceSwap(uint64_t frame);                           // the thread that swaps
+
+std::atomic<int64_t> g_vblankUs{ 0 }; // vblank period set by the host (0: ReGPU's own)
+
 struct Gpu
 {
     std::atomic<uint32_t> ringBase{ 0 };   // guest address
@@ -793,18 +798,7 @@ uint32_t ExecutePacket(uint32_t ptr)
             {
                 const auto swap = g_gpu.pendingSwaps[i];
                 g_gpu.pendingSwaps.erase(g_gpu.pendingSwaps.begin(), g_gpu.pendingSwaps.begin() + i + 1);
-                seg::Flush();
-                seg::g_tile = RendererTile{};
-                if (work::Active())
-                {
-                    uint32_t* p = work::Begin(work::kSwap, 3);
-                    p[0] = uint32_t(swap.frame);
-                    p[1] = uint32_t(swap.frame >> 32);
-                    p[2] = swap.frontBuffer;
-                    work::End(3);
-                }
-                else
-                    FrameOnSwap(swap.frame, swap.frontBuffer);
+                PresentSwap(swap.frame, swap.frontBuffer);
                 break;
             }
         }
@@ -838,6 +832,20 @@ uint32_t ExecutePacket(uint32_t ptr)
             count > 2 ? arg(2) : 0, count > 3 ? arg(3) : 0);
     switch (opcode)
     {
+    case 0x64: // XE_SWAP: 'SWAP', front buffer physical address, width, height
+    {
+        // Not a Xenos packet: Xenia's VdSwap, and ReXGlue's after it, writes it into the swap's
+        // block instead of NOPs. ReGPU's own VdSwap never does, so XenonRecomp ports don't see it.
+        if (count >= 2 && arg(0) == 0x53574150)
+        {
+            const uint64_t n = ++g_gpu.swaps;
+            PresentSwap(n, arg(1) & 0x1FFFF000);
+            // The guest's VdSwap returned long ago; pacing the command processor here holds the
+            // title back once the ring fills, which caps it the same way.
+            PaceSwap(n);
+        }
+        break;
+    }
     case 0x3F: // INDIRECT_BUFFER
     case 0x37: // INDIRECT_BUFFER_PFD
         // REGPU_TRACE_IB=1: the indirect buffers run (address, dwords, window offset, scissor), 400 of them.
@@ -1431,12 +1439,14 @@ void VblankLoop()
         // The title presents on vblanks: every one in gameplay, often every second one in menus. It
         // keeps game time by the clock, not by frames, so vblanks run at twice the frame cap
         // (120-720 Hz) and the limiter in VdSwap sets the frame rate for both.
-        static const int64_t periodUs = [] {
+        static const int64_t defaultUs = [] {
             const char* v = getenv("REGPU_VBLANK_HZ");
             const int hz = v ? std::clamp(atoi(v), 30, 1000) : std::clamp(int(FrameCap()) * 2, 120, 720);
             return int64_t(1000000 / hz);
         }();
-        next += std::chrono::microseconds(periodUs);
+        // A host that owns the video mode (driver::SetRefreshRate) sets the rate instead.
+        const int64_t hostUs = g_vblankUs.load(std::memory_order_relaxed);
+        next += std::chrono::microseconds(hostUs ? hostUs : defaultUs);
         static LiveSwitch coarse("REGPU_COARSE_SLEEP"); // A/B: the old 1 ms sleeps
         if (coarse)
             std::this_thread::sleep_until(next);
@@ -1490,6 +1500,83 @@ void GpuLogState()
     }
 }
 
+// Swaps -------------------------------------------------------------------
+
+namespace
+{
+// The command processor reached a swap: the frame so far goes to the screen.
+void PresentSwap(uint64_t frame, uint32_t frontBuffer)
+{
+    seg::Flush();
+    seg::g_tile = RendererTile{};
+    if (work::Active())
+    {
+        uint32_t* p = work::Begin(work::kSwap, 3);
+        p[0] = uint32_t(frame);
+        p[1] = uint32_t(frame >> 32);
+        p[2] = frontBuffer;
+        work::End(3);
+    }
+    else
+        FrameOnSwap(frame, frontBuffer);
+}
+
+// Per swap, on the thread that swaps (the title's in VdSwap, or the command processor's for
+// XE_SWAP): the hang watchdog and the frame limiter.
+void PaceSwap(uint64_t frame)
+{
+    if (frame == 1 || (frame & (frame - 1)) == 0 || frame % 60 == 0)
+        Log("gpu: swap #%llu", (unsigned long long)frame);
+    // Watchdog: no swap for 10 s once the title has started presenting logs every thread's stack
+    // (once per stall), so a lockup says where each thread is waiting.
+    static std::atomic<uint64_t> lastSwap{ 0 };
+    lastSwap.store(frame, std::memory_order_relaxed);
+    static std::once_flag watchdog;
+    std::call_once(watchdog, [] {
+        std::thread([] {
+            uint64_t seen = 0;
+            int still = 0;
+            bool logged = false;
+            for (;;)
+            {
+                Sleep(1000);
+                const uint64_t now = lastSwap.load(std::memory_order_relaxed);
+                still = now == seen ? still + 1 : 0;
+                if (now != seen)
+                    logged = false;
+                seen = now;
+                // (Only once the title presents steadily: the first swaps are followed by loading and
+                // a shader cache rebuild, minutes without a swap.)
+                if (still >= 10 && now >= 600 && !logged && regpu::GetHost().logThreadStacks)
+                {
+                    logged = true;
+                    Log("hang: no VdSwap for 10 s (last #%llu)", (unsigned long long)now);
+                    regpu::GetHost().logThreadStacks("no swap for 10 s");
+                }
+            }
+        }).detach();
+    });
+    // Frame limiter (settings: max FPS, the display's refresh with vsync): the title's render
+    // thread waits for its next frame slot. Vblanks run faster than the cap, so menus (which
+    // present every second vblank) and gameplay (every vblank) both reach it.
+    static const int64_t minFrameUs = int64_t(1000000 / FrameCap());
+    if (minFrameUs)
+    {
+        static auto next = Clock::now();
+        const auto now = Clock::now();
+        static LiveSwitch coarse("REGPU_COARSE_SLEEP");
+        if (next > now)
+        {
+            if (coarse)
+                std::this_thread::sleep_until(next);
+            else
+                PreciseSleepUntil(next, 300);
+        }
+        next = std::max(next, now) + std::chrono::microseconds(minFrameUs);
+    }
+}
+}
+
 // Driver entry points (include/regpu/driver.h) ------------------------------
 
 void regpu::driver::SetInterruptCallback(uint32_t callback, uint32_t userData)
@@ -1521,6 +1608,13 @@ void regpu::driver::EnableReadPointerWriteBack(uint32_t ptr, uint32_t blockSizeL
 {
     g_gpu.rptrWriteback = PhysToGuest(ptr & 0x1FFFFFFF);
     Log("gpu: rptr writeback at %08X (from %08X), block log2 %u", g_gpu.rptrWriteback.load(), ptr, blockSizeLog2);
+}
+
+void regpu::driver::SetRefreshRate(double hz)
+{
+    const int64_t us = hz > 0 ? int64_t(1000000 / std::clamp(hz, 24.0, 1000.0)) : 0;
+    if (g_vblankUs.exchange(us) != us)
+        Log("gpu: vblank %.2f Hz (0: ReGPU's own)", us ? 1000000.0 / us : 0.0);
 }
 
 // A guest access is a plain load or store, as it is when the file is guest memory: side effects
@@ -1688,55 +1782,7 @@ GUEST_EXPORT(VdSwap)
         if (g_gpu.pendingSwaps.size() > 16)
             g_gpu.pendingSwaps.pop_front();
     }
-    if (n == 1 || (n & (n - 1)) == 0 || n % 60 == 0)
-        Log("gpu: VdSwap #%llu", (unsigned long long)n);
-    // Watchdog: no swap for 10 s once the title has started presenting logs every thread's stack
-    // (once per stall), so a lockup says where each thread is waiting.
-    static std::atomic<uint64_t> lastSwap{ 0 };
-    lastSwap.store(n, std::memory_order_relaxed);
-    static std::once_flag watchdog;
-    std::call_once(watchdog, [] {
-        std::thread([] {
-            uint64_t seen = 0;
-            int still = 0;
-            bool logged = false;
-            for (;;)
-            {
-                Sleep(1000);
-                const uint64_t now = lastSwap.load(std::memory_order_relaxed);
-                still = now == seen ? still + 1 : 0;
-                if (now != seen)
-                    logged = false;
-                seen = now;
-                // (Only once the title presents steadily: the first swaps are followed by loading and
-                // a shader cache rebuild, minutes without a swap.)
-                if (still >= 10 && now >= 600 && !logged && regpu::GetHost().logThreadStacks)
-                {
-                    logged = true;
-                    Log("hang: no VdSwap for 10 s (last #%llu)", (unsigned long long)now);
-                    regpu::GetHost().logThreadStacks("no swap for 10 s");
-                }
-            }
-        }).detach();
-    });
-    // Frame limiter (settings: max FPS, the display's refresh with vsync): the title's render
-    // thread waits for its next frame slot. Vblanks run faster than the cap, so menus (which
-    // present every second vblank) and gameplay (every vblank) both reach it.
-    static const int64_t minFrameUs = int64_t(1000000 / FrameCap());
-    if (minFrameUs)
-    {
-        static auto next = Clock::now();
-        const auto now = Clock::now();
-        static LiveSwitch coarse("REGPU_COARSE_SLEEP");
-        if (next > now)
-        {
-            if (coarse)
-                std::this_thread::sleep_until(next);
-            else
-                PreciseSleepUntil(next, 300);
-        }
-        next = std::max(next, now) + std::chrono::microseconds(minFrameUs);
-    }
+    PaceSwap(n);
     Return(ctx, 0);
 }
 #endif // REGPU_GUEST_EXPORTS

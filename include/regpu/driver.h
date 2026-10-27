@@ -13,6 +13,10 @@ void EnableReadPointerWriteBack(uint32_t ptr, uint32_t blockSizeLog2);
 // VdSetGraphicsInterruptCallback. Starts ReGPU's interrupt and command processor threads.
 void SetInterruptCallback(uint32_t callback, uint32_t userData);
 
+// The guest's vblank rate, for a host whose VdQueryVideoMode reports its own refresh rate: the
+// title paces itself by it. 0 returns to ReGPU's own (twice the frame cap, 120-720 Hz).
+void SetRefreshRate(double hz);
+
 // The register file (guest 0x7FC80000 + index * 4), for the host's MMIO handler. Without
 // REGPU_GUEST_EXPORTS the registers live in host memory, so guest accesses must come here.
 uint32_t ReadRegister(uint32_t index);
