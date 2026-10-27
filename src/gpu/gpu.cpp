@@ -640,7 +640,10 @@ void WriteBack(uint32_t address, uint32_t value)
         work::End(2);
         return;
     }
-    PendingWrites::Add(RendererFenceSubmit(), address, value);
+    // With early fences (RendererEarlyFences) the fence lands now; the work before it is still
+    // submitted.
+    const uint64_t fence = RendererFenceSubmit();
+    PendingWrites::Add(RendererEarlyFences() ? 0 : fence, address, value);
 }
 
 uint32_t ReadBack(uint32_t address)

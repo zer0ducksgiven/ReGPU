@@ -251,6 +251,7 @@ constexpr uint32_t RB_SURFACE_INFO = 0x2000, RB_COLOR_INFO = 0x2001, RB_DEPTH_IN
 // Buffers that change (UI quads, particles) are all under 3 KB (REGPU_TRACE_MIDSIZE); REGPU_DIRECT_FETCH_KB
 // overrides. (16 KB while fences were written at record time; since they wait for the host GPU, 4 KB.)
 constexpr uint32_t kDirectFetchBytes = 4 * 1024;
+constexpr uint32_t kEarlyFenceDirectFetchBytes = 16 * 1024; // with RendererEarlyFences
 
 // Registers.
 constexpr uint32_t RB_STENCILREFMASK = 0x210D;
@@ -2307,6 +2308,10 @@ struct Manifest
 // Shader compilation runs on worker threads so the command processor never
 // stalls on fxc: a draw whose shaders are still compiling is skipped. The
 // bytecode is cached on disk by HLSL hash, so later runs start warm.
+// REGPU_OPTIMIZE_SHADERS=1: fxc optimises (slower compiles, faster shaders). The cache key is
+// the HLSL alone, so use a separate cache directory when switching.
+const UINT g_shaderFlags = getenv("REGPU_OPTIMIZE_SHADERS") ? D3DCOMPILE_OPTIMIZATION_LEVEL1 : D3DCOMPILE_SKIP_OPTIMIZATION;
+
 std::filesystem::path ShaderCachePath(uint64_t key)
 {
     char name[32];
@@ -2423,7 +2428,7 @@ struct ShaderCompiler
         // shader cannot sample with an implicit LOD).
         const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
         const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, cs.pixel ? nullptr : vertexStage, nullptr, "main",
-            cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
+            cs.pixel ? "ps_5_1" : "vs_5_1", g_shaderFlags | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         if (FAILED(hr))
         {
@@ -2504,7 +2509,13 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
 {
     thread_local std::unordered_map<uint64_t, const CompiledShader*> known;
     if (auto it = known.find(hash); it != known.end())
+    {
+        // First seen as a background find (a memory scan), it may still be parked: a draw
+        // that needs it must promote it, or its wait never ends.
+        if (!background)
+            g_compiler.Promote(*it->second);
         return *it->second;
+    }
     std::lock_guard shaderLock(g_shaderMutex);
     const CompiledShader& cs = GetShaderLocked(hash, codeBE, pixel, background);
     known.emplace(hash, &cs);
@@ -6734,6 +6745,11 @@ bool RendererIsResolveDraw()
 }
 
 uint64_t RendererFenceSubmit() { return FenceSubmitImpl(); }
+bool RendererEarlyFences()
+{
+    static const bool on = getenv("REGPU_EARLY_FENCES") != nullptr;
+    return on;
+}
 
 void RendererScreenScissor(int32_t rect[4]) { ScreenScissor(rect); }
 
@@ -7421,7 +7437,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // A draw asking for more indices than its index buffer holds reads zeros past its end (as the
     // Xenos does): the CPU path bounds the reads (BuildIndexList), the GPU's direct reads would not.
     const bool indexOverrun = indexSource == 0 && indexCount > (dmaSize & 0xFFFFFF);
-    const bool directIndex = g_r.physical && !noDirectIndex && !indexOverrun && (indexSource == 0 || indexSource == 2) &&
+    // With early fences, indices read in place must not be ones the title rewrites (the copied
+    // index paths are safe: they read guest memory at record time).
+    const bool indexRewritten = RendererEarlyFences() && indexSource == 0 &&
+        DynamicBuffer(dmaBase & 0x1FFFFFFF, (dmaSize & 0xFFFFFF) * (((initiator >> 11) & 1) ? 4u : 2u));
+    const bool directIndex = g_r.physical && !noDirectIndex && !indexOverrun && !indexRewritten && (indexSource == 0 || indexSource == 2) &&
         (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
     IndexListEntry* indexEntry = directIndex ? nullptr : CachedIndexList(initiator, dmaBase, dmaSize);
@@ -7674,7 +7694,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // Large buffers (static geometry) are read in place; small ones may be
         // rewritten before the GPU runs this frame, so they are copied.
         LiveSwitch &noDirect = g_sw_REGPU_NO_DIRECT_FETCH;
-        static const uint32_t directBytes = getenv("REGPU_DIRECT_FETCH_KB") ? uint32_t(atoi(getenv("REGPU_DIRECT_FETCH_KB"))) * 1024u : kDirectFetchBytes;
+        static const uint32_t directBytes = getenv("REGPU_DIRECT_FETCH_KB") ? uint32_t(atoi(getenv("REGPU_DIRECT_FETCH_KB"))) * 1024u
+                                          : RendererEarlyFences() ? kEarlyFenceDirectFetchBytes : kDirectFetchBytes;
         if (g_r.physical && !noDirect && bytes >= directBytes && !DynamicBuffer(address, bytes))
         {
             vc->vf[k][0] = address & 0x1FFFFFFF;

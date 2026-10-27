@@ -45,6 +45,10 @@ bool RendererIsResolveDraw();
 // that marks its end comes back (0: nothing to wait for). The write itself waits for that
 // value on another thread (gpu.cpp), so the command processor reads on.
 uint64_t RendererFenceSubmit();
+// REGPU_EARLY_FENCES=1: fences land when the command processor reaches them, as on the console
+// (where the GPU is never far behind), instead of after the host GPU. The title can then rewrite
+// memory the host GPU has yet to read, so guest ranges seen changing are copied, not read in place.
+bool RendererEarlyFences();
 // Blocks until the host GPU has reached a value from RendererFenceSubmit.
 void RendererFenceWait(uint64_t value, void* event);
 // The fence writer, after RendererFenceWait(value): resolve write-backs recorded before it land in guest memory.
