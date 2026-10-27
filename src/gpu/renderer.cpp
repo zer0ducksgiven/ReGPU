@@ -305,6 +305,7 @@ struct CachedTexture
     uint64_t contentHash = 0;
     uint64_t checkedFrame = ~0ull; // content already validated in this frame
     uint32_t unchanged = 0;        // checks in a row that found the same content
+    uint32_t changes = 0;          // times the content changed after the first upload
     uint32_t width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // cubes: matches their faces
     bool native = false; // block-compressed on the GPU: the shader applies the fetch swizzle
@@ -840,6 +841,29 @@ uint64_t Fnv(const void* data, size_t bytes, uint64_t h = 0xCBF29CE484222325ull)
     for (size_t i = 0; i < bytes; i++)
         h = (h ^ p[i]) * 0x100000001B3ull;
     return h;
+}
+
+// Every byte of the data, four independent 64-bit lanes at a time (a dword-by-dword chain waits on each
+// multiply). For data whose every byte matters and that is checked every frame: index buffers.
+uint64_t FullHash(const uint8_t* data, size_t bytes)
+{
+    uint64_t a = 0xCBF29CE484222325ull ^ bytes, b = 0x9E3779B97F4A7C15ull, c = 0xC2B2AE3D27D4EB4Full, d = 0x165667B19E3779F9ull;
+    size_t i = 0;
+    for (; i + 32 <= bytes; i += 32)
+    {
+        uint64_t v[4];
+        memcpy(v, data + i, 32);
+        a = (a ^ v[0]) * 0xFF51AFD7ED558CCDull;
+        b = (b ^ v[1]) * 0xC4CEB9FE1A85EC53ull;
+        c = (c ^ v[2]) * 0xFF51AFD7ED558CCDull;
+        d = (d ^ v[3]) * 0xC4CEB9FE1A85EC53ull;
+        a ^= a >> 29; b ^= b >> 31; c ^= c >> 29; d ^= d >> 31;
+    }
+    for (; i < bytes; i++)
+        a = (a ^ data[i]) * 0x100000001B3ull;
+    uint64_t h = a ^ (b * 0x9E3779B97F4A7C15ull) ^ (c * 0xC2B2AE3D27D4EB4Full) ^ (d * 0x165667B19E3779F9ull);
+    h = (h ^ (h >> 33)) * 0xFF51AFD7ED558CCDull;
+    return h ^ (h >> 33);
 }
 
 // Sampled hash for large texture sources: every 64th dword plus the ends.
@@ -2094,7 +2118,11 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
     }
     e.checkedFrame = g_r.frame;
     const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(base));
-    const uint64_t hash = ContentHash(src, bytes);
+    // Every index, not a sample: a game that streams new geometry into the same address and size
+    // can change only words between the samples, and the old indices drew on (FM2 port, report #4:
+    // black wedges of track). REGPU_INDEX_SAMPLED_HASH=1 samples every 256 bytes as before (A/B).
+    static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
+    const uint64_t hash = sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
     if (!inserted && hash == e.hash)
         return true;
     // Swap into the upload ring (as the vertex shader would read them), then copy.
@@ -2891,6 +2919,12 @@ struct PipelineLibrary
     std::shared_mutex access;
     std::chrono::steady_clock::time_point lastSave = std::chrono::steady_clock::now();
     std::vector<char> loaded;
+    // Compaction: entries are never removed, so every translator or driver change leaves the old ones
+    // behind (FM2 port: 574 MB read at every boot). Every pipeline this session loads or builds also
+    // goes into `fresh`; once that holds every pipeline the manifest lists and is at least 10% smaller,
+    // it replaces the old library and is what gets saved. REGPU_NO_LIBRARY_COMPACT=1 keeps the old one.
+    ComPtr<ID3D12PipelineLibrary> fresh;
+    std::atomic<size_t> freshCount{ 0 };
 
     static std::filesystem::path Path() { return RegpuUserDir() / "pipelines.bin"; }
 
@@ -2912,6 +2946,8 @@ struct PipelineLibrary
                 library.Reset();
         }
         Log("renderer: pipeline library %s (%zu bytes loaded)", library ? "ready" : "unavailable", loaded.size());
+        if (library && !loaded.empty() && !getenv("REGPU_NO_LIBRARY_COMPACT") && FAILED(d1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&fresh))))
+            fresh.Reset();
     }
 
     // The shaders' compiled code is part of the name: the game's shader hashes alone stay the same
@@ -2920,8 +2956,23 @@ struct PipelineLibrary
     // (FM2 port: 181-496 of 498 pipelines rebuilt each launch, 0 after).
     static std::wstring Name(const PipelineKey& k, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd)
     {
-        const uint64_t code = Fnv(pd.VS.pShaderBytecode, pd.VS.BytecodeLength, 3) * 0x9E3779B97F4A7C15ull ^
+        uint64_t code = Fnv(pd.VS.pShaderBytecode, pd.VS.BytecodeLength, 3) * 0x9E3779B97F4A7C15ull ^
             (pd.PS.pShaderBytecode ? Fnv(pd.PS.pShaderBytecode, pd.PS.BytecodeLength, 4) : 0);
+        // The fixed-function state too: an entry only loads with the description it was stored with, so
+        // when the renderer's state for a key changed (depth bias, formats, sample count) the old entry
+        // kept the name and blocked the new one (FM2 port: 2723 of 3031 rebuilt every launch).
+        // REGPU_PIPELINE_NAME_SHADERS_ONLY=1 names by the shaders alone, as before.
+        static const bool shadersOnly = getenv("REGPU_PIPELINE_NAME_SHADERS_ONLY") != nullptr;
+        if (!shadersOnly)
+        {
+            code = (code ^ Fnv(&pd.BlendState, sizeof(pd.BlendState), 5)) * 0x9E3779B97F4A7C15ull;
+            code = (code ^ Fnv(&pd.RasterizerState, sizeof(pd.RasterizerState), 6)) * 0x9E3779B97F4A7C15ull;
+            code = (code ^ Fnv(&pd.DepthStencilState, sizeof(pd.DepthStencilState), 7)) * 0x9E3779B97F4A7C15ull;
+            code = (code ^ Fnv(pd.RTVFormats, sizeof(pd.RTVFormats), 8)) * 0x9E3779B97F4A7C15ull;
+            const uint32_t misc[] = { pd.SampleMask, uint32_t(pd.IBStripCutValue), uint32_t(pd.PrimitiveTopologyType), pd.NumRenderTargets,
+                uint32_t(pd.DSVFormat), pd.SampleDesc.Count, pd.SampleDesc.Quality, pd.InputLayout.NumElements };
+            code = (code ^ Fnv(misc, sizeof(misc), 9)) * 0x9E3779B97F4A7C15ull;
+        }
         wchar_t name[128];
         swprintf(name, 128, L"%016llx_%016llx_%08x_%08x_%08x_%08x_%016llx", (unsigned long long)k.vs, (unsigned long long)k.ps, k.blend, k.depth,
             k.stencilMaskMode, k.flags, (unsigned long long)code);
@@ -2936,11 +2987,12 @@ struct PipelineLibrary
             const std::wstring name = Name(key, pd);
             {
                 std::shared_lock lock(access);
-                if (SUCCEEDED(library->LoadGraphicsPipeline(name.c_str(), &pd, IID_PPV_ARGS(&pso))))
-                {
-                    *hit = true;
-                    return S_OK;
-                }
+                *hit = SUCCEEDED(library->LoadGraphicsPipeline(name.c_str(), &pd, IID_PPV_ARGS(&pso)));
+            }
+            if (*hit)
+            {
+                KeepFresh(name, pso.Get());
+                return S_OK;
             }
             // The slow part (the driver compiling) runs outside the lock.
             const HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
@@ -2950,9 +3002,47 @@ struct PipelineLibrary
                 if (SUCCEEDED(library->StorePipeline(name.c_str(), pso.Get())))
                     stored++;
             }
+            if (SUCCEEDED(hr))
+                KeepFresh(name, pso.Get());
             return hr;
         }
         return device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+    }
+
+    void KeepFresh(const std::wstring& name, ID3D12PipelineState* pso)
+    {
+        if (!fresh)
+            return;
+        {
+            std::shared_lock lock(access); // (stores share the library, as in CreateOrLoad)
+            if (!fresh)
+                return;
+            if (SUCCEEDED(fresh->StorePipeline(name.c_str(), pso)))
+                freshCount++;
+        }
+        size_t listed;
+        {
+            std::lock_guard manifestLock(g_manifest.mutex);
+            listed = g_manifest.known.size();
+        }
+        if (!listed || freshCount < listed)
+            return;
+        bool swap = false;
+        {
+            std::unique_lock lock(access);
+            // Only when it saves something: else the old library stays and is not written again.
+            if (fresh && fresh->GetSerializedSize() * 10 < loaded.size() * 9)
+            {
+                library = fresh;
+                swap = true;
+            }
+            fresh.Reset();
+        }
+        if (swap)
+        {
+            Log("renderer: pipeline library compacted to this session's %zu pipelines; saved at the next save", freshCount.load());
+            stored++;
+        }
     }
 
     // Writes the library out when new pipelines were stored (at most every 10 s). Never on
@@ -3799,7 +3889,12 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     // ~0.1 s late). REGPU_TEXTURE_CHECK_EVERY4=1 keeps every 4th (A/B).
     LiveSwitch &every4 = g_sw_REGPU_TEXTURE_CHECK_EVERY4;
     const uint64_t checkMask = !every4 && cached.unchanged >= 300 ? 15 : 3;
-    if (cached.resource && !checkAlways && !forceDecode && cached.unchanged >= 30 && ((g_r.frame + (textureKey >> 32)) & checkMask) != 0)
+    // Textures that keep changing (8 times or more) aren't staggered. A paused video's planes sit unchanged
+    // long enough to be, each on its own frames, and when it played again its brightness and colour came
+    // from different frames for a frame or two (FM2 port, report #15). REGPU_STAGGER_CHANGING=1: as before.
+    static LiveSwitch noChangingCheck("REGPU_STAGGER_CHANGING");
+    if (cached.resource && !checkAlways && !forceDecode && cached.unchanged >= 30 &&
+        (cached.changes < 8 || noChangingCheck) && ((g_r.frame + (textureKey >> 32)) & checkMask) != 0)
     {
         if (((g_r.frame + 1 + (textureKey >> 32)) & checkMask) == 0) // due next frame: hashed ahead
         {
@@ -3838,6 +3933,8 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     const auto uploadStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool wasNew = !cached.resource;
     cached.unchanged = 0;
+    if (!wasNew)
+        cached.changes++;
     struct UploadLog
     {
         std::chrono::steady_clock::time_point start;
