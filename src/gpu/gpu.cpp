@@ -22,6 +22,7 @@
 #include "settings.h"
 #include "kernel/imports.h"
 #include "kernel/thread.h"
+#include "regpu/driver.h"
 
 using Clock = std::chrono::steady_clock;
 #include "gpu/regs.h"
@@ -33,16 +34,23 @@ extern HANDLE g_profiledWorker; // renderer.cpp
 
 namespace
 {
-// GPU registers are memory-mapped at 0x7FC80000 in guest space.
-constexpr uint32_t kRegisterBase = 0x7FC80000;
 constexpr uint32_t CP_RB_RPTR = 0x01C4;
 constexpr uint32_t CP_RB_WPTR = 0x01C5;
 constexpr uint32_t SCRATCH_REG0 = 0x0578;
 constexpr uint32_t COHER_STATUS_HOST = 0x0A31;
 constexpr uint32_t RBBM_STATUS = 0x05D0;
 
-uint32_t Reg(uint32_t index) { return LoadBE32(kRegisterBase + index * 4); }
-void SetReg(uint32_t index, uint32_t value) { StoreBE32(kRegisterBase + index * 4, value); }
+uint32_t Reg(uint32_t index)
+{
+    uint32_t v;
+    memcpy(&v, gpureg::LiveFile() + index * 4, 4);
+    return __builtin_bswap32(v);
+}
+void SetReg(uint32_t index, uint32_t value)
+{
+    value = __builtin_bswap32(value);
+    memcpy(gpureg::LiveFile() + index * 4, &value, 4);
+}
 
 // Physical addresses as the GPU sees them map onto our physical heap.
 uint32_t PhysToGuest(uint32_t phys) { return 0xA0000000 + (phys & 0x1FFFFFFF); }
@@ -238,7 +246,7 @@ void TakeSnapshot()
     s.logPos = g_log.size();
     s.drawsBefore = g_draws;
     s.regs.resize(0x8000 * 4); // (type-0 packets address registers up to 0x7FFF)
-    memcpy(s.regs.data(), GuestPtr<uint8_t>(kRegisterBase), s.regs.size());
+    memcpy(s.regs.data(), gpureg::LiveFile(), s.regs.size());
     s.vs = g_vs;
     s.ps = g_ps;
     s.vsAddress = g_vsAddress;
@@ -728,7 +736,7 @@ void WriteRegisters(uint32_t index, uint32_t source, uint32_t count)
     const bool lut = index <= DC_LUT_30_COLOR && index + count > DC_LUT_RW_INDEX;
     if (!lut && (index + count <= SCRATCH_REG0 || index >= SCRATCH_REG0 + 8))
     {
-        memcpy(GuestPtr<uint8_t>(kRegisterBase + index * 4), GuestPtr<uint8_t>(source), size_t(count) * 4);
+        memcpy(gpureg::LiveFile() + index * 4, GuestPtr<uint8_t>(source), size_t(count) * 4);
         if (seg::g_open)
             seg::Append(seg::kRegs, &index, 1, GuestPtr<uint32_t>(source), count);
         if (work::Active())
@@ -1246,7 +1254,7 @@ void GpuLookahead()
         return;
     constexpr uint32_t kFirst = 0x2000, kCount = 0x3000;
     std::vector<uint32_t> saved(kCount);
-    memcpy(saved.data(), GuestPtr<uint8_t>(kRegisterBase + kFirst * 4), kCount * 4);
+    memcpy(saved.data(), gpureg::LiveFile() + kFirst * 4, kCount * 4);
     const uint64_t savedMask = g_gpu.binMask, savedSelect = g_gpu.binSelect;
     RendererPredictBegin();
     LookState st;
@@ -1271,7 +1279,7 @@ void GpuLookahead()
             StoreBE32(scratch + i * 4, LoadBE32(base + ((start + i) % size) * 4));
         LookaheadBuffer(scratch, n, 0, st);
     }
-    memcpy(GuestPtr<uint8_t>(kRegisterBase + kFirst * 4), saved.data(), kCount * 4);
+    memcpy(gpureg::LiveFile() + kFirst * 4, saved.data(), kCount * 4);
     g_gpu.binMask = savedMask;
     g_gpu.binSelect = savedSelect;
 }
@@ -1283,7 +1291,7 @@ void CommandProcessorLoop(PPCContext& ctx)
     t_cpContext = &ctx;
     if (work::g_enabled)
     {
-        memcpy(work::g_file.data(), GuestPtr<uint8_t>(kRegisterBase), work::g_file.size());
+        memcpy(work::g_file.data(), gpureg::LiveFile(), work::g_file.size());
         std::thread worker(WorkerLoop);
         static HANDLE workerHandle = nullptr;
         DuplicateHandle(GetCurrentProcess(), worker.native_handle(), GetCurrentProcess(), &workerHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
@@ -1482,6 +1490,52 @@ void GpuLogState()
     }
 }
 
+// Driver entry points (include/regpu/driver.h) ------------------------------
+
+void regpu::driver::SetInterruptCallback(uint32_t callback, uint32_t userData)
+{
+    g_gpu.interruptCallback = callback;
+    g_gpu.interruptData = userData;
+    Log("gpu: interrupt callback %08X data %08X", callback, userData);
+    GpuStartInterruptThread();
+}
+
+void regpu::driver::InitializeRingBuffer(uint32_t ptr, uint32_t sizeLog2)
+{
+    // (physical address, log2 of size in qwords? - size = 1 << (log2 + 3) bytes)
+    // A new ring starts empty: both pointers back to 0, as the kernel resets the CP. Without the
+    // write pointer reset, the CP would run the new ring's stale contents up to the old one's.
+    {
+        std::lock_guard lock(g_gpu.ringMutex);
+        g_gpu.ringBase = PhysToGuest(ptr);
+        g_gpu.ringDwords = (1u << (sizeLog2 + 3)) / 4;
+        g_gpu.rptr = 0;
+        g_gpu.ringGeneration++;
+        SetReg(CP_RB_WPTR, 0);
+        SetReg(CP_RB_RPTR, 0);
+    }
+    Log("gpu: ring buffer at %08X, %u dwords", g_gpu.ringBase.load(), g_gpu.ringDwords.load());
+}
+
+void regpu::driver::EnableReadPointerWriteBack(uint32_t ptr, uint32_t blockSizeLog2)
+{
+    g_gpu.rptrWriteback = PhysToGuest(ptr & 0x1FFFFFFF);
+    Log("gpu: rptr writeback at %08X (from %08X), block log2 %u", g_gpu.rptrWriteback.load(), ptr, blockSizeLog2);
+}
+
+// A guest access is a plain load or store, as it is when the file is guest memory: side effects
+// (the gamma table) come from packets, which go through WriteRegister above.
+uint32_t regpu::driver::ReadRegister(uint32_t index)
+{
+    return Reg(index & 0x7FFF);
+}
+
+void regpu::driver::WriteRegister(uint32_t index, uint32_t value)
+{
+    SetReg(index & 0x7FFF, value);
+}
+
+#if REGPU_GUEST_EXPORTS
 // Imports ------------------------------------------------------------------
 
 GUEST_EXPORT(VdInitializeEngines)
@@ -1493,34 +1547,18 @@ GUEST_EXPORT(VdShutdownEngines) {}
 
 GUEST_EXPORT(VdSetGraphicsInterruptCallback)
 {
-    g_gpu.interruptCallback = ctx.r3.u32;
-    g_gpu.interruptData = ctx.r4.u32;
-    Log("gpu: interrupt callback %08X data %08X", ctx.r3.u32, ctx.r4.u32);
-    GpuStartInterruptThread();
+    regpu::driver::SetInterruptCallback(ctx.r3.u32, ctx.r4.u32);
 }
 
 GUEST_EXPORT(VdInitializeRingBuffer)
 {
-    // (physical address, log2 of size in qwords? - size = 1 << (log2 + 3) bytes)
-    // A new ring starts empty: both pointers back to 0, as the kernel resets the CP. Without the
-    // write pointer reset, the CP would run the new ring's stale contents up to the old one's.
-    {
-        std::lock_guard lock(g_gpu.ringMutex);
-        g_gpu.ringBase = PhysToGuest(ctx.r3.u32);
-        g_gpu.ringDwords = (1u << (ctx.r4.u32 + 3)) / 4;
-        g_gpu.rptr = 0;
-        g_gpu.ringGeneration++;
-        SetReg(CP_RB_WPTR, 0);
-        SetReg(CP_RB_RPTR, 0);
-    }
-    Log("gpu: ring buffer at %08X, %u dwords", g_gpu.ringBase.load(), g_gpu.ringDwords.load());
+    regpu::driver::InitializeRingBuffer(ctx.r3.u32, ctx.r4.u32);
 }
 
 GUEST_EXPORT(VdEnableRingBufferRPtrWriteBack)
 {
     // (address, block log2)
-    g_gpu.rptrWriteback = PhysToGuest(ctx.r3.u32 & 0x1FFFFFFF);
-    Log("gpu: rptr writeback at %08X (from %08X), block log2 %u", g_gpu.rptrWriteback.load(), ctx.r3.u32, ctx.r4.u32);
+    regpu::driver::EnableReadPointerWriteBack(ctx.r3.u32, ctx.r4.u32);
 }
 
 GUEST_EXPORT(VdSetSystemCommandBufferGpuIdentifierAddress) {}
@@ -1701,3 +1739,4 @@ GUEST_EXPORT(VdSwap)
     }
     Return(ctx, 0);
 }
+#endif // REGPU_GUEST_EXPORTS

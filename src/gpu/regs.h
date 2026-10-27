@@ -15,10 +15,25 @@ constexpr uint32_t FetchConstants = 0x4800;
 constexpr uint32_t BoolConstants = 0x4900;
 constexpr uint32_t LoopConstants = 0x4908;
 
-// The register file this thread reads: the guest's (written by the command processor), or
+// The live register file, big-endian. XenonRecomp ports have no MMIO, so the guest reads and
+// writes it as plain memory at kBase. Under ReXGlue that range is MMIO (regpu::driver::Read/
+// WriteRegister), so the file lives in host memory. 0x8000 registers: type-0 packets address
+// up to 0x7FFF.
+constexpr uint32_t kFileBytes = 0x8000 * 4;
+#if REGPU_GUEST_EXPORTS
+inline uint8_t* LiveFile() { return GuestPtr<uint8_t>(kBase); }
+#else
+inline uint8_t* LiveFile()
+{
+    alignas(64) static uint8_t file[kFileBytes];
+    return file;
+}
+#endif
+
+// The register file this thread reads: the live one (written by the command processor), or
 // the draw worker's own copy, which follows the command processor's writes in order.
 inline thread_local uint8_t* t_file = nullptr;
-inline uint8_t* File() { return t_file ? t_file : GuestPtr<uint8_t>(kBase); }
+inline uint8_t* File() { return t_file ? t_file : LiveFile(); }
 inline uint32_t Get(uint32_t index)
 {
     uint32_t v;

@@ -1,8 +1,17 @@
 #pragma once
 // Implementing guest imports (the Vd* video exports): PPC_FUNC(__imp__Name) receives the caller's
 // registers. Arguments are r3-r10, then 8-byte stack slots.
+#if REGPU_REXGLUE
+// ReXGlue's PPCContext: same register names and function signature as XenonRecomp's.
+#include <rex/ppc/context.h>
+#include <rex/ppc/func.h>
+#ifndef PPC_FUNC
+#define PPC_FUNC(x) REX_FUNC(x)
+#endif
+#else
 #include <ppc_config.h> // the game's (REGPU_PPC_DIR)
 #include <ppc_context.h>
+#endif
 
 #include "log.h"
 #include "memory.h"
