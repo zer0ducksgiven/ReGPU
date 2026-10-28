@@ -1964,30 +1964,36 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
 // Whether guest memory can be read. A XenonRecomp port commits all of it; a host that protects
 // unallocated guest pages (ReXGlue: no access) faults on a fetch that runs past an allocation,
 // which the GPU reading the same memory in place would see as zeros. (Its fault handler runs
-// before any of ours, so the range is checked first.) One VirtualQuery per 64 KB page and frame,
-// per recording thread.
+// before any of ours, so the range is checked first.) VirtualQuery is slow on a large mapped view
+// (it walks the view to find the region: answered per page and frame it cost FH1 100 ms a frame),
+// so answers are kept per 64 KB page: a readable page for 240 frames (staggered), one that is not
+// for 30. Protection the host changes in between is not seen until then.
 bool GuestReadable(const uint8_t* p, size_t bytes)
 {
-    thread_local FrameMap<bool> pages;
+    struct Page
+    {
+        uint64_t until;
+        bool ok;
+    };
+    thread_local std::unordered_map<uintptr_t, Page> pages;
     const uintptr_t first = uintptr_t(p) >> 16, last = (uintptr_t(p) + std::max<size_t>(bytes, 1) - 1) >> 16;
     for (uintptr_t page = first; page <= last; page++)
     {
-        if (const bool* known = pages.Find(page, g_r.frame))
+        auto it = pages.find(page);
+        if (it == pages.end() || it->second.until <= g_r.frame)
         {
-            if (!*known)
-                return false;
-            continue;
+            MEMORY_BASIC_INFORMATION mbi{};
+            const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE;
+            const void* at = reinterpret_cast<const void*>(page << 16);
+            bool ok = VirtualQuery(at, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT && (mbi.Protect & readable) && !(mbi.Protect & PAGE_GUARD);
+            // The region may end inside the page: a run of readable regions until the page's end.
+            for (uintptr_t next = uintptr_t(mbi.BaseAddress) + mbi.RegionSize; ok && next < ((page + 1) << 16);
+                 next = uintptr_t(mbi.BaseAddress) + mbi.RegionSize)
+                ok = VirtualQuery(reinterpret_cast<const void*>(next), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+                     (mbi.Protect & readable) && !(mbi.Protect & PAGE_GUARD);
+            it = pages.insert_or_assign(page, Page{ g_r.frame + (ok ? 240 + (page * 2654435761u) % 64 : 30), ok }).first;
         }
-        MEMORY_BASIC_INFORMATION mbi{};
-        const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE;
-        bool ok = VirtualQuery(reinterpret_cast<const void*>(page << 16), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
-                  (mbi.Protect & readable) && !(mbi.Protect & PAGE_GUARD);
-        // (The region may end inside the page: check its remainder too.)
-        if (ok && uintptr_t(mbi.BaseAddress) + mbi.RegionSize < ((page + 1) << 16))
-            ok = GuestReadable(reinterpret_cast<const uint8_t*>(uintptr_t(mbi.BaseAddress) + mbi.RegionSize),
-                               ((page + 1) << 16) - (uintptr_t(mbi.BaseAddress) + mbi.RegionSize));
-        pages.Put(page, g_r.frame, ok);
-        if (!ok)
+        if (!it->second.ok)
             return false;
     }
     return true;
@@ -2013,7 +2019,9 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     // of them; large ones (static geometry) are sampled.
     uint64_t sample = bytes;
     static const uint32_t fullHashBytes = getenv("REGPU_UPLOAD_FULL_HASH_KB") ? uint32_t(atoi(getenv("REGPU_UPLOAD_FULL_HASH_KB"))) * 1024u : 16384u;
-    if (!GuestReadable(src, bytes))
+    // (Only on the copy path: with the zero-copy heap the large ranges, the ones that run past
+    // allocations, are read in place by the GPU, and the check would cost every upload.)
+    if (!g_r.physical && !GuestReadable(src, bytes))
         return zeros();
     if (bytes <= fullHashBytes)
         sample = ContentHash(src, bytes);
