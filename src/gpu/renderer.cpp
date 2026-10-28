@@ -1634,7 +1634,14 @@ void PassMark(const char* fmt, uint32_t a, uint32_t b)
 
 void SelectSurfaces(bool force)
 {
-    const uint32_t colorBase = gpureg::Get(RB_COLOR_INFO) & 0xFFF, depthBase = gpureg::Get(RB_DEPTH_INFO) & 0xFFF;
+    // A colour surface is keyed by its EDRAM base and its pitch (RB_SURFACE_INFO bits 0-13): in
+    // EDRAM a narrower surface at the same base lays its tiles out differently, so it does not
+    // overwrite the same pixels of a wider one, as our shared texture did (FH1's photo mode: a
+    // 640-pitch pass at the base of the 1280 scene darkened the scene's top-left quarter).
+    // REGPU_SURFACE_BY_BASE=1: by base alone, as before (A/B).
+    static LiveSwitch byBase("REGPU_SURFACE_BY_BASE");
+    const uint32_t colorBase = (gpureg::Get(RB_COLOR_INFO) & 0xFFF) | (byBase ? 0u : (gpureg::Get(RB_SURFACE_INFO) & 0x3FFF) << 12),
+                   depthBase = gpureg::Get(RB_DEPTH_INFO) & 0xFFF;
     if (!force && colorBase == C().colorBase && depthBase == C().depthBase)
         return;
     if (C().colorBase != ~0u && !C().worker) // (workers leave surfaces as render targets)
