@@ -10,7 +10,16 @@ struct TextureFetch
     uint32_t Type() const { return dwords[0] & 3; } // 2 = texture
     bool Tiled() const { return dwords[0] >> 31; }
     uint32_t Pitch() const { return ((dwords[0] >> 22) & 0x1FF) << 5; } // texels
-    uint32_t Format() const { return dwords[1] & 0x3F; }
+    uint32_t RawFormat() const { return dwords[1] & 0x3F; }
+    // The _AS_16_16_16_16 formats (50-56) store their base format's bytes; the suffix only asks
+    // for 16-bit filtering. They decode as the base: 8888, DXT1, DXT2_3, DXT4_5, 2_10_10_10,
+    // 10_11_11, 11_11_10.
+    uint32_t Format() const
+    {
+        static constexpr uint8_t kAs16Base[] = { 6, 18, 19, 20, 7, 16, 17 };
+        const uint32_t f = RawFormat();
+        return f >= 50 && f <= 56 ? kAs16Base[f - 50] : f;
+    }
     uint32_t Endian() const { return (dwords[1] >> 6) & 3; }
     uint32_t Address() const { return dwords[1] & 0xFFFFF000; } // physical
     // 3D textures pack the size as 11 + 11 + 10 bits (Xenia's size_3d), the others 13 + 13.
