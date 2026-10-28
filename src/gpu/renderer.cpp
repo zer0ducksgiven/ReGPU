@@ -145,6 +145,24 @@ void SetNativeMsaa(uint32_t key, uint32_t msaa)
     if (NativeSlot(key).exchange(key << 2 | msaa, std::memory_order_relaxed) != (key << 2 | msaa))
         g_nativeMsaaGeneration.fetch_add(1, std::memory_order_relaxed);
 }
+// The same, for depth surfaces: the MSAA layout each depth EDRAM base and row width (in samples)
+// is drawn in. A title can reset a 1x pass's stencil through a 4x view that only shares the depth
+// base (FH1's sun-shadow mask: a 640x360 4x rectangle over the 1280x720 mask pass, colour base
+// another). Keyed apart from the colour table.
+std::atomic<uint32_t> g_nativeDepthMsaa[0x1000]; // key << 2 | MSAA mode
+uint32_t DepthLayoutKey(uint32_t surface)
+{
+    return (gpureg::Get(0x2002 /* RB_DEPTH_INFO */) & 0xFFF) | (surface & 0x3FFF) * MsaaAcross((surface >> 16) & 3) << 12;
+}
+std::atomic<uint32_t>& NativeDepthSlot(uint32_t key) { return g_nativeDepthMsaa[(key ^ key >> 12) & 0xFFF]; }
+// The depth surface's MSAA layout when the current view is another one of it (also of a 1x
+// surface), else -1.
+int ForeignNativeDepthMsaa()
+{
+    const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */), key = DepthLayoutKey(surface);
+    const uint32_t native = NativeDepthSlot(key).load(std::memory_order_relaxed);
+    return native >> 2 == key && (native & 3) != ((surface >> 16) & 3) ? int(native & 3) : -1;
+}
 // The surface's MSAA layout when the current view is another one of an MSAA surface, else -1.
 int ForeignNativeMsaa()
 {
@@ -8178,9 +8196,15 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     else if (!noMsaaScale)
     {
         const uint32_t surface = gpureg::Get(RB_SURFACE_INFO), msaa = (surface >> 16) & 3;
+        static LiveSwitch noDepthViewScale("REGPU_NO_DEPTH_VIEW_SCALE"); // A/B for the depth-layout case below
         if ((initiator & 0x3F) != 8 || ps.info.usedTextureSlots || vs.info.usedTextureSlots)
         {
             SetNativeMsaa(LayoutKey(surface), msaa);
+            if (gpureg::Get(0x2200 /* RB_DEPTHCONTROL */) & 7) // the draw uses the depth surface
+            {
+                const uint32_t key = DepthLayoutKey(surface);
+                NativeDepthSlot(key).store(key << 2 | msaa, std::memory_order_relaxed);
+            }
         }
         else if (TallView())
         {
@@ -8192,6 +8216,16 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         {
             vc->vscale[3] = float(MsaaAcross(msaa)) / float(MsaaAcross(uint32_t(native)));
             vc->voffset[3] = float(MsaaDown(msaa)) / float(MsaaDown(uint32_t(native)));
+        }
+        // A rectangle through another MSAA view of a depth surface (stencil resets): scaled from the
+        // view's layout to the depth surface's. Without it FH1's 4x stencil reset covered a quarter
+        // of the sun-shadow mask, and the far cascades never reached the rest: weak sun shadows.
+        // REGPU_NO_DEPTH_VIEW_SCALE=1: not scaled, as before.
+        else if (const int nativeDepth = noDepthViewScale ? -1 : ForeignNativeDepthMsaa();
+                 nativeDepth >= 0 && (gpureg::Get(0x2200 /* RB_DEPTHCONTROL */) & 7))
+        {
+            vc->vscale[3] = float(MsaaAcross(msaa)) / float(MsaaAcross(uint32_t(nativeDepth)));
+            vc->voffset[3] = float(MsaaDown(msaa)) / float(MsaaDown(uint32_t(nativeDepth)));
         }
     }
     vc->voffset[0] = RegFloat(PA_CL_VPORT_XOFFSET);
