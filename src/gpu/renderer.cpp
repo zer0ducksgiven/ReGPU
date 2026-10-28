@@ -264,7 +264,7 @@ constexpr uint32_t PA_SC_WINDOW_OFFSET = 0x2080, PA_SC_WINDOW_SCISSOR_TL = 0x208
 constexpr uint32_t PA_SU_SC_MODE_CNTL = 0x2205;
 constexpr uint32_t RB_COPY_CONTROL = 0x2318, RB_COPY_DEST_BASE = 0x2319, RB_COPY_DEST_PITCH = 0x231A, RB_COPY_DEST_INFO = 0x231B;
 constexpr uint32_t SQ_PROGRAM_CNTL = 0x2180, SQ_CONTEXT_MISC = 0x2181, PA_SU_POINT_SIZE = 0x2280, PA_SU_POINT_MINMAX = 0x2281;
-constexpr uint32_t RB_DEPTH_CLEAR = 0x231D, RB_COLOR_CLEAR = 0x231E;
+constexpr uint32_t RB_DEPTH_CLEAR = 0x231D, RB_COLOR_CLEAR = 0x231E, RB_COLOR_CLEAR_LO = 0x231F;
 
 void LogDebugMessages();
 
@@ -1961,16 +1961,60 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
     return g_r.frame <= s.dynamicUntil;
 }
 
+// Whether guest memory can be read. A XenonRecomp port commits all of it; a host that protects
+// unallocated guest pages (ReXGlue: no access) faults on a fetch that runs past an allocation,
+// which the GPU reading the same memory in place would see as zeros. (Its fault handler runs
+// before any of ours, so the range is checked first.) One VirtualQuery per 64 KB page and frame,
+// per recording thread.
+bool GuestReadable(const uint8_t* p, size_t bytes)
+{
+    thread_local FrameMap<bool> pages;
+    const uintptr_t first = uintptr_t(p) >> 16, last = (uintptr_t(p) + std::max<size_t>(bytes, 1) - 1) >> 16;
+    for (uintptr_t page = first; page <= last; page++)
+    {
+        if (const bool* known = pages.Find(page, g_r.frame))
+        {
+            if (!*known)
+                return false;
+            continue;
+        }
+        MEMORY_BASIC_INFORMATION mbi{};
+        const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE;
+        bool ok = VirtualQuery(reinterpret_cast<const void*>(page << 16), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+                  (mbi.Protect & readable) && !(mbi.Protect & PAGE_GUARD);
+        // (The region may end inside the page: check its remainder too.)
+        if (ok && uintptr_t(mbi.BaseAddress) + mbi.RegionSize < ((page + 1) << 16))
+            ok = GuestReadable(reinterpret_cast<const uint8_t*>(uintptr_t(mbi.BaseAddress) + mbi.RegionSize),
+                               ((page + 1) << 16) - (uintptr_t(mbi.BaseAddress) + mbi.RegionSize));
+        pages.Put(page, g_r.frame, ok);
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
 // Copies a guest range into the ring once per frame; draws sharing a vertex
 // buffer reuse the copy. A sampled hash catches ranges rewritten mid-frame.
 UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
 {
     FrameResources& f = Frame();
     const uint8_t* src = GuestPtr<uint8_t>(guest);
+    // A range that isn't readable guest memory (see GuestReadable) is uploaded as zeros.
+    auto zeros = [&] {
+        static std::atomic<uint32_t> logged{ 0 };
+        if (logged++ < 8)
+            Log("upload: %08X (%u bytes) is not readable guest memory: zeros", guest, bytes);
+        const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
+        if (offset != ~0ull)
+            memset(f.ringCpu + offset, 0, bytes);
+        return offset;
+    };
     // Small buffers are often rewritten between draws (UI quads), so hash all
     // of them; large ones (static geometry) are sampled.
     uint64_t sample = bytes;
     static const uint32_t fullHashBytes = getenv("REGPU_UPLOAD_FULL_HASH_KB") ? uint32_t(atoi(getenv("REGPU_UPLOAD_FULL_HASH_KB"))) * 1024u : 16384u;
+    if (!GuestReadable(src, bytes))
+        return zeros();
     if (bytes <= fullHashBytes)
         sample = ContentHash(src, bytes);
     else
@@ -5395,6 +5439,72 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
 // REGPU_WRITEBACK_8888_ONLY=1: resolve write-backs only for 8_8_8_8 colour (and depth), as before (A/B).
 LiveSwitch g_writeback8888Only("REGPU_WRITEBACK_8888_ONLY");
 
+// Xenos 7e3 float (3-bit exponent, 7-bit mantissa, no sign) in bits 0-9.
+float Float7e3(uint32_t f)
+{
+    f &= 0x3FF;
+    uint32_t mantissa = f & 0x7F, exponent = f >> 7;
+    if (!f)
+        return 0.0f;
+    if (!exponent)
+    {
+        int shift = 0;
+        while (!(mantissa & 0x80))
+            mantissa <<= 1, shift++;
+        exponent = uint32_t(1 - (shift - 1));
+        mantissa &= 0x7F;
+        return std::ldexp(1.0f + mantissa / 128.0f, int(exponent) - 4);
+    }
+    return std::ldexp(1.0f + mantissa / 128.0f, int(exponent) - 3);
+}
+
+// The resolve clear value is the EDRAM's own bits for the colour surface's format (red in the low
+// bits, as Xenia packs them): RB_COLOR_CLEAR for 32 bits a sample, RB_COLOR_CLEAR_LO the lower half
+// of 64-bit formats. Read as ARGB 8888 for every format, a k_2_10_10_10_FLOAT surface cleared to
+// C8521485 came out purple (FH1's sky, where the scene leaves the clear showing).
+void ClearColor(uint32_t format, uint32_t lo, uint32_t hi, float out[4])
+{
+    auto half = [](uint32_t h) {
+        const uint32_t e = (h >> 10) & 0x1F, m = h & 0x3FF;
+        const float v = e ? std::ldexp(1.0f + m / 1024.0f, int(e) - 15) : std::ldexp(m / 1024.0f, -14);
+        return (h & 0x8000) ? -v : v;
+    };
+    auto fixed16 = [](uint32_t v) { return float(int16_t(v & 0xFFFF)) * (32.0f / 32767.0f); }; // -32...32
+    auto f32 = [](uint32_t v) { float f; memcpy(&f, &v, 4); return f; };
+    switch (format)
+    {
+    case 2:  // k_2_10_10_10
+    case 10: // k_2_10_10_10_AS_10_10_10_10
+        out[0] = (hi & 0x3FF) / 1023.0f, out[1] = ((hi >> 10) & 0x3FF) / 1023.0f, out[2] = ((hi >> 20) & 0x3FF) / 1023.0f, out[3] = (hi >> 30) / 3.0f;
+        return;
+    case 3:  // k_2_10_10_10_FLOAT
+    case 12: // k_2_10_10_10_FLOAT_AS_16_16_16_16
+        out[0] = Float7e3(hi), out[1] = Float7e3(hi >> 10), out[2] = Float7e3(hi >> 20), out[3] = (hi >> 30) / 3.0f;
+        return;
+    case 4: // k_16_16
+        out[0] = fixed16(hi), out[1] = fixed16(hi >> 16), out[2] = 0.0f, out[3] = 1.0f;
+        return;
+    case 5: // k_16_16_16_16
+        out[0] = fixed16(lo), out[1] = fixed16(lo >> 16), out[2] = fixed16(hi), out[3] = fixed16(hi >> 16);
+        return;
+    case 6: // k_16_16_FLOAT
+        out[0] = half(hi), out[1] = half(hi >> 16), out[2] = 0.0f, out[3] = 1.0f;
+        return;
+    case 7: // k_16_16_16_16_FLOAT
+        out[0] = half(lo), out[1] = half(lo >> 16), out[2] = half(hi), out[3] = half(hi >> 16);
+        return;
+    case 14: // k_32_FLOAT
+        out[0] = f32(hi), out[1] = out[2] = 0.0f, out[3] = 1.0f;
+        return;
+    case 15: // k_32_32_FLOAT
+        out[0] = f32(lo), out[1] = f32(hi), out[2] = 0.0f, out[3] = 1.0f;
+        return;
+    default: // k_8_8_8_8, k_8_8_8_8_GAMMA
+        out[0] = (hi & 0xFF) / 255.0f, out[1] = ((hi >> 8) & 0xFF) / 255.0f, out[2] = ((hi >> 16) & 0xFF) / 255.0f, out[3] = (hi >> 24) / 255.0f;
+        return;
+    }
+}
+
 void Resolve()
 {
     g_resolveEpoch++; // texture bindings may now map to a new resolve
@@ -5575,7 +5685,14 @@ void Resolve()
     if ((control >> 8) & 1) // colour clear (ARGB)
     {
         const uint32_t c = gpureg::Get(RB_COLOR_CLEAR);
-        const float color[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f };
+        float color[4];
+        static LiveSwitch oldClear("REGPU_OLD_CLEAR_COLOR"); // A/B: every clear read as ARGB 8888
+        if (oldClear)
+        {
+            color[0] = ((c >> 16) & 0xFF) / 255.0f, color[1] = ((c >> 8) & 0xFF) / 255.0f, color[2] = (c & 0xFF) / 255.0f, color[3] = (c >> 24) / 255.0f;
+        }
+        else
+            ClearColor((gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF, gpureg::Get(RB_COLOR_CLEAR_LO), c, color);
         TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
         const D3D12_RECT hostClear = ToHost(clearRect);
         static LiveSwitch traceClears("REGPU_TRACE_CLEARS");

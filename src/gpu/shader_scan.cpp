@@ -41,12 +41,49 @@ uint64_t Fnv(const uint32_t* p, size_t n)
     return h;
 }
 
+// The end (byte offset into the view) of the run of committed, readable memory at offset, or
+// offset itself when the page there is not; *skip gets where the next run may start. A host that
+// commits guest memory on demand (ReXGlue) leaves most of the view reserved only: reading it
+// faults. (A XenonRecomp port commits all of it.)
+uint32_t ReadableEnd(uint32_t offset, uint32_t end, uint32_t* skip)
+{
+    MEMORY_BASIC_INFORMATION mbi{};
+    const uint8_t* at = GuestPtr<uint8_t>(kBase + offset);
+    if (!VirtualQuery(at, &mbi, sizeof(mbi)))
+    {
+        *skip = end;
+        return offset;
+    }
+    const uint64_t regionEnd = uint64_t(static_cast<const uint8_t*>(mbi.BaseAddress) - GuestPtr<uint8_t>(kBase)) + mbi.RegionSize;
+    const uint32_t stop = uint32_t(std::min<uint64_t>(regionEnd, end));
+    *skip = stop;
+    const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE;
+    const bool ok = mbi.State == MEM_COMMIT && (mbi.Protect & readable) && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+    return ok ? stop : offset;
+}
+
+void ScanWords(uint32_t first, uint32_t last, std::vector<ScannedShader>& out);
+
 // Scans [begin, end) (byte offsets into the view) and reports valid shaders.
 void ScanRange(uint32_t begin, uint32_t end, std::vector<ScannedShader>& out)
 {
+    for (uint32_t offset = begin; offset < end;)
+    {
+        uint32_t next = end;
+        const uint32_t stop = ReadableEnd(offset, end, &next);
+        // (A shader's header reads 3 words ahead and its code up to its size: both stay within
+        // the run, as ScanWords bounds them by it.)
+        if (stop > offset)
+            ScanWords(offset / 4, stop / 4, out);
+        offset = std::max(next, offset + 4096);
+    }
+}
+
+void ScanWords(uint32_t first, uint32_t runEnd, std::vector<ScannedShader>& out)
+{
     const uint32_t* words = GuestPtr<uint32_t>(kBase);
-    const uint32_t count = kSize / 4;
-    const uint32_t first = begin / 4, last = std::min(end / 4, count - 3);
+    const uint32_t count = runEnd;
+    const uint32_t last = count >= 3 ? count - 3 : 0;
     for (uint32_t i = first; i < last; i++)
     {
         const uint32_t w = words[i];
