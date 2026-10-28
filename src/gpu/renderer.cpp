@@ -5759,8 +5759,13 @@ void Resolve()
         static LiveSwitch noFixed16Clamp("REGPU_NO_FIXED16_RESOLVE_CLAMP");
         const uint32_t numberFormat = (info >> 13) & 7;
         static constexpr float kSigned16[2] = { -32768.0f, 32767.0f }, kUnsigned16[2] = { 0.0f, 65535.0f };
+        // A fixed-point 2_10_10_10 destination kept as half float (biased copies, above) saturates
+        // like the hardware's: without it an HDR copy scaled down kept values past 1 (FH1's reflection
+        // cube, at 1/16: the sun's highlights came back 16 times too bright on the car glass).
+        static constexpr float kUnorm[2] = { 0.0f, 1.0f };
         const float* destRange = !depth && !noFixed16Clamp && destFormat >= 24 && destFormat <= 26
-            ? (numberFormat == 1 || numberFormat == 3 ? kSigned16 : kUnsigned16) : nullptr;
+            ? (numberFormat == 1 || numberFormat == 3 ? kSigned16 : kUnsigned16)
+            : !depth && destFormat == 7 && format == DXGI_FORMAT_R16G16B16A16_FLOAT ? kUnorm : nullptr;
         // A k_8_8_8_8_GAMMA surface (colour format 1) holds gamma in memory: our surfaces keep linear,
         // so the copy encodes it, as the EDRAM does, for the gamma-signed fetches that read it back
         // and for the front buffer.
@@ -8335,8 +8340,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // FH1's colour maps (most of its textures) in gamma. But with it FH1 came out far darker than
         // stock ReXGlue (Xenia, which converts these too): something else in the chain differs, not
         // found yet. Opt-in until then: REGPU_TEXTURE_GAMMA=1.
-        static LiveSwitch textureGamma("REGPU_TEXTURE_GAMMA");
-        if (textureGamma)
+        // (=2: only textures decoded here, =3: only those on the GPU (resolves, native block formats).)
+        static const int textureGamma = getenv("REGPU_TEXTURE_GAMMA") ? atoi(getenv("REGPU_TEXTURE_GAMMA")) : 0;
+        if (textureGamma == 1 || (textureGamma == 2 && !onGpu) || (textureGamma == 3 && onGpu) || (textureGamma == 4 && native) ||
+            (textureGamma == 5 && resolvedPtr))
         {
             uint32_t gammaMask = 0;
             for (uint32_t c = 0; c < 4; c++)
