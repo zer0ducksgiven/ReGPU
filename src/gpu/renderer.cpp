@@ -7815,7 +7815,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const bool indexOverrun = indexSource == 0 && indexCount > (dmaSize & 0xFFFFFF);
     // With early fences, indices read in place must not be ones the title rewrites (the copied
     // index paths are safe: they read guest memory at record time).
-    const bool indexRewritten = RendererEarlyFences() && indexSource == 0 &&
+    // (Rect lists only: triangle lists and strips read their indices through the index arena, which
+    // copies them; refusing those sent every draw of a rewritten index buffer to the CPU's index
+    // expansion, 7 ms a frame in FH1 TU4.)
+    const bool indexRewritten = RendererEarlyFences() && indexSource == 0 && prim == 13 &&
         DynamicBuffer(dmaBase & 0x1FFFFFFF, (dmaSize & 0xFFFFFF) * (((initiator >> 11) & 1) ? 4u : 2u));
     const bool directIndex = g_r.physical && !noDirectIndex && !indexOverrun && !indexRewritten && (indexSource == 0 || indexSource == 2) &&
         (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
