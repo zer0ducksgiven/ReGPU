@@ -17,6 +17,10 @@ void SetInterruptCallback(uint32_t callback, uint32_t userData);
 // title paces itself by it. 0 returns to ReGPU's own (twice the frame cap, 120-720 Hz).
 void SetRefreshRate(double hz);
 
+// Sets a REGPU_* live switch, for a host that needs one on by default. Unlike setting the
+// environment variable, this also reaches switches read when the library loads.
+void SetSwitch(const char* name, bool on);
+
 // The register file (guest 0x7FC80000 + index * 4), for the host's MMIO handler. Without
 // REGPU_GUEST_EXPORTS the registers live in host memory, so guest accesses must come here.
 uint32_t ReadRegister(uint32_t index);

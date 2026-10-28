@@ -1613,6 +1613,11 @@ void regpu::driver::EnableReadPointerWriteBack(uint32_t ptr, uint32_t blockSizeL
     Log("gpu: rptr writeback at %08X (from %08X), block log2 %u", g_gpu.rptrWriteback.load(), ptr, blockSizeLog2);
 }
 
+void regpu::driver::SetSwitch(const char* name, bool on)
+{
+    LiveSwitch::Set(name, on);
+}
+
 void regpu::driver::SetRefreshRate(double hz)
 {
     const int64_t us = hz > 0 ? int64_t(1000000 / std::clamp(hz, 24.0, 1000.0)) : 0;
