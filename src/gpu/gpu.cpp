@@ -1629,7 +1629,16 @@ uint32_t regpu::driver::ReadRegister(uint32_t index)
 
 void regpu::driver::WriteRegister(uint32_t index, uint32_t value)
 {
-    SetReg(index & 0x7FFF, value);
+    index &= 0x7FFF;
+    SetReg(index, value);
+    // The display's gamma table, which a title can write directly (FH1 does, after its brightness
+    // calibration): without it the presenter showed the identity ramp and the image's tones were
+    // off against the console's. (The rest of WriteRegister records into the command stream: not
+    // from a guest thread.)
+    if (index == DC_LUT_RW_INDEX)
+        g_lutIndex = value & 0xFF;
+    else if (index == DC_LUT_30_COLOR)
+        RendererSetGammaEntry(g_lutIndex++ & 0xFF, value);
 }
 
 #if REGPU_GUEST_EXPORTS

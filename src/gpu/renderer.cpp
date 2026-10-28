@@ -1159,7 +1159,7 @@ void InitDepthBlit()
     params[0].DescriptorTable.pDescriptorRanges = &range;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants.Num32BitValues = 5;
+    params[1].Constants.Num32BitValues = 6;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     rs.NumParameters = 2;
@@ -1173,7 +1173,24 @@ void InitDepthBlit()
     static const char kSource[] = R"(
 Texture2D<float> depthTex : register(t0);
 Texture2D<float4> colorTex : register(t0);
-cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; };
+cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; };
+// Xenia's LinearToPWLGamma: what a k_8_8_8_8_GAMMA surface holds in memory.
+float LinearToPWLGamma(float l)
+{
+    l = saturate(l);
+    float scale, offset;
+    if (l >= 128.0 / 1023.0)
+    {
+        if (l >= 512.0 / 1023.0) { scale = 1023.0 / 8.0; offset = 128.0 / 255.0; }
+        else { scale = 1023.0 / 4.0; offset = 64.0 / 255.0; }
+    }
+    else
+    {
+        if (l >= 64.0 / 1023.0) { scale = 1023.0 / 2.0; offset = 32.0 / 255.0; }
+        else { scale = 1023.0; offset = 0.0; }
+    }
+    return trunc(l * scale) * (1.0 / 255.0) + offset;
+}
 float4 vs(uint id : SV_VertexID) : SV_Position
 {
     float2 uv = float2((id << 1) & 2, id & 2);
@@ -1205,6 +1222,7 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
 {
     float4 c = colorTex.Load(int3(int2(pos.xy), 0)) * scale;
     if (clampDest) c = clamp(c, destMin, destMax);
+    if (toGamma) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
     return swapRB ? c.bgra : c;
 }
 )";
@@ -1248,7 +1266,24 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
         const std::string msSource = "#define SAMPLES " + std::to_string(g_msaa) + R"(
 Texture2DMS<float, SAMPLES> depthMs : register(t0);
 Texture2DMS<float4, SAMPLES> colorMs : register(t0);
-cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; };
+cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; };
+// Xenia's LinearToPWLGamma: what a k_8_8_8_8_GAMMA surface holds in memory.
+float LinearToPWLGamma(float l)
+{
+    l = saturate(l);
+    float scale, offset;
+    if (l >= 128.0 / 1023.0)
+    {
+        if (l >= 512.0 / 1023.0) { scale = 1023.0 / 8.0; offset = 128.0 / 255.0; }
+        else { scale = 1023.0 / 4.0; offset = 64.0 / 255.0; }
+    }
+    else
+    {
+        if (l >= 64.0 / 1023.0) { scale = 1023.0 / 2.0; offset = 32.0 / 255.0; }
+        else { scale = 1023.0; offset = 0.0; }
+    }
+    return trunc(l * scale) * (1.0 / 255.0) + offset;
+}
 float4 vs(uint id : SV_VertexID) : SV_Position
 {
     float2 uv = float2((id << 1) & 2, id & 2);
@@ -1265,6 +1300,7 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
         c += colorMs.Load(int2(pos.xy), i);
     c = c / SAMPLES * scale;
     if (clampDest) c = clamp(c, destMin, destMax);
+    if (toGamma) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
     return swapRB ? c.bgra : c;
 }
 )";
@@ -4822,7 +4858,7 @@ void EnsureResolved(ResolvedTexture& dest, uint32_t width, uint32_t height, uint
 // destRange: the destination's fixed-point range after the scale (the 16-bit integer range for the
 // 16-bit fixed formats); null none.
 void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false,
-    const float* destRange = nullptr)
+    const float* destRange = nullptr, bool toGamma = false)
 {
     ResolvedTexture& dest = g_r.resolved[base];
     const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
@@ -4881,9 +4917,9 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     C().list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
     C().list->SetPipelineState(pso);
     C().list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
-    const uint32_t blitConstants[5] = { std::bit_cast<uint32_t>(scale), uint32_t(swapRB), uint32_t(destRange != nullptr),
-        std::bit_cast<uint32_t>(destRange ? destRange[0] : 0.0f), std::bit_cast<uint32_t>(destRange ? destRange[1] : 0.0f) };
-    C().list->SetGraphicsRoot32BitConstants(1, 5, blitConstants, 0);
+    const uint32_t blitConstants[6] = { std::bit_cast<uint32_t>(scale), uint32_t(swapRB), uint32_t(destRange != nullptr),
+        std::bit_cast<uint32_t>(destRange ? destRange[0] : 0.0f), std::bit_cast<uint32_t>(destRange ? destRange[1] : 0.0f), uint32_t(toGamma) };
+    C().list->SetGraphicsRoot32BitConstants(1, 6, blitConstants, 0);
     // Width and height stay in game pixels (the size the title knows); the texture and the
     // rectangle are scaled.
     const D3D12_VIEWPORT vp{ 0, 0, float(hostWidth), float(hostHeight), 0, 1 };
@@ -5725,7 +5761,13 @@ void Resolve()
         static constexpr float kSigned16[2] = { -32768.0f, 32767.0f }, kUnsigned16[2] = { 0.0f, 65535.0f };
         const float* destRange = !depth && !noFixed16Clamp && destFormat >= 24 && destFormat <= 26
             ? (numberFormat == 1 || numberFormat == 3 ? kSigned16 : kUnsigned16) : nullptr;
-        BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange);
+        // A k_8_8_8_8_GAMMA surface (colour format 1) holds gamma in memory: our surfaces keep linear,
+        // so the copy encodes it, as the EDRAM does, for the gamma-signed fetches that read it back
+        // and for the front buffer.
+        // (Pairs with REGPU_TEXTURE_GAMMA: opt-in with it, REGPU_RESOLVE_GAMMA=1.)
+        static LiveSwitch resolveGamma("REGPU_RESOLVE_GAMMA");
+        const bool toGamma = !depth && resolveGamma && ((gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF) == 1;
+        BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, toGamma);
         // Temporal upscaling: each tile of the main view keeps its depth before it is cleared.
         if (g_temporal && g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth))
             CopySceneDepth(rect);
@@ -8287,6 +8329,24 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const bool clamp = oldClamp ? clampX != 0 : clampX != 0 && clampY != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
         ti[0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
+        // Gamma-signed components (fetch dword 0 bits 2-9, two bits a texel component; 3 = gamma): the
+        // shader converts them to linear (bits 24-27, in the order TFetchRaw returns: the texel's for
+        // textures swizzled in the shader, the swizzled order for decoded ones). Ignoring them left
+        // FH1's colour maps (most of its textures) in gamma. But with it FH1 came out far darker than
+        // stock ReXGlue (Xenia, which converts these too): something else in the chain differs, not
+        // found yet. Opt-in until then: REGPU_TEXTURE_GAMMA=1.
+        static LiveSwitch textureGamma("REGPU_TEXTURE_GAMMA");
+        if (textureGamma)
+        {
+            uint32_t gammaMask = 0;
+            for (uint32_t c = 0; c < 4; c++)
+            {
+                const uint32_t sel = onGpu ? c : (fetch.Swizzle() >> (3 * c)) & 7;
+                if (sel < 4 && ((fetch.dwords[0] >> (2 + 2 * sel)) & 3) == 3)
+                    gammaMask |= 1u << c;
+            }
+            ti[0] |= gammaMask << 24;
+        }
         if (!clamp && !oldClamp)
             ti[0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
         // Clamp to border on both axes (modes 6, 7): the shader returns the border colour

@@ -216,9 +216,38 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
 #define REGPU_SAMPLE_BIAS_CUBE(t, s, dir, bias) ((t).SampleBias((s), (dir), (bias)))
 #endif
 
+// The Xenos texture fetch's gamma sign: the texel holds piecewise-linear gamma, converted to linear
+// (Xenia's PWLGammaToLinear).
+float PWLGammaToLinear(float g)
+{
+    g = saturate(g);
+    float scale, offset;
+    if (g >= 96.0 / 255.0)
+    {
+        if (g >= 192.0 / 255.0) { scale = 8.0 / 1024.0; offset = -1024.0; }
+        else { scale = 4.0 / 1024.0; offset = -256.0; }
+    }
+    else
+    {
+        if (g >= 64.0 / 255.0) { scale = 2.0 / 1024.0; offset = -64.0; }
+        else { scale = 1.0 / 1024.0; offset = 0.0; }
+    }
+    float l = g * ((255.0 * 1024.0) * scale) + offset;
+    l += trunc(l * scale);
+    return l / 1023.0;
+}
+
 float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
 {
     float4 v = TFetchRaw(slot, coord, denorm, vertexStage, bias, texel);
+    // Gamma-signed components (tinfo.x bits 24-27, in v's order): before the exponent adjust.
+    uint gamma = (tinfo[slot].x >> 24) & 0xFu;
+    if (gamma != 0u)
+    {
+        [unroll] for (uint g = 0; g < 4; g++)
+            if ((gamma >> g) & 1u)
+                v[g] = PWLGammaToLinear(v[g]);
+    }
     // Exponent adjust (fetch constant): texels scaled by 2^n, n in tinfo.x bits 8-13.
     int expAdjust = int(tinfo[slot].x << 18) >> 26;
     if (expAdjust != 0) v *= exp2(float(expAdjust));
