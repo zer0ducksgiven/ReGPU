@@ -323,6 +323,10 @@ struct ResolvedTexture
     uint64_t serial = 0;                     // stamp of the last resolve into it (g_resolveSerial)
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // R32_FLOAT for depth resolves
     bool swapped = false; // resolved with the copy swap bit: guest memory has red and blue exchanged
+    // Depth resolves: the guest's D24S8 words as RGBA8 (stencil, then depth's low to high bytes),
+    // for titles that fetch the depth image with a colour format to read its stencil (see BlitResolve).
+    ComPtr<ID3D12Resource> packed;
+    uint32_t packedWidth = 0, packedHeight = 0;
     // Guest memory under the image when it was resolved (our resolves don't write it): if the title
     // later puts something else there (a CPU-made texture), the resolve is stale (see ResolvedFor).
     uint64_t memHash = 0, memChecked = 0;
@@ -421,6 +425,7 @@ struct Renderer
     ComPtr<ID3D12RootSignature> blitRootSignature;
     ComPtr<ID3D12RootSignature> motionRootSignature; // root signature + b2 (motion-vector pipelines)
     ComPtr<ID3D12PipelineState> depthBlit;                // depth buffer -> R32_FLOAT
+    ComPtr<ID3D12PipelineState> depthPackBlit;            // depth and stencil -> the guest's D24S8 words as RGBA8
     ComPtr<ID3D12PipelineState> colorBlit8, colorBlit16;  // colour -> 8888 / RGBA16F, scaled
     ComPtr<ID3D12PipelineState> depthBlitMs, colorBlitMs8, colorBlitMs16; // the same from multisampled surfaces
     // EDRAM surfaces: one host colour and one host depth target per EDRAM base
@@ -1147,7 +1152,7 @@ void InitDepthBlit()
     Log("renderer: anti-aliasing %ux (setting %u)", g_msaa, GetSettings().msaa);
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 1;
+    range.NumDescriptors = 2; // (t1: the depth pack's stencil plane; the other blits read t0 only)
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable.NumDescriptorRanges = 1;
@@ -1178,6 +1183,24 @@ float ps(float4 pos : SV_Position) : SV_Target
 {
     return depthTex.Load(int3(int2(pos.xy), 0));
 }
+Texture2D<uint2> stencilTex : register(t1);
+// 20e4 (D24FS8): 4-bit exponent biased by 15, 20-bit mantissa, [0, 2).
+uint Encode20e4(float v)
+{
+    v = clamp(v, 0.0, 1.9999999);
+    if (v < exp2(-14.0))
+        return uint(v * exp2(14.0) * 1048576.0);
+    int e = int(floor(log2(v)));
+    float m = v / exp2(float(e)) - 1.0;
+    return (uint(e + 15) << 20) | min(uint(m * 1048576.0), 0xFFFFFu);
+}
+float4 psPack(float4 pos : SV_Position) : SV_Target
+{
+    float z = depthTex.Load(int3(int2(pos.xy), 0));
+    uint st = stencilTex.Load(int3(int2(pos.xy), 0)).g;
+    uint d = swapRB != 0 ? Encode20e4(z) : uint(round(saturate(z) * 16777215.0));
+    return float4(float(st & 0xFFu), float(d & 0xFFu), float((d >> 8) & 0xFFu), float(d >> 16)) / 255.0;
+}
 float4 psColor(float4 pos : SV_Position) : SV_Target
 {
     float4 c = colorTex.Load(int3(int2(pos.xy), 0)) * scale;
@@ -1204,6 +1227,14 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
     pd.SampleDesc.Count = 1;
     Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.depthBlit)), "CreateGraphicsPipelineState(depth blit)");
+    {
+        ComPtr<ID3DBlob> psPack;
+        Check(D3DCompile(kSource, sizeof(kSource) - 1, nullptr, nullptr, nullptr, "psPack", "ps_5_0", 0, 0, &psPack, &error), "D3DCompile(blit psPack)");
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pack = pd;
+        pack.PS = { psPack->GetBufferPointer(), psPack->GetBufferSize() };
+        pack.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        Check(d->CreateGraphicsPipelineState(&pack, IID_PPV_ARGS(&g_r.depthPackBlit)), "CreateGraphicsPipelineState(depth pack blit)");
+    }
     ComPtr<ID3DBlob> psColor;
     Check(D3DCompile(kSource, sizeof(kSource) - 1, nullptr, nullptr, nullptr, "psColor", "ps_5_0", 0, 0, &psColor, &error), "D3DCompile(blit psColor)");
     pd.PS = { psColor->GetBufferPointer(), psColor->GetBufferSize() };
@@ -4015,6 +4046,12 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         // (By the size the draw fetches it at: the HUD samples the scene image too, at 320x180.)
         if (resolvedTexture->frame == g_r.frame && fetch.Width() >= kWidth)
             g_drawSamplesResolve = true;
+        // A colour-format fetch of a depth resolve reads the guest's D24S8 words (BlitResolve's pack).
+        if (resolvedTexture->format == DXGI_FORMAT_R32_FLOAT && resolvedTexture->packed && fetch.Format() == 6 /* k_8_8_8_8 */)
+        {
+            format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            return resolvedTexture->packed.Get();
+        }
         format = resolvedTexture->format;
         if (fetch.MipMaxLevel() > 0 && fetch.MipAddress())
             if (ID3D12Resource* chain = ResolvedMipChain(fetch, *resolvedTexture))
@@ -4854,6 +4891,62 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     C().list->RSSetViewports(1, &vp);
     C().list->RSSetScissorRects(1, &hostRect);
     C().list->DrawInstanced(3, 1, 0, 0);
+    // Depth resolves also keep the guest's D24S8 words (RGBA8: stencil, depth low to high byte), for
+    // fetches of the depth image with a colour format: FH1's speed blur reads the stencil that way to
+    // pick each pixel's reprojection, and with depth alone every pixel took object 0's and the whole
+    // scene blurred. REGPU_NO_DEPTH_PACK=1: depth only, as before.
+    static LiveSwitch noDepthPack("REGPU_NO_DEPTH_PACK");
+    if (depth && !ms && !noDepthPack && f.descriptorsUsed + 2 <= kDescriptorsPerFrame)
+    {
+        if (!dest.packed || dest.packedWidth != hostWidth || dest.packedHeight != hostHeight)
+        {
+            if (dest.packed)
+                Frame().garbage.push_back(std::move(dest.packed));
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = hostWidth;
+            td.Height = hostHeight;
+            td.DepthOrArraySize = 1;
+            td.MipLevels = 1;
+            td.SampleDesc.Count = 1;
+            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if (SUCCEEDED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&dest.packed))))
+            {
+                CountCreate("depth pack");
+                dest.packedWidth = hostWidth;
+                dest.packedHeight = hostHeight;
+            }
+        }
+        if (dest.packed)
+        {
+            const UINT pslot = f.descriptorBase + f.descriptorsUsed;
+            f.descriptorsUsed += 2;
+            D3D12_SHADER_RESOURCE_VIEW_DESC dv = srv;
+            g_r.device->CreateShaderResourceView(C().depth.Get(), &dv, Cpu(g_r.srvHeap.Get(), pslot, g_r.srvStride));
+            dv.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+            dv.Texture2D.PlaneSlice = 1;
+            g_r.device->CreateShaderResourceView(C().depth.Get(), &dv, Cpu(g_r.srvHeap.Get(), pslot + 1, g_r.srvStride));
+            D3D12_RESOURCE_BARRIER pb{};
+            pb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            pb.Transition.pResource = dest.packed.Get();
+            pb.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            pb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            C().list->ResourceBarrier(1, &pb);
+            C().list->CreateRenderTargetView(g_r.device, dest.packed.Get(), rtv);
+            C().list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            C().list->SetPipelineState(g_r.depthPackBlit.Get());
+            C().list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), pslot, g_r.srvStride));
+            const uint32_t packConstants[5] = { 0, uint32_t((gpureg::Get(RB_DEPTH_INFO) >> 16) & 1), 0, 0, 0 };
+            C().list->SetGraphicsRoot32BitConstants(1, 5, packConstants, 0);
+            C().list->DrawInstanced(3, 1, 0, 0);
+            std::swap(pb.Transition.StateBefore, pb.Transition.StateAfter);
+            C().list->ResourceBarrier(1, &pb);
+        }
+    }
 
     std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
     std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
