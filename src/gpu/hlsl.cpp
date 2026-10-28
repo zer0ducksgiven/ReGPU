@@ -1209,6 +1209,7 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    }\n"
              "    oC[0] *= exp2(float(int(pinfo.w))); // colour exponent bias (RB_COLOR_INFO), after the alpha test\n"
              "    if (pinfo.z & 8u) oC[0] = clamp(oC[0], -32.0, 32.0); // 16_16 fixed range\n"
+             "    if (pinfo.z & 32u) oC[0].a = round(saturate(oC[0].a) * 3.0) / 3.0; // 2-bit alpha surface (k_2_10_10_10_FLOAT)\n"
              "    if (pinfo2.w > 0.0) oC[0].rgb = clamp(oC[0].rgb, 0.0, pinfo2.w); // 7e3 target range\n"
              "    else if (pinfo2.w < 0.0) oC[0] = saturate(oC[0]); // fixed-point target\n"
              + std::string(e.exportsDepth ? "    PSOut o; o.c = oC[0]; o.d = saturate(oD.x); return o;\n}\n" : "    return oC[0];\n}\n");

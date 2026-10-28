@@ -1222,7 +1222,8 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
 {
     float4 c = colorTex.Load(int3(int2(pos.xy), 0)) * scale;
     if (clampDest) c = clamp(c, destMin, destMax);
-    if (toGamma) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
+    if (toGamma & 1u) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
+    if (toGamma & 2u) c.a = round(saturate(c.a) * 3.0) / 3.0; // a 2-bit alpha destination (k_2_10_10_10)
     return swapRB ? c.bgra : c;
 }
 )";
@@ -1300,7 +1301,8 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
         c += colorMs.Load(int2(pos.xy), i);
     c = c / SAMPLES * scale;
     if (clampDest) c = clamp(c, destMin, destMax);
-    if (toGamma) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
+    if (toGamma & 1u) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
+    if (toGamma & 2u) c.a = round(saturate(c.a) * 3.0) / 3.0; // a 2-bit alpha destination (k_2_10_10_10)
     return swapRB ? c.bgra : c;
 }
 )";
@@ -4858,7 +4860,7 @@ void EnsureResolved(ResolvedTexture& dest, uint32_t width, uint32_t height, uint
 // destRange: the destination's fixed-point range after the scale (the 16-bit integer range for the
 // 16-bit fixed formats); null none.
 void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false,
-    const float* destRange = nullptr, bool toGamma = false)
+    const float* destRange = nullptr, uint32_t toGamma = 0)
 {
     ResolvedTexture& dest = g_r.resolved[base];
     const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
@@ -5783,7 +5785,12 @@ void Resolve()
         // (Pairs with REGPU_TEXTURE_GAMMA: opt-in with it, REGPU_RESOLVE_GAMMA=1.)
         static LiveSwitch resolveGamma("REGPU_RESOLVE_GAMMA");
         const bool toGamma = !depth && resolveGamma && ((gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF) == 1;
-        BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, toGamma);
+        // A k_2_10_10_10 destination (7) holds 2 bits of alpha; our texture keeps 8 or 16. Titles test
+        // that alpha for equality (FH1's final composite picks scene samples whose alpha matches the
+        // centre's), so the copy rounds it as the hardware's does. REGPU_NO_RESOLVE_ALPHA2=1: as before.
+        static LiveSwitch noAlpha2("REGPU_NO_RESOLVE_ALPHA2");
+        const uint32_t blitFlags = (toGamma ? 1u : 0u) | (!depth && destFormat == 7 && !noAlpha2 ? 2u : 0u);
+        BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, blitFlags);
         // Temporal upscaling: each tile of the main view keeps its depth before it is cleared.
         if (g_temporal && g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth))
             CopySceneDepth(rect);
@@ -8410,6 +8417,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const uint32_t format = (colorInfo >> 16) & 0xF;
         if (!noColorExpBias && (format == 4 || format == 5))
             pc->info[2] |= 8u;
+        // A k_2_10_10_10_FLOAT surface (formats 3, 12) keeps 2 bits of alpha (see the resolve's
+        // REGPU_NO_RESOLVE_ALPHA2); the draw's output is rounded as the EDRAM stores it. (Blending
+        // with the stored alpha still reads ours, unrounded.) REGPU_NO_ALPHA2=1: as before.
+        static LiveSwitch noAlpha2("REGPU_NO_ALPHA2");
+        if (!noAlpha2 && (format == 3 || format == 12))
+            pc->info[2] |= 32u;
     }
     // A vertex shader that allocates interpolators but exports none (depth-only shaders end with an
     // empty export) leaves the pixel shader's inputs to whatever the hardware's parameter cache
