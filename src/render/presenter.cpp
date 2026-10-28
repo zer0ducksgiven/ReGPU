@@ -149,7 +149,14 @@ void CreateWindowAndDevice()
     const Settings& settings = GetSettings();
     const uint32_t outW = settings.width, outH = settings.height;
     HWND surface = nullptr;
-    if (settings.fullscreen)
+    if (settings.hostWindow)
+    {
+        // The host's window (Config::hostWindow): the swap chain goes straight onto it, and it
+        // stretches with it. The host owns its messages (close, resize, fullscreen).
+        g_p.window = HWND(settings.hostWindow);
+        Log("presenter: presenting into the host's window %p", settings.hostWindow);
+    }
+    else if (settings.fullscreen)
     {
         // Borderless window over the whole display; its black background shows around the picture.
         // The picture (the swap chain) is a child window: the largest rectangle of the chosen
