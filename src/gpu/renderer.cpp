@@ -5721,13 +5721,24 @@ void Resolve()
         // The tile's rows are pitch * guestBpp bytes each (PGR4's 2xMSAA HDR scene, k_16_16_16_16_FLOAT,
         // put its lower tile in a separate image at 4 bytes a pixel: the bottom third came out black).
         static LiveSwitch noTileBpp("REGPU_NO_TILE_BPP"); // A/B: rows of 4 bytes a pixel, as before
-        const uint32_t base = ((gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF) - uint32_t(rect.top) * pitch * (noTileBpp ? 4 : guestBpp)) & 0x1FFFFFFF;
+        // REGPU_RESOLVE_IMAGE_BASE=1: when the declared height covers a partial-width rectangle, the destination
+        // base is the image's own and the rectangle its place in it (FH1's shadow atlas: one 1024x1024
+        // cascade quadrant per resolve, at rows 512-1023 of the image at the base). As tiles, those
+        // landed 512 rows early, at an address nothing fetches, and the shadow lookups read empty
+        // quadrants: no sun shadows. Opt-in: a tall pass's tiles may declare such heights too.
+        static LiveSwitch imageBase("REGPU_RESOLVE_IMAGE_BASE");
+        const uint32_t declaredHeight = (pitchReg >> 16) & 0x3FFF;
+        // (Only for a rectangle narrower than the image: full-width rows are a tall pass's tiles, which
+        // FH1's scene resolves are too, at the tile's own row.)
+        const bool placedInImage = imageBase && rect.top > 0 && uint32_t(rect.bottom) <= declaredHeight && uint32_t(rect.right - rect.left) < pitch;
+        const uint32_t base = placedInImage ? gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF
+                                            : ((gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF) - uint32_t(rect.top) * pitch * (noTileBpp ? 4 : guestBpp)) & 0x1FFFFFFF;
         const uint32_t width = std::clamp<uint32_t>(pitch, 1, std::max<uint32_t>(kWidth, BigPassSize()));
         // Taller than the screen is possible: a 1024x1024 target drawn as tall passes is resolved
         // 720 rows at a time and sampled as 1024 rows. The texture keeps all its rows (clamped to
         // kHeight it was stretched 1.4x vertically when sampled).
         constexpr uint32_t kMaxResolveHeight = 2048;
-        uint32_t height = std::clamp<uint32_t>(((pitchReg >> 16) & 0x3FFF) + uint32_t(rect.top), 1, kMaxResolveHeight);
+        uint32_t height = std::clamp<uint32_t>(placedInImage ? declaredHeight : declaredHeight + uint32_t(rect.top), 1, kMaxResolveHeight);
         // A later tile into an image that already holds its rows keeps the image: some copies give
         // the full image's rows for every tile (720, then 976 and 1232 with the tile's offset), and
         // each "taller" copy recreated the texture, dropping the tiles before it (the lower two
