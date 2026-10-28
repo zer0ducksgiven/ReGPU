@@ -2308,15 +2308,99 @@ struct Manifest
 // Shader compilation runs on worker threads so the command processor never
 // stalls on fxc: a draw whose shaders are still compiling is skipped. The
 // bytecode is cached on disk by HLSL hash, so later runs start warm.
-// REGPU_OPTIMIZE_SHADERS=1: fxc optimises (slower compiles, faster shaders). The cache key is
-// the HLSL alone, so use a separate cache directory when switching.
-const UINT g_shaderFlags = getenv("REGPU_OPTIMIZE_SHADERS") ? D3DCOMPILE_OPTIMIZATION_LEVEL1 : D3DCOMPILE_SKIP_OPTIMIZATION;
+// Compiles that something waits for skip fxc's optimiser (a large shader can take seconds with
+// it). REGPU_OPTIMIZE_SHADERS=1 also builds each shader optimised on a background thread and
+// stores it beside the unoptimised one (<key>.o.dxbc); later runs load that. The running
+// session keeps the bytecode its pipelines were built from.
+const bool g_optimizeShaders = getenv("REGPU_OPTIMIZE_SHADERS") != nullptr;
 
-std::filesystem::path ShaderCachePath(uint64_t key)
+std::filesystem::path ShaderCachePath(uint64_t key, bool optimized = false)
 {
-    char name[32];
-    snprintf(name, sizeof(name), "%016llx.dxbc", (unsigned long long)key);
+    char name[40];
+    snprintf(name, sizeof(name), optimized ? "%016llx.o.dxbc" : "%016llx.dxbc", (unsigned long long)key);
     return RegpuUserDir() / "shadercache" / name;
+}
+
+// REGPU_OPTIMIZE_SHADERS: optimised builds, one at a time at the lowest priority.
+struct ShaderOptimizer
+{
+    struct Job
+    {
+        uint64_t key;
+        bool pixel;
+        std::string hlsl;
+    };
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Job> jobs;
+    std::unordered_set<uint64_t> queued;
+    std::atomic<uint32_t> built{ 0 };
+
+    void Push(uint64_t key, bool pixel, const std::string& hlsl)
+    {
+        {
+            std::lock_guard lock(mutex);
+            if (!queued.insert(key).second)
+                return;
+            jobs.push_back({ key, pixel, hlsl });
+        }
+        static std::once_flag started;
+        std::call_once(started, [this] { std::thread([this] { Run(); }).detach(); });
+        cv.notify_one();
+    }
+
+    void Run()
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        for (;;)
+        {
+            Job job;
+            {
+                std::unique_lock lock(mutex);
+                cv.wait(lock, [this] { return !jobs.empty(); });
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
+            ComPtr<ID3DBlob> code, errors;
+            if (FAILED(D3DCompile(job.hlsl.data(), job.hlsl.size(), nullptr, job.pixel ? nullptr : vertexStage, nullptr, "main",
+                    job.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0,
+                    &code, &errors)))
+                continue; // the unoptimised build stays
+            // Written under a temporary name: a run that reads it never sees half a file.
+            const auto path = ShaderCachePath(job.key, true);
+            auto tmp = path;
+            tmp += ".tmp";
+            std::ofstream(tmp, std::ios::binary).write(static_cast<const char*>(code->GetBufferPointer()), std::streamsize(code->GetBufferSize()));
+            std::error_code ec;
+            std::filesystem::rename(tmp, path, ec);
+            if (const uint32_t n = ++built; n == 1 || n % 100 == 0)
+                Log("renderer: %u shaders optimised in the background", n);
+        }
+    }
+} g_optimizer;
+
+// The stored bytecode for cs.cacheKey, optimised first; an unoptimised one is queued for its
+// optimised build.
+bool LoadCachedBytecode(CompiledShader& cs)
+{
+    for (const bool optimized : { true, false })
+    {
+        if (optimized && !g_optimizeShaders)
+            continue;
+        std::ifstream in{ ShaderCachePath(cs.cacheKey, optimized), std::ios::binary | std::ios::ate };
+        if (!in)
+            continue;
+        const auto size = size_t(in.tellg());
+        if (!size || FAILED(D3DCreateBlob(size, &cs.code)))
+            continue;
+        in.seekg(0);
+        in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
+        if (!optimized && g_optimizeShaders)
+            g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
+        return true;
+    }
+    return false;
 }
 
 struct ShaderCompiler
@@ -2428,7 +2512,7 @@ struct ShaderCompiler
         // shader cannot sample with an implicit LOD).
         const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
         const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, cs.pixel ? nullptr : vertexStage, nullptr, "main",
-            cs.pixel ? "ps_5_1" : "vs_5_1", g_shaderFlags | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
+            cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         if (FAILED(hr))
         {
@@ -2442,6 +2526,8 @@ struct ShaderCompiler
             Log("renderer: %s %016llx compiled in %.0f ms (background)", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash, ms);
         std::ofstream(ShaderCachePath(cs.cacheKey), std::ios::binary)
             .write(static_cast<const char*>(cs.code->GetBufferPointer()), std::streamsize(cs.code->GetBufferSize()));
+        if (g_optimizeShaders)
+            g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
         cs.state.store(CompiledShader::Ready, std::memory_order_release);
     }
 } g_compiler;
@@ -2722,18 +2808,12 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
         g_stats.shadersCached++;
         return cs;
     }
-    if (std::ifstream in{ ShaderCachePath(cs.cacheKey), std::ios::binary | std::ios::ate })
+    if (LoadCachedBytecode(cs))
     {
-        const auto size = size_t(in.tellg());
-        if (size && SUCCEEDED(D3DCreateBlob(size, &cs.code)))
-        {
-            in.seekg(0);
-            in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
-            cs.state = CompiledShader::Ready;
-            g_bytecode.emplace(cs.cacheKey, cs.code);
-            g_stats.shadersCached++;
-            return cs;
-        }
+        cs.state = CompiledShader::Ready;
+        g_bytecode.emplace(cs.cacheKey, cs.code);
+        g_stats.shadersCached++;
+        return cs;
     }
     g_compiler.Push(&cs, background);
     return cs;
@@ -2853,17 +2933,11 @@ const CompiledShader* MotionShaderLookup(const CompiledShader& base)
         cs.state = CompiledShader::Ready;
         return &cs;
     }
-    if (std::ifstream in{ ShaderCachePath(cs.cacheKey), std::ios::binary | std::ios::ate })
+    if (LoadCachedBytecode(cs))
     {
-        const auto size = size_t(in.tellg());
-        if (size && SUCCEEDED(D3DCreateBlob(size, &cs.code)))
-        {
-            in.seekg(0);
-            in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
-            cs.state = CompiledShader::Ready;
-            g_bytecode.emplace(cs.cacheKey, cs.code);
-            return &cs;
-        }
+        cs.state = CompiledShader::Ready;
+        g_bytecode.emplace(cs.cacheKey, cs.code);
+        return &cs;
     }
     g_compiler.Push(&cs, false);
     return &cs;
