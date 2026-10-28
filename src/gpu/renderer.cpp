@@ -2793,7 +2793,24 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
             if (auto e = g_psEditExpr.find(hash); e != g_psEditExpr.end())
                 expr = e->second;
         }
-        if (!expr.empty())
+        // "@TEXT|STATEMENT" runs STATEMENT after the first line holding TEXT, as for vertex shaders
+        // (to read a value mid-shader: "@cfpc = 9u;|oC0 = float4(r1.xyz, 1); cfpc = 0xFFFFu;").
+        if (!expr.empty() && expr[0] == '@')
+        {
+            const size_t bar = expr.find('|');
+            size_t at = std::string::npos;
+            if (bar != std::string::npos)
+                if (size_t hit = cs.info.hlsl.find(expr.substr(1, bar - 1)); hit != std::string::npos)
+                    at = cs.info.hlsl.find('\n', hit) + 1;
+            if (at != std::string::npos && at != 0)
+            {
+                cs.info.hlsl.insert(at, expr.substr(bar + 1) + "\n");
+                Log("debug: ps alias %016llx runs %s", (unsigned long long)hash, expr.c_str());
+            }
+            else
+                Log("debug: ps alias %016llx: the anchor wasn't found", (unsigned long long)hash);
+        }
+        else if (!expr.empty())
         {
             if (size_t at = cs.info.hlsl.rfind("return oC[0];"); at != std::string::npos)
                 cs.info.hlsl.replace(at, 13, "return " + expr + ";");
@@ -3627,6 +3644,12 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         C().list->ResourceBarrier(1, &b);
         if (n)
             C().list->ResourceBarrier(n, fb);
+        // REGPU_CUBE_Y_SWAP=1: the title's +Y and -Y faces trade places. FH1's live car reflections
+        // came out with them exchanged against Xenia (whose face order and cube coordinates match
+        // ours; the faces' own contents differ), and the glass reflected the sunlit ground: green after
+        // the shader squares it. Why our resolves of those two faces differ is not known yet; opt-in
+        // until it is.
+        static LiveSwitch swapY("REGPU_CUBE_Y_SWAP");
         for (uint32_t i = 0; i < 6; i++)
         {
             if (!faces[i] || faces[i]->format != want)
@@ -3634,7 +3657,7 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
             dst.pResource = cached.resource.Get();
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dst.SubresourceIndex = i * mips;
+            dst.SubresourceIndex = (swapY && (i == 2 || i == 3) ? 5 - i : i) * mips;
             src.pResource = faces[i]->resource.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             const D3D12_BOX box{ 0, 0, 0, std::min(cw, faces[i]->hostWidth), std::min(ch, faces[i]->hostHeight), 1 };
@@ -5469,11 +5492,14 @@ void Resolve()
         // Destination: 8888 stays 8-bit (clamped, as the hardware does); other
         // formats keep the HDR range. The exponent bias scales colour copies.
         // k_2_10_10_10 (7) is a fixed-point front-buffer format too (PGR4 presents one); it gets the same
-        // presentable 8-bit host image, losing its low two bits. REGPU_NO_1010102_AS_8888 keeps it HDR.
+        // presentable 8-bit host image, losing its low two bits. Only unscaled, though: a copy with an
+        // exponent bias stores HDR scaled down (FH1's reflections at 1/16, sampled back with the fetch's
+        // exponent adjust), and 8 bits of that came out as a colour cast (green car glass); those keep
+        // the HDR range. REGPU_NO_1010102_AS_8888 keeps every one HDR.
         static LiveSwitch no1010102("REGPU_NO_1010102_AS_8888");
-        const DXGI_FORMAT format = depth ? DXGI_FORMAT_R32_FLOAT
-            : destFormat == 6 || (destFormat == 7 && !no1010102) ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
         const int bias = int32_t(info << 10) >> 26; // bits 16-21, signed
+        const DXGI_FORMAT format = depth ? DXGI_FORMAT_R32_FLOAT
+            : destFormat == 6 || (destFormat == 7 && bias == 0 && !no1010102) ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
         // Bit 24 (copy swap): the destination stores red and blue exchanged; the
         // fetch swizzle swaps them back when the title samples it.
         const bool swapRB = !depth && ((info >> 24) & 1);
