@@ -1691,6 +1691,7 @@ LiveSwitch g_sw_REGPU_ASYNC_SHADERS("REGPU_ASYNC_SHADERS");
 LiveSwitch g_sw_REGPU_CONSTANTS_BY_COUNT("REGPU_CONSTANTS_BY_COUNT");
 LiveSwitch g_sw_REGPU_CONSTANTS_IN_RING("REGPU_CONSTANTS_IN_RING");
 LiveSwitch g_sw_REGPU_DEPTH_ALPHATEST_ALL("REGPU_DEPTH_ALPHATEST_ALL");
+LiveSwitch g_sw_REGPU_DEPTH_ALPHATEST_EMPTY("REGPU_DEPTH_ALPHATEST_EMPTY");
 LiveSwitch g_sw_REGPU_DEPTH_ALPHATEST_VS("REGPU_DEPTH_ALPHATEST_VS");
 LiveSwitch g_sw_REGPU_DUMP_TEXTURES("REGPU_DUMP_TEXTURES");
 LiveSwitch g_sw_REGPU_FULL_CONSTANT_BLOCKS("REGPU_FULL_CONSTANT_BLOCKS");
@@ -8300,10 +8301,23 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // (alpha-tested, the clear was lost and the stale depth shadowed the map's whole square).
     // Only a texture the pixel shader samples makes a cut-out (FM2: the race's sun shadow map lost
     // its casters and clears to a pass-through alpha of 0 while the vertex shader sampled one).
+    // A slot whose fetch constant isn't a texture (type 0: the game unbound it) has no cut-out
+    // either: it reads 0, and the test would drop the whole caster (FH1: the car body sampled an
+    // unbound slot 0 and was missing from the near sun-shadow cascade, so the car cast no shadow).
     // REGPU_NO_DEPTH_ALPHATEST=1: no alpha test in depth-only passes; REGPU_DEPTH_ALPHATEST_ALL=1:
-    // every draw tested (before); REGPU_DEPTH_ALPHATEST_VS=1: a vertex-shader texture counts too.
+    // every draw tested (before); REGPU_DEPTH_ALPHATEST_VS=1: a vertex-shader texture counts too;
+    // REGPU_DEPTH_ALPHATEST_EMPTY=1: an unbound slot counts too.
     LiveSwitch &noDepthAlphaTest = g_sw_REGPU_NO_DEPTH_ALPHATEST, &testAll = g_sw_REGPU_DEPTH_ALPHATEST_ALL, &testVs = g_sw_REGPU_DEPTH_ALPHATEST_VS;
-    const bool depthAlphaTest = !noDepthAlphaTest && (testAll || ps.info.usedTextureSlots || (testVs && vs.info.usedTextureSlots));
+    const auto boundSlots = [&](uint32_t slots) {
+        if (edramMode != 5 || g_sw_REGPU_DEPTH_ALPHATEST_EMPTY)
+            return slots;
+        uint32_t bound = 0;
+        for (uint32_t m = slots; m; m &= m - 1)
+            if (ReadTextureFetch(uint32_t(__builtin_ctz(m))).Type() == 2)
+                bound |= m & -m;
+        return bound;
+    };
+    const bool depthAlphaTest = !noDepthAlphaTest && (testAll || boundSlots(ps.info.usedTextureSlots) || (testVs && boundSlots(vs.info.usedTextureSlots)));
     pc->info[0] = (colorControl >> 3) & 1 && (edramMode != 5 || depthAlphaTest) ? (colorControl & 7) : 7;
     pc->info2[0] = RegFloat(RB_ALPHA_REF);
     pc->info2[1] = 1.0f / ScaleX();
