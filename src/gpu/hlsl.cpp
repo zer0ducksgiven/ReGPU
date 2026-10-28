@@ -1175,7 +1175,13 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    // (no viewport transform: the title's filter and post-processing passes) are left\n"
              "    // alone: squeezing their inner vertices warped the image outside 16:9.\n"
              "    if (flat && vwide.w > 0.5 && vwide.z < 1.0 && (vte.x & 0x30Fu) != 0x300u && abs(ndc.x) < 0.999) ndc.x *= vwide.z;\n"
-             "    r.pos = float4(ndc * w, p.z * w, w);\n"
+             "    // Depth kept homogeneous (z * scale + offset * w, as Xenia does), not divided by w and multiplied\n"
+             "    // back: the round trip moved geometry on the far plane (FH1's sky dome, z = w) a hair past it,\n"
+             "    // where depth clipping dropped it (holes in the sky). vte.x bit 29: the old form (REGPU_OLD_DEPTH_W).\n"
+             "    float zc = p.z * w;\n"
+             "    if (!(vte.x & (1u << 9)) && !(vte.x & (1u << 8)) && !(vte.x & (1u << 29)))\n"
+             "        zc = r.pos.z * ((vte.x & 16u) ? vscale.z : 1.0) + ((vte.x & 32u) ? voffset.z : 0.0) * w;\n"
+             "    r.pos = float4(ndc * w, zc, w);\n"
              "    return r;\n}\n";
     }
     else

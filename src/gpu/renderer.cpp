@@ -3009,7 +3009,7 @@ std::string MotionVariant(const std::string& hlsl, bool pixel)
     h.insert(end + 2, prev);
     // The viewport transform (from the target size to the clip position) as a function.
     const std::string from = "    float2 size = float2(vinfo.zw);\n";
-    const std::string last = "    r.pos = float4(ndc * w, p.z * w, w);\n";
+    const std::string last = "    r.pos = float4(ndc * w, zc, w);\n";
     const size_t a = h.find(from), b = h.find(last);
     const size_t mainAt = h.find("VSOut main(uint id : SV_VertexID)\n{");
     if (a == std::string::npos || b == std::string::npos || mainAt == std::string::npos || b < a || a < mainAt)
@@ -3017,7 +3017,7 @@ std::string MotionVariant(const std::string& hlsl, bool pixel)
     std::string body = h.substr(a, b - a);
     for (size_t at = 0; (at = body.find("r.pos", at)) != std::string::npos; at += 3)
         body.replace(at, 5, "pos");
-    const std::string fn = "float4 ToClip(float4 pos, float2 pointOffset)\n{\n" + body + "    return float4(ndc * w, p.z * w, w);\n}\n";
+    const std::string fn = "float4 ToClip(float4 pos, float2 pointOffset)\n{\n" + body + "    return float4(ndc * w, zc, w);\n}\n";
     h.replace(a, b + last.size() - a,
         "    r.pos = ToClip(r.pos, pointOffset);\n"
         "    r.mcur = r.pos;\n"
@@ -3396,7 +3396,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.RasterizerState.DepthClipEnable = (key.flags >> 2) & 1 ? FALSE : TRUE;
     pd.DepthStencilState.DepthEnable = (depth >> 1) & 1;
     pd.DepthStencilState.DepthWriteMask = ((depth >> 2) & 1) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
@@ -3515,7 +3515,14 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
     const uint32_t stencil = gpureg::Get(RB_STENCILREFMASK) & 0xFFFF00, mode = gpureg::Get(PA_SU_SC_MODE_CNTL) & 7;
     // Alpha-to-mask (RB_COLORCONTROL bit 4): cut-out foliage and fences.
     const bool alphaToMask = (gpureg::Get(RB_COLORCONTROL) >> 4) & 1;
-    return PipelineKey{ vsHash, psHash, blend, depth, stencil | (mask << 24) | (mode << 28), uint32_t(alphaToMask) | (uint32_t(cullable) << 1) };
+    // CLIP_DISABLE (PA_CL_CLIP_CNTL bit 16): no near/far clipping, the depth clamped instead, as
+    // Xenia does. FH1's sky dome lies on the far plane: with depth clipping, fragments a little
+    // past it were dropped as the camera moved, and the holes showed the clear colour (grey shapes
+    // in the sky). REGPU_DEPTH_CLIP_ALWAYS=1: clipped as before (A/B).
+    static LiveSwitch depthClipAlways("REGPU_DEPTH_CLIP_ALWAYS");
+    const bool noDepthClip = !depthClipAlways && ((gpureg::Get(0x2204 /* PA_CL_CLIP_CNTL */) >> 16) & 1);
+    return PipelineKey{ vsHash, psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
+        uint32_t(alphaToMask) | (uint32_t(cullable) << 1) | (uint32_t(noDepthClip) << 2) };
 }
 
 // Alpha-blended colour draws (smoke, sparks, glows) are skippable for the moment it
@@ -8194,6 +8201,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     LiveSwitch &oldClearShift = g_sw_REGPU_OLD_CLEAR_SHIFT, &noRectSnap = g_sw_REGPU_NO_RECT_SNAP;
     if (oldClearShift)
         vc->vte[0] |= 1u << 31;
+    // REGPU_OLD_DEPTH_W=1: depth divided by w and multiplied back, as before (hlsl.cpp, bit 29).
+    if (static LiveSwitch oldDepthW("REGPU_OLD_DEPTH_W"); oldDepthW)
+        vc->vte[0] |= 1u << 29;
     if (!noRectSnap && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots && (ScaleX() != 1.0f || ScaleY() != 1.0f))
         vc->vte[0] |= 1u << 30;
     Sub(3); // viewport, MSAA scale
