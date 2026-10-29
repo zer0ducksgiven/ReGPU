@@ -7358,11 +7358,23 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
                     return false;
                 if (p.laterResolved[i] || keep)
                     return false;
+                // A draw with the stencil test on runs in its own tile: the stencil its widened first-tile
+                // twin wrote in this tile's rows doesn't last to the draws here that test it (FH1's sky is
+                // drawn where its stencil marks allow: with those dropped, the sky went grey for a frame
+                // now and then while the camera moved). REGPU_TILE_MERGE_DROP_STENCIL=1: dropped too (A/B).
+                static LiveSwitch dropStencil("REGPU_TILE_MERGE_DROP_STENCIL");
+                if (!dropStencil && (gpureg::Get(RB_DEPTHCONTROL) & 1))
+                    return false;
                 // Drawn by the first tile: dropped (each first-tile draw stands for one later one).
                 const auto it = p.drawn.find(TileMerge::DrawKey(initiator, dmaBase, dmaSize));
                 if (it == p.drawn.end())
                     return false;
                 p.drawn.erase(it);
+                static LiveSwitch traceDrops("REGPU_TRACE_TILE_DROPS"); // debug: one frame's dropped draws every 300
+                if (traceDrops && g_r.frame % 300 == 0)
+                    Log("tile drop: frame %llu #%u tile %d vs %016llx ps %016llx prim %u depthctl %08X colour %03X depth %03X", (unsigned long long)g_r.frame, number, int(i) + 1,
+                        (unsigned long long)C().vsHash, (unsigned long long)C().psHash, initiator & 0x3F, gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_COLOR_INFO) & 0xFFF,
+                        gpureg::Get(RB_DEPTH_INFO) & 0xFFF);
                 return true;
             }
     }
