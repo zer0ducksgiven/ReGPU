@@ -1460,6 +1460,14 @@ if (FILE* f = _wfopen((regpu::GetConfig().userDir / "zero_copy.txt").c_str(), L"
 }
 }
 
+// REGPU_ANISO_FROM_FETCH: anisotropic filtering as each fetch asks (see Init's samplers). Read when the
+// root signature is built, and by each texture binding.
+bool AnisoFromFetch()
+{
+    static LiveSwitch fromFetch("REGPU_ANISO_FROM_FETCH");
+    return fromFetch;
+}
+
 void Init()
 {
     g_r.device = RenderDevice();
@@ -1517,25 +1525,35 @@ void Init()
     params[3].DescriptorTable.NumDescriptorRanges = 3;
     params[3].DescriptorTable.pDescriptorRanges = bindless;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_STATIC_SAMPLER_DESC samplers[4]{};
+    // s0-s3 linear wrap, linear clamp, point clamp, point wrap; s4-s7 linear wrap at 2x, 4x, 8x, 16x
+    // anisotropy (REGPU_ANISO_FROM_FETCH, below).
+    D3D12_STATIC_SAMPLER_DESC samplers[8]{};
     const D3D12_FILTER filters[4] = { D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_POINT,
         D3D12_FILTER_MIN_MAG_MIP_POINT };
     const D3D12_TEXTURE_ADDRESS_MODE modes[4] = { D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP };
-    for (UINT i = 0; i < 4; i++)
+    for (UINT i = 0; i < 8; i++)
     {
-        samplers[i].Filter = filters[i];
+        samplers[i].Filter = filters[i < 4 ? i : 0];
         // Wrapping linear filtering (surface textures: road, ground) is anisotropic: plain
         // trilinear picks blurred levels at grazing angles (blotchy asphalt). Not the clamped
         // sampler: it also reads shadow maps and other render targets, where averaging depth
         // over a long footprint breaks the shadows (black patches, glitchy object shadows).
+        // REGPU_ANISO_FROM_FETCH: s0 stays trilinear and a fetch gets the anisotropy it asks for (dword 3
+        // bits 25-27), as the console and Xenia give it; forced 16x made FH1's distant ground about 20%
+        // sharper than stock's (fine-detail measure, FX).
         static LiveSwitch noAniso("REGPU_NO_ANISO"); // A/B
-        if (filters[i] == D3D12_FILTER_MIN_MAG_MIP_LINEAR && modes[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP && !noAniso)
+        if (i >= 4)
+        {
+            samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
+            samplers[i].MaxAnisotropy = 2u << (i - 4);
+        }
+        else if (filters[i] == D3D12_FILTER_MIN_MAG_MIP_LINEAR && modes[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP && !noAniso && !AnisoFromFetch())
         {
             samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
             samplers[i].MaxAnisotropy = 16;
         }
-        samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = modes[i];
+        samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = i >= 4 ? D3D12_TEXTURE_ADDRESS_MODE_WRAP : modes[i];
         samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
         samplers[i].ShaderRegister = i;
         samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -1543,7 +1561,7 @@ void Init()
     D3D12_ROOT_SIGNATURE_DESC rs{};
     rs.NumParameters = 4;
     rs.pParameters = params;
-    rs.NumStaticSamplers = 4;
+    rs.NumStaticSamplers = 8;
     rs.pStaticSamplers = samplers;
     ComPtr<ID3DBlob> blob, error;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
@@ -5011,6 +5029,21 @@ void EnsureResolved(ResolvedTexture& dest, uint32_t width, uint32_t height, uint
 void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false,
     const float* destRange = nullptr, uint32_t toGamma = 0)
 {
+    // REGPU_FREEZE_RESOLVES=<hex base>[,<hex base>...]: those images keep what they hold, later resolves
+    // to them are skipped (debug: does a flicker come from an image's redraws?). Read every resolve, so
+    // the debug server's "env" sets it live.
+    if (const char* freeze = getenv("REGPU_FREEZE_RESOLVES"); freeze && *freeze)
+        if (auto it = g_r.resolved.find(base); it != g_r.resolved.end() && it->second.resource)
+            for (const char* p = freeze; *p;)
+            {
+                char* end = nullptr;
+                if (uint32_t(strtoul(p, &end, 16)) == base)
+                {
+                    it->second.frame = g_r.frame;
+                    return;
+                }
+                p = *end ? end + 1 : end;
+            }
     ResolvedTexture& dest = g_r.resolved[base];
     const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
     EnsureResolved(dest, width, height, hostWidth, hostHeight, format);
@@ -8405,6 +8438,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vte[0] |= 1u << 29;
     if (!noRectSnap && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots && (ScaleX() != 1.0f || ScaleY() != 1.0f))
         vc->vte[0] |= 1u << 30;
+    // Viewport-transformed draws with D3D9 pixel centres (PA_SU_VTX_CNTL bit 0 clear) are shifted half a
+    // pixel, as the screen-space ones are (hlsl.cpp, bit 28). Unshifted, FH1's image sat 0.6-0.7 px off
+    // stock's (HUD, banners) and its screen-space shadow lookups landed between mask texels: the shadows
+    // shimmered with the idle camera (FX, real-time capture: 22-30 changes a second at the user's
+    // example against 12.7 shifted and stock's 16). REGPU_NO_3D_HALF_PIXEL=1: unshifted (A/B).
+    if (static LiveSwitch no3dHalfPixel("REGPU_NO_3D_HALF_PIXEL"); !no3dHalfPixel && !(gpureg::Get(0x2302 /* PA_SU_VTX_CNTL */) & 1))
+        vc->vte[0] |= 1u << 28;
     Sub(3); // viewport, MSAA scale
     // Triangle lists and restart-free strips from an index buffer: a real indexed draw.
     LiveSwitch &noIndexed = g_sw_REGPU_NO_INDEXED;
@@ -8599,6 +8639,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         if (!clamp && !oldClamp)
             ti[0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
+        // Anisotropy the fetch asks for (dword 3 bits 25-27: 2 = 2x .. 5 = 16x), for the linear wrapping
+        // sampler: bits 20-22 pick s4-s7 (hlsl.cpp). Only with REGPU_ANISO_FROM_FETCH (else s0 is 16x).
+        if (const uint32_t aniso = (fetch.dwords[3] >> 25) & 7; AnisoFromFetch() && !point && !clamp && aniso >= 2 && aniso <= 5)
+            ti[0] |= (aniso - 1) << 20;
         // Clamp to border on both axes (modes 6, 7): the shader returns the border colour
         // outside the image (dword 5 bits 0-1: 1 white, else black).
         if (clampX >= 6 && clampY >= 6)

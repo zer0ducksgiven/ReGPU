@@ -53,6 +53,10 @@ SamplerState sLinearWrap : register(s0);
 SamplerState sLinearClamp : register(s1);
 SamplerState sPointClamp : register(s2);
 SamplerState sPointWrap : register(s3);
+SamplerState sAniso2Wrap : register(s4);
+SamplerState sAniso4Wrap : register(s5);
+SamplerState sAniso8Wrap : register(s6);
+SamplerState sAniso16Wrap : register(s7);
 
 static const float FLT_MAX = 3.402823466e+38;
 
@@ -310,6 +314,12 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     if (mode == 1) return REGPU_SAMPLE_BIAS_2D(t, sLinearClamp, uv, bias);
     if (mode == 2) return REGPU_SAMPLE_BIAS_2D(t, sPointClamp, uv, bias);
     if (mode == 3) return REGPU_SAMPLE_BIAS_2D(t, sPointWrap, uv, bias);
+    // The fetch's anisotropy (renderer.cpp, tinfo.x bits 20-22): 1 2x, 2 4x, 3 8x, 4 16x.
+    uint aniso = (tinfo[slot].x >> 20) & 7u;
+    if (aniso == 1u) return REGPU_SAMPLE_BIAS_2D(t, sAniso2Wrap, uv, bias);
+    if (aniso == 2u) return REGPU_SAMPLE_BIAS_2D(t, sAniso4Wrap, uv, bias);
+    if (aniso == 3u) return REGPU_SAMPLE_BIAS_2D(t, sAniso8Wrap, uv, bias);
+    if (aniso == 4u) return REGPU_SAMPLE_BIAS_2D(t, sAniso16Wrap, uv, bias);
     return REGPU_SAMPLE_BIAS_2D(t, sLinearWrap, uv, bias);
 }
 
@@ -1183,6 +1193,10 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    if (halfPixel && !snap && (vte.x & (1u << 31))) p.xy += 0.5;\n"
              "    if (vscale.w > 0.0) p.xy *= float2(vscale.w, voffset.w);\n"
              "    if (halfPixel && !snap && !(vte.x & (1u << 31))) p.xy += 0.5;\n"
+             "    // vte.x bit 28: a viewport-transformed draw with D3D9 pixel centres (PA_SU_VTX_CNTL bit 0\n"
+             "    // clear) is shifted the same half pixel, as Xenia does: the console samples it at integer\n"
+             "    // positions, and screen-space lookups that add half a texel then land on texel centres.\n"
+             "    if (!halfPixel && (vte.x & (1u << 28))) p.xy += 0.5;\n"
              "    p.xy += pointOffset;\n"
              "    if (vte.x & (1u << 8)) w = 1.0;\n"
              "    float2 ndc = float2(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0);\n"

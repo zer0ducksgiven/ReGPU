@@ -338,6 +338,12 @@ bool DecodeTexture(const TextureFetch& fetch, std::vector<uint8_t>& rgba)
 void PackedMipOffset(const TextureFetch& fetch, uint32_t blockSize, uint32_t& xBlocks, uint32_t& yBlocks)
 {
     xBlocks = yBlocks = 0;
+    if (fetch.tailX != ~0u)
+    {
+        xBlocks = fetch.tailX;
+        yBlocks = fetch.tailY;
+        return;
+    }
     // Linear textures too: PGR4's 8x6 car damage tables are linear with packed mips, their texels
     // 16 to the right of the base (read from the base, every car looked fully damaged).
     static LiveSwitch tiledOnly("REGPU_PACKED_TILED_ONLY"); // A/B: the old rule
@@ -568,24 +574,58 @@ bool TextureMipLevel(const TextureFetch& base, uint32_t level, TextureFetch& out
         return true;
     }
     const uint32_t w = base.Width(), h = base.Height();
-    if (!base.MipAddress() || level > base.MipMaxLevel() || !base.Tiled() || (w & (w - 1)) || (h & (h - 1)))
+    // Non-power-of-two images have levels too (FH1's 768x256 and 2048x768 ground textures): each is
+    // stored at the power-of-two size (next_pow2(base) >> level, as Xenia's GetGuestMipBlocks), its
+    // texels (base >> level, D3D's level size) in the top-left. Without them the distant ground read
+    // the full-size image: too sharp, and it shimmered as the camera moved. REGPU_NO_NPOT_MIPS=1: none.
+    static const bool noNpot = getenv("REGPU_NO_NPOT_MIPS") != nullptr;
+    const bool pow2 = !(w & (w - 1)) && !(h & (h - 1));
+    if (!base.MipAddress() || level > base.MipMaxLevel() || !base.Tiled() || (!pow2 && noNpot))
         return false;
+    auto nextPow2 = [](uint32_t v) { uint32_t p = 1; while (p < v) p <<= 1; return p; };
+    const uint32_t sw0 = nextPow2(w), sh0 = nextPow2(h);
     uint32_t address = base.MipAddress();
     for (uint32_t l = 1;; l++)
     {
         const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
-        if (std::min(lw, lh) <= 16) // the packed tail (small levels share a tile): not read
-            return false;
+        const uint32_t sw = std::max(sw0 >> l, 1u), sh = std::max(sh0 >> l, 1u); // stored size
+        if (std::min(sw, sh) <= 16)
+        {
+            // The packed tail: this level and the smaller ones share one tile at this address, each at
+            // an offset (Xenia's GetPackedMipOffset). Unread, chains stopped at 32 texels and distant
+            // surfaces sampled a level more detailed than the console's. Opt-in, REGPU_MIP_TAIL=1: the
+            // offsets are Xenia's and unverified against a console dump.
+            static const bool tail = getenv("REGPU_MIP_TAIL") != nullptr;
+            if (!tail)
+                return false;
+            auto log2Ceil = [](uint32_t v) { uint32_t r = 0; while ((1u << r) < v) r++; return r; };
+            const uint32_t lw2 = log2Ceil(w), lh2 = log2Ceil(h), size2 = std::min(lw2, lh2);
+            const uint32_t tailBase = size2 > 4 ? size2 - 4 : 0;
+            const uint32_t packed = level - tailBase;
+            uint32_t x = 0, y = 0; // texels
+            if (packed < 3)
+                (lw2 > lh2 ? y : x) = 16u >> packed;
+            else
+                (lw2 > lh2 ? x : y) = (1u << ((lw2 > lh2 ? lw2 : lh2) - tailBase)) >> (packed - 2);
+            out = base;
+            out.dwords[0] = (out.dwords[0] & ~(0x1FFu << 22)) | (1u << 22); // pitch: one tile
+            out.dwords[1] = (out.dwords[1] & 0xFFF) | address;
+            out.dwords[2] = (out.dwords[2] & ~0x3FFFFFFu) | (std::max(w >> level, 1u) - 1) | ((std::max(h >> level, 1u) - 1) << 13);
+            out.tailX = x / info.blockSize;
+            out.tailY = y / info.blockSize;
+            return true;
+        }
         if (l == level)
         {
             out = base;
-            out.dwords[0] &= ~(0x1FFu << 22); // pitch: the level's own width
+            // Pitch: the stored width, in 32-texel units (the level's own width when a power of two).
+            out.dwords[0] = (out.dwords[0] & ~(0x1FFu << 22)) | (pow2 ? 0u : ((sw + 31) / 32) << 22);
             out.dwords[1] = (out.dwords[1] & 0xFFF) | address;
             out.dwords[2] = (out.dwords[2] & ~0x3FFFFFFu) | (lw - 1) | ((lh - 1) << 13);
             return true;
         }
         // Each level is padded to 32x32 blocks (a tile) and 4 KB.
-        const uint32_t bx = (lw + info.blockSize - 1) / info.blockSize, by = (lh + info.blockSize - 1) / info.blockSize;
+        const uint32_t bx = (sw + info.blockSize - 1) / info.blockSize, by = (sh + info.blockSize - 1) / info.blockSize;
         const uint32_t bytes = (((bx + 31) & ~31u) * ((by + 31) & ~31u)) << info.log2Bytes;
         address += (bytes + 4095) & ~4095u;
     }
