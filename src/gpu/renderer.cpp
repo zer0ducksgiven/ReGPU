@@ -1652,13 +1652,16 @@ void PassMark(const char* fmt, uint32_t a, uint32_t b)
 
 void SelectSurfaces(bool force)
 {
-    // A colour surface is keyed by its EDRAM base and its pitch (RB_SURFACE_INFO bits 0-13): in
-    // EDRAM a narrower surface at the same base lays its tiles out differently, so it does not
-    // overwrite the same pixels of a wider one, as our shared texture did (FH1's photo mode: a
-    // 640-pitch pass at the base of the 1280 scene darkened the scene's top-left quarter).
-    // REGPU_SURFACE_BY_BASE=1: by base alone, as before (A/B).
-    static LiveSwitch byBase("REGPU_SURFACE_BY_BASE");
-    const uint32_t colorBase = (gpureg::Get(RB_COLOR_INFO) & 0xFFF) | (byBase ? 0u : (gpureg::Get(RB_SURFACE_INFO) & 0x3FFF) << 12),
+    // A colour surface is keyed by its EDRAM layout: its base and its row width in samples (pitch
+    // times 2 for a 4x view, see LayoutKey). A narrower 1x surface at the same base lays its tiles
+    // out differently and is another surface; a 4x view of half the pitch covers the same samples
+    // and is the same one (FH1's photo mode reaches its 1280x720 1x scene through a 4x 640x360
+    // view; keyed by pitch it missed the scene, and the scene stayed hazy). REGPU_SURFACE_BY_BASE=1:
+    // by base alone; REGPU_SURFACE_BY_PITCH=1: by base and pitch (A/B).
+    static LiveSwitch byBase("REGPU_SURFACE_BY_BASE"), byPitch("REGPU_SURFACE_BY_PITCH");
+    const uint32_t surfaceInfo = gpureg::Get(RB_SURFACE_INFO);
+    const uint32_t rowSamples = (surfaceInfo & 0x3FFF) * (byPitch ? 1u : MsaaAcross((surfaceInfo >> 16) & 3));
+    const uint32_t colorBase = (gpureg::Get(RB_COLOR_INFO) & 0xFFF) | (byBase ? 0u : rowSamples << 12),
                    depthBase = gpureg::Get(RB_DEPTH_INFO) & 0xFFF;
     if (!force && colorBase == C().colorBase && depthBase == C().depthBase)
         return;
