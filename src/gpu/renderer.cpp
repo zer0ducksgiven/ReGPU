@@ -3647,8 +3647,17 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     if (motion)
         key.flags |= 4;
     thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (pipelines are never removed)
+    // Runs of draws share a pipeline: the last one's answer first, before the map.
+    thread_local PipelineKey lastKey{};
+    thread_local ID3D12PipelineState* lastPso = nullptr;
+    if (lastPso && memcmp(&key, &lastKey, sizeof(key)) == 0)
+        return lastPso;
     if (auto r = ready.find(key); r != ready.end())
+    {
+        lastKey = key;
+        lastPso = r->second;
         return r->second;
+    }
     std::shared_ptr<PipelineEntry> entry;
     {
         const auto lockStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
