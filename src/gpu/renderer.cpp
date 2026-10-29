@@ -7956,6 +7956,23 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         return;
     }
     // Colour+depth (4) and depth-only (5) passes draw.
+    // REGPU_SKIP_SHADERS=<hex hash>[,...]: draws whose vertex or pixel shader is listed are dropped
+    // (debug: which draw makes an artefact). Read per draw, so the debug server's "env" sets it live.
+    if (const char* skip = getenv("REGPU_SKIP_SHADERS"); skip && *skip)
+        for (const char* p = skip; *p;)
+        {
+            char* end = nullptr;
+            const uint64_t h = strtoull(p, &end, 16);
+            if (end == p)
+                break;
+            if (h == C().vsHash || h == C().psHash)
+            {
+                TraceSkip("REGPU_SKIP_SHADERS", initiator);
+                g_r.skippedThisFrame++;
+                return;
+            }
+            p = *end ? end + 1 : end;
+        }
     if ((edramMode != 4 && edramMode != 5) || C().vsCode.empty() || C().psCode.empty())
     {
         TraceSkip("edram mode", initiator);
