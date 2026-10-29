@@ -1620,7 +1620,9 @@ void Init()
     g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     kRingSize = (getenv("REGPU_RING_MB") ? std::clamp<UINT64>(UINT64(atoi(getenv("REGPU_RING_MB"))), 16, 2048)
-        : regpu::GetConfig().uploadRingMB ? std::clamp<UINT64>(regpu::GetConfig().uploadRingMB, 16, 2048) : g_r.physical && !getenv("REGPU_NO_DIRECT_FETCH") ? 64 : 384) << 20;
+        // (128 MB with the zero-copy mapping, not 64: new vertex buffers are copied for their first 16 frames,
+        // and the frame a world loads in filled 64 MB and dropped draws until the ring had grown.)
+        : regpu::GetConfig().uploadRingMB ? std::clamp<UINT64>(regpu::GetConfig().uploadRingMB, 16, 2048) : g_r.physical && !getenv("REGPU_NO_DIRECT_FETCH") ? 128 : 384) << 20;
     Log("renderer: upload ring %llu MB per frame", (unsigned long long)(kRingSize >> 20));
     for (UINT i = 0; i < kFrames; i++)
     {
@@ -3686,10 +3688,11 @@ void WaitHoldingImpl(const std::function<bool()>& done);
 
 // Waits for the build (draws are never dropped: a missing pipeline used to leave
 // shadow passes undrawn). Cold builds can take 100+ ms; the overlay says so.
-ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry)
+// `force`: wait even with REGPU_ASYNC_PIPELINES (draws a pass cannot lose, see SkippableDraw).
+ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry, bool force = false)
 {
     static LiveSwitch async("REGPU_ASYNC_PIPELINES");
-    if (async && entry->state.load(std::memory_order_acquire) == 0)
+    if (async && !force && entry->state.load(std::memory_order_acquire) == 0)
         return nullptr;
     WaitHoldingImpl([&] { return entry->state.load(std::memory_order_acquire) != 0; });
     return entry->state.load() == 1 ? entry->pso.Get() : nullptr;
@@ -3760,10 +3763,24 @@ bool GameSettled()
     return !never && g_lastLongHold.time_since_epoch().count() != 0 && std::chrono::steady_clock::now() - g_lastLongHold > std::chrono::seconds(4);
 }
 
+// Set by the draw: a rectangle list without textures (a clear, a stencil reset, a mask fill).
+thread_local bool g_plainRectDraw = false;
+bool PlainRectMustDraw()
+{
+    static LiveSwitch skipPlainRects("REGPU_SKIP_PLAIN_RECTS"); // 1: skippable like the rest, as before
+    return g_plainRectDraw && !skipPlainRects;
+}
+
 bool SkippableDraw(bool depthOnly, uint32_t blend)
 {
     static LiveSwitch noSkip("REGPU_NO_SKIP_BLENDED");
     if (noSkip || depthOnly)
+        return false;
+    // Not these: the pipelines are tiny and a dropped clear or reset leaves the last frame's stencil or colour
+    // for later passes to draw through (FH1's minimap came out as white blobs for a moment when the world
+    // loaded: 27 such draws were dropped while their pipelines built, the first frame after the load).
+    // REGPU_SKIP_PLAIN_RECTS=1: skippable like the rest, as before.
+    if (PlainRectMustDraw())
         return false;
     const bool opaque = (blend & 0xFF1F1F1F) == 0x00010001 || (blend & 0x1F) == 1 && ((blend >> 8) & 0x1F) == 0;
     return !opaque || GameSettled();
@@ -3809,7 +3826,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     g_waitWhat = depthOnly ? "pipeline (depth only)" : "pipeline";
     g_waitBlend = key.blend;
     const auto waitStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    ID3D12PipelineState* pso = WaitForPipeline(entry);
+    ID3D12PipelineState* pso = WaitForPipeline(entry, PlainRectMustDraw());
     if (g_perfTiming)
         if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count(); ms > 2.0)
             Log("perf: GetPipeline waited %.1f ms for pipeline %016llx/%016llx (state was %d)", ms, (unsigned long long)key.vs, (unsigned long long)key.ps, 0);
@@ -6864,8 +6881,52 @@ void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t d
 
 namespace
 {
+// REGPU_LOG_SKIPS=1: every frame that dropped draws logs how many and why (first 600 such frames), with the
+// shaders of the first few: tells whether a glitch at load (a half-drawn minimap) is missing draws.
+LiveSwitch g_sw_REGPU_LOG_SKIPS("REGPU_LOG_SKIPS");
+struct SkipLog
+{
+    std::mutex mutex;
+    uint64_t frame = ~0ull;
+    std::map<std::string, uint32_t> reasons;
+    std::vector<std::string> samples;
+    uint32_t frames = 0;
+    void Flush()
+    {
+        if (reasons.empty())
+            return;
+        if (frames++ < 600)
+        {
+            std::string line;
+            for (const auto& [why, n] : reasons)
+                line += why + " x" + std::to_string(n) + "; ";
+            for (const auto& s : samples)
+                line += s + "; ";
+            Log("skips: frame %llu: %s", (unsigned long long)frame, line.c_str());
+        }
+        reasons.clear();
+        samples.clear();
+    }
+} g_skipLog;
+
 void TraceSkip(const char* why, uint32_t initiator)
 {
+    if (g_sw_REGPU_LOG_SKIPS)
+    {
+        std::lock_guard lock(g_skipLog.mutex);
+        if (g_skipLog.frame != g_r.frame)
+        {
+            g_skipLog.Flush();
+            g_skipLog.frame = g_r.frame;
+        }
+        g_skipLog.reasons[why]++;
+        if (g_skipLog.samples.size() < 4)
+        {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "%s vs %08llx ps %08llx", why, (unsigned long long)(C().vsHash >> 32), (unsigned long long)(C().psHash >> 32));
+            g_skipLog.samples.push_back(buf);
+        }
+    }
     const uint64_t traceFrame = TraceFrame();
     if (traceFrame && g_r.frame + 1 == traceFrame)
         Log("skip draw (%s): prim %u count %u mode %u vs %016llx ps %016llx", why, initiator & 0x3F, initiator >> 16,
@@ -8202,6 +8263,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // shaders' motion variants, once compiled; until then the draw has no motion).
     const bool cullable = (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1;
     const bool wantMotion = g_temporal && g_scenePhase && edramMode == 4 && WidePass();
+    g_plainRectDraw = (initiator & 0x3F) == 8 && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots;
     const CompiledShader* mvs = wantMotion ? MotionShader(vs) : nullptr;
     const CompiledShader* mps = wantMotion ? MotionShader(ps) : nullptr;
     bool motion = mvs && mps && mvs->IsReady() && mps->IsReady();
