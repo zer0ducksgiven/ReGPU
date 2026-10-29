@@ -502,7 +502,10 @@ struct Emitter
         case 28: return "p = (" + A + " != 0.0); s = p ? 0.0 : 1.0;";
         case 29: return "p = (" + A + " > 0.0); s = p ? 0.0 : 1.0;";
         case 30: return "p = (" + A + " >= 0.0); s = p ? 0.0 : 1.0;";
-        case 31: return "p = (" + A + " == 0.0); s = p ? 0.0 : ((" + A + " == 1.0) ? 0.0 : " + A + ");";
+        // setp_inv: src 1 sets the predicate (dest 0); otherwise it clears, dest 1 for 0 or src itself
+        // (Xenia's ucode.h). The predicate was set for 0 instead: FH1's sun-shadow passes then ran their
+        // far cascade's taps on pixels the near ones had already shaded, a dark band ahead of the camera.
+        case 31: return "p = (" + A + " == 1.0); s = p ? 0.0 : ((" + A + " == 0.0) ? 1.0 : " + A + ");";
         case 32: return "p = (" + A + " - 1.0 <= 0.0); s = p ? 0.0 : " + A + " - 1.0;";
         case 33: return "p = false; s = FLT_MAX;";
         case 34: return "p = (" + A + " == 0.0); s = " + A + ";";
