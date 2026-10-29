@@ -210,6 +210,20 @@ uint32_t PassHeight()
     const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
     return g_tallHeight && (surface == g_tallInfo || TallView()) ? g_tallHeight : kHeight;
 }
+// Guest rows the host EDRAM surfaces hold at full scale. A 1024-row pass (a 1024x1024 shadow
+// atlas drawn as one tall pass) used to be squeezed into the 720 rows of the output: at a 720p
+// render size FH1's four shadow cascades had 70% of the console's resolution (720x720 for its
+// 1024x1024 atlas). REGPU_SURFACE_ROWS=720 squeezes as before (A/B).
+uint32_t SurfaceRows()
+{
+    static const uint32_t rows = [] {
+        const char* v = getenv("REGPU_SURFACE_ROWS");
+        return v ? std::clamp<uint32_t>(uint32_t(atoi(v)), kHeight, 2048) : 1024u;
+    }();
+    return rows;
+}
+uint32_t SurfaceHeight() { return uint32_t((uint64_t(OutputHeight()) * SurfaceRows() + kHeight - 1) / kHeight); }
+
 float PassScale()
 {
     // (Asked for every scaled coordinate: memoised on what it depends on.)
@@ -218,7 +232,7 @@ float PassScale()
     const uint32_t surface = gpureg::Get(0x2000), color = gpureg::Get(0x2001) & 0xFFF, generation = g_nativeMsaaGeneration.load(std::memory_order_relaxed);
     if (surface != memo.surface || color != memo.color || generation != memo.generation || g_tallInfo != memo.tallInfo || g_tallHeight != memo.tallHeight)
         memo = { surface, color, generation, g_tallInfo, g_tallHeight,
-            std::min(float(kWidth) / float(PassWidth()), float(kHeight) / float(PassHeight())) };
+            std::min(float(kWidth) / float(PassWidth()), float(SurfaceRows()) / float(PassHeight())) };
     return memo.result;
 }
 float ScaleY() { return float(OutputHeight()) / float(kHeight) * g_sceneScale * PassScale(); }
@@ -391,6 +405,7 @@ struct PipelineKey
 {
     uint64_t vs, ps;
     uint32_t blend, depth, stencilMaskMode, flags;
+    uint32_t biasScale = 0, biasOffset = 0; // polygon offset (float bits), 0 when off
     bool operator==(const PipelineKey&) const = default;
 };
 struct PipelineKeyHash
@@ -400,6 +415,7 @@ struct PipelineKeyHash
         uint64_t h = k.vs * 0x9E3779B97F4A7C15ull ^ k.ps;
         h ^= (uint64_t(k.blend) << 32 | k.depth) * 0xC2B2AE3D27D4EB4Full;
         h ^= (uint64_t(k.stencilMaskMode) << 32 | k.flags) * 0x165667B19E3779F9ull;
+        h ^= (uint64_t(k.biasScale) << 32 | k.biasOffset) * 0x9E3779B97F4A7C15ull;
         return size_t(h ^ (h >> 29));
     }
 };
@@ -1633,7 +1649,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = OutputWidth();
-    td.Height = OutputHeight();
+    td.Height = SurfaceHeight();
     td.DepthOrArraySize = 1;
     td.MipLevels = 1;
     td.SampleDesc.Count = g_msaa;
@@ -2475,7 +2491,8 @@ struct Manifest
         {
             PipelineKey k{};
             unsigned long long vs, ps;
-            if (sscanf(line.c_str(), "P %llx %llx %x %x %x %x", &vs, &ps, &k.blend, &k.depth, &k.stencilMaskMode, &k.flags) == 6)
+            // (Older manifests end at the flags: no polygon offset.)
+            if (sscanf(line.c_str(), "P %llx %llx %x %x %x %x %x %x", &vs, &ps, &k.blend, &k.depth, &k.stencilMaskMode, &k.flags, &k.biasScale, &k.biasOffset) >= 6)
             {
                 k.vs = vs;
                 k.ps = ps;
@@ -2493,7 +2510,7 @@ struct Manifest
             return;
         g_diskWriter.Push([k] {
             std::ofstream(Path(), std::ios::app) << "P " << std::hex << k.vs << ' ' << k.ps << ' ' << k.blend << ' ' << k.depth << ' '
-                                                  << k.stencilMaskMode << ' ' << k.flags << '\n';
+                                                  << k.stencilMaskMode << ' ' << k.flags << ' ' << k.biasScale << ' ' << k.biasOffset << '\n';
         });
     }
     void RecordShader(bool pixel, uint64_t hash, const std::vector<uint32_t>& codeBE)
@@ -3490,6 +3507,16 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = (key.flags >> 2) & 1 ? FALSE : TRUE;
+    if (key.biasScale | key.biasOffset)
+    {
+        float scale, offset;
+        memcpy(&scale, &key.biasScale, 4);
+        memcpy(&offset, &key.biasOffset, 4);
+        // As Xenia: the scale is in 1/16ths of the slope; the offset in depth units, taken as 2^-24
+        // each (a 32-bit float depth's step between 0.5 and 1).
+        pd.RasterizerState.SlopeScaledDepthBias = scale / 16.0f;
+        pd.RasterizerState.DepthBias = INT(std::clamp(double(offset) * double(1 << 24), -2147483647.0, 2147483647.0));
+    }
     pd.DepthStencilState.DepthEnable = (depth >> 1) & 1;
     pd.DepthStencilState.DepthWriteMask = ((depth >> 2) & 1) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
@@ -3614,8 +3641,21 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
     // in the sky). REGPU_DEPTH_CLIP_ALWAYS=1: clipped as before (A/B).
     static LiveSwitch depthClipAlways("REGPU_DEPTH_CLIP_ALWAYS");
     const bool noDepthClip = !depthClipAlways && ((gpureg::Get(0x2204 /* PA_CL_CLIP_CNTL */) >> 16) & 1);
-    return PipelineKey{ vsHash, psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
+    // Polygon offset (PA_SU_SC_MODE_CNTL bits 11 front, 12 back; PA_SU_POLY_OFFSET_FRONT/BACK_SCALE,
+    // _OFFSET at 0x2380-0x2383): FH1's shadow maps are drawn with a slope scale of 16 (in 1/16ths) and
+    // an offset of 5e-5. Without it lit surfaces shadowed themselves (shadow acne): the parked car's
+    // rear and roof came out 15% darker than stock, mottled. Front values for both faces (FH1 sets
+    // them equal). REGPU_NO_POLY_OFFSET=1: none (A/B).
+    static LiveSwitch noPolyOffset("REGPU_NO_POLY_OFFSET");
+    const uint32_t sc = gpureg::Get(PA_SU_SC_MODE_CNTL);
+    const bool polyOffset = !noPolyOffset && ((depth >> 1) & 1) && ((sc >> 11) & 3);
+    const uint32_t biasScale = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2380 : 0x2382) : 0;
+    const uint32_t biasOffset = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2381 : 0x2383) : 0;
+    PipelineKey key{ vsHash, psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
         uint32_t(alphaToMask) | (uint32_t(cullable) << 1) | (uint32_t(noDepthClip) << 2) };
+    key.biasScale = biasScale;
+    key.biasOffset = biasOffset;
+    return key;
 }
 
 // Alpha-blended colour draws (smoke, sparks, glows) are skippable for the moment it
