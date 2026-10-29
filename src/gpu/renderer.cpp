@@ -2089,6 +2089,28 @@ UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
     return offset;
 }
 
+// A debug variable the debug server's "env" can set live, read once per frame: getenv on every draw
+// (REGPU_SKIP_SHADERS, REGPU_POLY_OFFSET_SCALE) cost FH1 half its frame rate on this PC.
+struct FrameEnv
+{
+    const char* name;
+    std::string value;
+    uint64_t frame = ~0ull;
+    bool set = false;
+    const char* Get()
+    {
+        if (frame != g_r.frame)
+        {
+            frame = g_r.frame;
+            const char* v = getenv(name);
+            set = v && *v;
+            if (set)
+                value = v;
+        }
+        return set ? value.c_str() : nullptr;
+    }
+};
+
 // A large vertex buffer the title rewrites from frame to frame (PGR4's crowd bone palettes):
 // read in place, the title's next frame can overwrite it before the host GPU runs this one
 // (its fences are signalled when recorded), so it is copied while it keeps changing. Checked
@@ -2110,8 +2132,21 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
     if (s.frame != g_r.frame && due)
     {
         const uint64_t hash = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes);
+        // A buffer seen changing once stays copied: one written in bursts (FH1's skid marks, appended
+        // while the car slides) went back to being read in place 120 frames after its last change and
+        // checked every 16th frame, so the next burst was read while the title wrote it (rare exploded
+        // vertices on the marks). REGPU_DYNAMIC_EXPIRE=1: back to in place after 120 quiet frames, as before.
+        static LiveSwitch expire("REGPU_DYNAMIC_EXPIRE");
         if (s.frame != ~0ull && hash != s.hash)
-            s.dynamicUntil = g_r.frame + 120;
+            s.dynamicUntil = expire ? g_r.frame + 120 : ~0ull;
+        // A buffer seen for the first time is copied until it has stayed the same for 16 frames: with
+        // early fences the title may rewrite it before the host GPU reads it, and ring-style buffers (FH1's
+        // minimap blocks, skid marks, particles) keep appearing at new addresses and sizes, so read in place
+        // at first sight they exploded when the GPU ran behind (busy scenes). REGPU_NEW_BUFFERS_IN_PLACE=1:
+        // read in place until seen changing, as before.
+        static LiveSwitch newInPlace("REGPU_NEW_BUFFERS_IN_PLACE");
+        if (s.frame == ~0ull && !newInPlace)
+            s.dynamicUntil = g_r.frame + 16;
         s.hash = hash;
         s.frame = g_r.frame;
         // REGPU_TRACE_DYNAMIC=1: the buffers being copied, every 600 frames.
@@ -2219,8 +2254,16 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     // allocations, are read in place by the GPU, and the check would cost every upload.)
     if (!g_r.physical && !GuestReadable(src, bytes))
         return zeros();
-    if (bytes <= fullHashBytes)
-        sample = ContentHash(src, bytes);
+    // Large ranges reach this copy path, with guest memory mapped for the GPU, only when they were seen
+    // changing (DynamicBuffer): hash them all, not 16 samples. Sampled, a range rewritten between two
+    // draws of a frame (FH1's skid marks once they pass 16 KB: segments rewritten as the car slides)
+    // kept the first draw's copy, and later draws put marks at old positions. REGPU_UPLOAD_SAMPLED=1:
+    // 16 samples, as before. (Without the mapping every large buffer is copied: sampled there.)
+    static LiveSwitch uploadSampled("REGPU_UPLOAD_SAMPLED");
+    if (bytes > fullHashBytes && g_r.physical && !uploadSampled)
+        sample = FullHash(src, bytes);
+    else if (bytes <= fullHashBytes)
+        sample = uploadSampled ? ContentHash(src, bytes) : FullHash(src, bytes); // (ContentHash's default stride is 256 bytes)
     else
         for (uint32_t i = 0; i < 16 && bytes >= 8; i++)
         {
@@ -2259,6 +2302,7 @@ struct IndexArena
         uint32_t sizeClass = 0;
         D3D12_GPU_VIRTUAL_ADDRESS staged = 0; // this frame's copy in the upload ring (frame stagedFrame)
         uint64_t stagedFrame = ~0ull;
+        bool changing = false; // seen changing: checked at every draw, not once a frame
     };
     std::unordered_map<uint64_t, Entry> entries;
     bool full = false;
@@ -2294,7 +2338,8 @@ void FlushIndexCopies()
 // The view of the guest index buffer at physical address `base` (count indices), swapped
 // into the arena; false when it cannot be cached (the draw fetches indices itself).
 bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view);
-// Each thread remembers this frame's index buffers (checked once per frame).
+thread_local bool g_indexChanging = false; // set by GetIndexBufferLocked: the entry is checked at every draw
+// Each thread remembers this frame's index buffers (checked once per frame), except ones seen changing.
 bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
 {
     thread_local FrameMap<D3D12_INDEX_BUFFER_VIEW> known;
@@ -2305,9 +2350,11 @@ bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D
         return true;
     }
     std::lock_guard textureLock(g_textureMutex);
+    g_indexChanging = false;
     if (!GetIndexBufferLocked(base, count, is32, endian, view))
         return false;
-    known.Put(key, g_r.frame, view);
+    if (!g_indexChanging)
+        known.Put(key, g_r.frame, view);
     return true;
 }
 
@@ -2359,7 +2406,12 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
         e.sizeClass = sizeClass;
     }
     view = { arena.buffer->GetGPUVirtualAddress() + e.offset, bytes, is32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT };
-    if (e.checkedFrame == g_r.frame)
+    // An index buffer seen changing is checked at every draw: one rewritten between two draws of a frame
+    // (FH1's skid marks, many on screen) otherwise drew later draws with the earlier indices, triangles
+    // stretched to far-off vertices. REGPU_INDEX_CHECK_ONCE=1: once a frame for all, as before.
+    static LiveSwitch checkOnce("REGPU_INDEX_CHECK_ONCE");
+    g_indexChanging = e.changing && !checkOnce;
+    if (e.checkedFrame == g_r.frame && (!e.changing || checkOnce))
     {
         if (e.stagedFrame == g_r.frame)
             view.BufferLocation = e.staged;
@@ -2373,7 +2425,16 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
     static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
     const uint64_t hash = sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
     if (!inserted && hash == e.hash)
+    {
+        if (e.stagedFrame == g_r.frame)
+            view.BufferLocation = e.staged;
         return true;
+    }
+    if (!inserted)
+    {
+        e.changing = true;
+        g_indexChanging = !checkOnce;
+    }
     // Swap into the upload ring (as the vertex shader would read them), then copy.
     const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16);
     if (offset == ~0ull)
@@ -3670,7 +3731,8 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
     const uint32_t biasScale = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2380 : 0x2382) : 0;
     uint32_t biasOffset = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2381 : 0x2383) : 0;
     // REGPU_POLY_OFFSET_SCALE=<f>: the constant offset times f (debug; read per draw, part of the key).
-    if (const char* m = getenv("REGPU_POLY_OFFSET_SCALE"); m && *m && biasOffset)
+    thread_local FrameEnv scaleEnv{ "REGPU_POLY_OFFSET_SCALE" };
+    if (const char* m = scaleEnv.Get(); m && biasOffset)
     {
         float v;
         memcpy(&v, &biasOffset, 4);
@@ -4761,7 +4823,11 @@ IndexListEntry* CachedIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t d
     {
         const uint32_t available = (dmaSize & 0xFFFFFF) /* in indices, as Xenia (num_words) */;
         const uint32_t bytes = std::min(count, available) * (is32 ? 4 : 2);
-        sample = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u))), bytes);
+        // Every index (as GetIndexBuffer): sampled every 256 bytes, indices rewritten between the samples
+        // kept the old expanded list (stretched triangles). REGPU_INDEX_SAMPLED_HASH=1: sampled.
+        static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
+        const uint8_t* p = GuestPtr<uint8_t>(GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u)));
+        sample = sampledIndexHash ? ContentHash(p, bytes) : FullHash(p, bytes);
     }
     thread_local std::unordered_map<uint64_t, IndexListEntry> cache;
     if (cache.size() > 8192)
@@ -5040,7 +5106,8 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     // REGPU_FREEZE_RESOLVES=<hex base>[,<hex base>...]: those images keep what they hold, later resolves
     // to them are skipped (debug: does a flicker come from an image's redraws?). Read every resolve, so
     // the debug server's "env" sets it live.
-    if (const char* freeze = getenv("REGPU_FREEZE_RESOLVES"); freeze && *freeze)
+    thread_local FrameEnv freezeEnv{ "REGPU_FREEZE_RESOLVES" };
+    if (const char* freeze = freezeEnv.Get())
         if (auto it = g_r.resolved.find(base); it != g_r.resolved.end() && it->second.resource)
             for (const char* p = freeze; *p;)
             {
@@ -7966,7 +8033,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // Colour+depth (4) and depth-only (5) passes draw.
     // REGPU_SKIP_SHADERS=<hex hash>[,...]: draws whose vertex or pixel shader is listed are dropped
     // (debug: which draw makes an artefact). Read per draw, so the debug server's "env" sets it live.
-    if (const char* skip = getenv("REGPU_SKIP_SHADERS"); skip && *skip)
+    thread_local FrameEnv skipEnv{ "REGPU_SKIP_SHADERS" };
+    if (const char* skip = skipEnv.Get())
         for (const char* p = skip; *p;)
         {
             char* end = nullptr;
