@@ -777,7 +777,23 @@ struct Emitter
                 cf.op() != CfOp::CondCall && cf.op() != CfOp::Return;
             loops = loops || cf.op() == CfOp::LoopStart;
         }
-        if (!linear)
+        // Only forward jumps (no loops, calls or returns: most pixel shaders with a predicated skip):
+        // the blocks run once each in order, so they are emitted in sequence without the dispatch
+        // loop; a jump sets cfpc past the blocks it skips. The loop kept fxc from flattening the
+        // program (FH1's sun-shadow mask boxes, ~6 ms of a 31 ms frame on a GTX 970).
+        // REGPU_NO_FORWARD_CF=1: the dispatch loop for these too (read at translation).
+        bool forward = !linear && !getenv("REGPU_NO_FORWARD_CF");
+        for (size_t i = 0; forward && i < shader.cf.size(); i++)
+        {
+            const CfOp op = shader.cf[i].op();
+            if (op == CfOp::LoopStart || op == CfOp::LoopEnd || op == CfOp::CondCall || op == CfOp::Return)
+                forward = false;
+            else if (op == CfOp::CondJmp && (shader.cf[i].lo & 0x1FFF) <= i)
+                forward = false;
+        }
+        if (forward)
+            Line("uint cfpc = 0;");
+        else if (!linear)
         {
             Line("uint cfpc = 0;");
             // Loops: each level keeps its counter and the aL it replaced. Calls: a 4-deep return stack.
@@ -871,7 +887,8 @@ struct Emitter
                     cond = std::string("BoolConstant(") + (pixel ? "pb" : "vb") + ", " + std::to_string((cf.hi >> 2) & 0xFF) + ") == " +
                         (cf.condition() ? "true" : "false");
                 Line("cfpc = (" + cond + ") ? " + std::to_string(target) + "u : " + next + "u;");
-                Line("continue;");
+                if (!forward)
+                    Line("continue;");
                 break;
             }
             // Loop constant (count | start << 8 | signed step << 16). loop_start sets aL to the
@@ -936,7 +953,7 @@ struct Emitter
             if (cf.IsEnd() && (linear || getenv("REGPU_NO_REACHABLE_CF")))
                 break;
         }
-        if (!linear)
+        if (!linear && !forward)
         {
             indent--;
             Line("}");
