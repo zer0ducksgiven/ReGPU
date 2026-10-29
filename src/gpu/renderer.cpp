@@ -3668,7 +3668,15 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
     const uint32_t sc = gpureg::Get(PA_SU_SC_MODE_CNTL);
     const bool polyOffset = !noPolyOffset && ((depth >> 1) & 1) && ((sc >> 11) & 3);
     const uint32_t biasScale = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2380 : 0x2382) : 0;
-    const uint32_t biasOffset = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2381 : 0x2383) : 0;
+    uint32_t biasOffset = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2381 : 0x2383) : 0;
+    // REGPU_POLY_OFFSET_SCALE=<f>: the constant offset times f (debug; read per draw, part of the key).
+    if (const char* m = getenv("REGPU_POLY_OFFSET_SCALE"); m && *m && biasOffset)
+    {
+        float v;
+        memcpy(&v, &biasOffset, 4);
+        v *= float(atof(m));
+        memcpy(&biasOffset, &v, 4);
+    }
     PipelineKey key{ vsHash, psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
         uint32_t(alphaToMask) | (uint32_t(cullable) << 1) | (uint32_t(noDepthClip) << 2) };
     key.biasScale = biasScale;
