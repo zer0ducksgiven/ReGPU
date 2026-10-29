@@ -8196,7 +8196,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
     }
     Sub(1); // bools, loops
-    memset(vc->vf, 0, sizeof(vc->vf));
+    // (Only the entries the shader fetches are set, each in full below: zeroing all 96 was 1.5 KB a draw,
+    // ~6 MB a frame of stores in FH1.)
     // vf[k].w: the buffer's size, past which a fetch reads 0 (as the Xenos does). REGPU_NO_FETCH_BOUNDS=1
     // reads past it (A/B).
     LiveSwitch &noBounds = g_sw_REGPU_NO_FETCH_BOUNDS;
@@ -8204,6 +8205,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         const uint32_t d0 = gpureg::Get(gpureg::FetchConstants + k * 2), d1 = gpureg::Get(gpureg::FetchConstants + k * 2 + 1);
         const uint32_t address = d0 & 0xFFFFFFFC, bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
+        vc->vf[k][0] = vc->vf[k][1] = vc->vf[k][2] = vc->vf[k][3] = 0;
         // Large buffers (static geometry) are read in place; small ones may be
         // rewritten before the GPU runs this frame, so they are copied.
         LiveSwitch &noDirect = g_sw_REGPU_NO_DIRECT_FETCH;
