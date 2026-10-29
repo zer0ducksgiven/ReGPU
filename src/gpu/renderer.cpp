@@ -1343,6 +1343,107 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
 
 void InitPipelineLibrary(ID3D12Device* device);
 
+// Guest physical memory for the GPU, in place: vertex fetches read it without copies. Called at
+// init and, when that fails, again at a few frames after (FrameBegin): under ReXGlue the heap calls
+// can fail with E_INVALIDARG at init and succeed later (FH1 TU4 on one PC: about half its runs on
+// the copy path, 7 ms a frame of vertex copies). REGPU_NO_MAP_RETRY=1: init only.
+void MapGuestMemory(ID3D12Device* d)
+{
+    // A title can make a page of physical memory no-access (FH1 TU4 guards the page after its
+    // minimap geometry ring), and the heap calls refuse a view with such a page (E_INVALIDARG): on
+    // one PC the guard was there before the renderer started and every run took the copy path. The
+    // GPU doesn't see CPU protection, so those pages are made read-write (as the rest of the view) while the heap is opened and
+    // restored after. REGPU_NO_MAP_UNGUARD=1: as found.
+    std::vector<std::pair<std::pair<void*, size_t>, DWORD>> guarded;
+    if (!getenv("REGPU_NO_MAP_UNGUARD"))
+    {
+        uint8_t* at = GuestPtr<uint8_t>(0xA0000000);
+        uint8_t* const end = at + 0x20000000;
+        MEMORY_BASIC_INFORMATION mbi{};
+        while (at < end && VirtualQuery(at, &mbi, sizeof(mbi)))
+        {
+            const size_t size = std::min<size_t>(mbi.RegionSize - (at - static_cast<uint8_t*>(mbi.BaseAddress)), end - at);
+            DWORD old = 0;
+            if (mbi.State == MEM_COMMIT && ((mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) && VirtualProtect(at, size, PAGE_READWRITE, &old))
+                guarded.push_back({ { at, size }, old });
+            at += size;
+        }
+        if (!guarded.empty())
+            Log("renderer: %zu no-access range(s) in guest physical memory made readable while the heap is opened", guarded.size());
+    }
+    struct Restore
+    {
+        std::vector<std::pair<std::pair<void*, size_t>, DWORD>>& ranges;
+        ~Restore()
+        {
+            for (const auto& [range, old] : ranges)
+            {
+                DWORD unused = 0;
+                VirtualProtect(range.first, range.second, old, &unused);
+            }
+        }
+    } restore{ guarded };
+    ComPtr<ID3D12Device13> d13;
+    HRESULT hr = getenv("REGPU_FORCE_DEVICE3") ? E_NOINTERFACE : d->QueryInterface(IID_PPV_ARGS(&d13)); // (REGPU_FORCE_DEVICE3: test the fallback)
+    if (SUCCEEDED(hr))
+        hr = d13->OpenExistingHeapFromFileMapping(RegpuPhysicalSection(), IID_PPV_ARGS(&g_r.physicalHeap));
+    if (FAILED(hr) && d13)
+    {
+        Log("renderer: OpenExistingHeapFromFileMapping failed %08X; trying the view address", unsigned(hr));
+        hr = d13->OpenExistingHeapFromAddress1(GuestPtr(0xA0000000), 0x20000000, IID_PPV_ARGS(&g_r.physicalHeap));
+}
+// Older runtimes (Windows 10, older drivers) have no ID3D12Device13, but ID3D12Device3 (Windows 10
+// 1709+) opens a heap over the whole allocation an address is in: the 512 MB view of guest
+// physical memory at 0xA0000000 is exactly that. The self-test below checks the GPU sees it.
+// (From the FM2 port: 211 fps against 150 on the copy path there.) Also when ID3D12Device13's calls
+// fail: under ReXGlue on one PC both returned E_INVALIDARG while this one works (FH1 on the copy
+// path: 7 ms a frame of vertex copies, 63 fps against stock's 96).
+if (FAILED(hr))
+{
+    if (d13)
+        Log("renderer: mapping guest memory: OpenExistingHeapFromAddress1 failed %08X; trying ID3D12Device3", unsigned(hr));
+    ComPtr<ID3D12Device3> d3;
+    if (SUCCEEDED(hr = d->QueryInterface(IID_PPV_ARGS(&d3))))
+        hr = d3->OpenExistingHeapFromAddress(GuestPtr(0xA0000000), IID_PPV_ARGS(&g_r.physicalHeap));
+    if (SUCCEEDED(hr))
+        Log("renderer: guest memory opened through ID3D12Device3, %llu MB", (unsigned long long)(g_r.physicalHeap->GetDesc().SizeInBytes >> 20));
+    else
+        Log("renderer: mapping guest memory: ID3D12Device3 failed %08X", unsigned(hr));
+}
+if (SUCCEEDED(hr))
+{
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = g_r.physicalHeap->GetDesc().SizeInBytes;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    if (FAILED(hr = d->CreatePlacedResource(g_r.physicalHeap.Get(), 0, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_r.physical))))
+    {
+        Log("renderer: placing the guest memory buffer failed %08X", unsigned(hr));
+        g_r.physical.Reset();
+    }
+}
+// The calls can succeed on a driver that doesn't alias the memory (vkd3d-proton on RADV): test it.
+// REGPU_NO_HEAP_SELFTEST=1 trusts the mapping (A/B).
+if (g_r.physical && !getenv("REGPU_NO_HEAP_SELFTEST") && !PhysicalHeapAliasesGuest(d, g_r.physical.Get()))
+{
+    Log("renderer: the GPU does not see guest memory through the mapped heap; vertex data is copied instead");
+    g_r.physical.Reset();
+    g_r.physicalHeap.Reset();
+}
+Log("renderer: guest memory %s", g_r.physical ? "mapped for the GPU (zero-copy vertex fetch)" : "not mappable; vertex data is copied");
+// For a port's launcher ("Reduced performance" warning): what this PC actually got.
+if (FILE* f = _wfopen((regpu::GetConfig().userDir / "zero_copy.txt").c_str(), L"w"))
+{
+    fputs(g_r.physical ? "1" : "0", f);
+    fclose(f);
+}
+}
+
 void Init()
 {
     g_r.device = RenderDevice();
@@ -1470,66 +1571,7 @@ void Init()
     d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.srvHeap.Get(), kBindlessBase + 2, g_r.srvStride));
 
     InitPipelineLibrary(d);
-    // Guest physical memory for the GPU, in place: vertex fetches read it
-    // without copies.
-    ComPtr<ID3D12Device13> d13;
-    HRESULT hr = getenv("REGPU_FORCE_DEVICE3") ? E_NOINTERFACE : d->QueryInterface(IID_PPV_ARGS(&d13)); // (REGPU_FORCE_DEVICE3: test the fallback)
-    if (SUCCEEDED(hr))
-        hr = d13->OpenExistingHeapFromFileMapping(RegpuPhysicalSection(), IID_PPV_ARGS(&g_r.physicalHeap));
-    if (FAILED(hr) && d13)
-    {
-        Log("renderer: OpenExistingHeapFromFileMapping failed %08X; trying the view address", unsigned(hr));
-        hr = d13->OpenExistingHeapFromAddress1(GuestPtr(0xA0000000), 0x20000000, IID_PPV_ARGS(&g_r.physicalHeap));
-    }
-    // Older runtimes (Windows 10, older drivers) have no ID3D12Device13, but ID3D12Device3 (Windows 10
-    // 1709+) opens a heap over the whole allocation an address is in: the 512 MB view of guest
-    // physical memory at 0xA0000000 is exactly that. The self-test below checks the GPU sees it.
-    // (From the FM2 port: 211 fps against 150 on the copy path there.)
-    if (FAILED(hr) && !d13)
-    {
-        ComPtr<ID3D12Device3> d3;
-        if (SUCCEEDED(hr = d->QueryInterface(IID_PPV_ARGS(&d3))))
-            hr = d3->OpenExistingHeapFromAddress(GuestPtr(0xA0000000), IID_PPV_ARGS(&g_r.physicalHeap));
-        if (SUCCEEDED(hr))
-            Log("renderer: guest memory opened through ID3D12Device3 (no ID3D12Device13), %llu MB",
-                (unsigned long long)(g_r.physicalHeap->GetDesc().SizeInBytes >> 20));
-        else
-            Log("renderer: mapping guest memory: no ID3D12Device13, and ID3D12Device3 failed %08X", unsigned(hr));
-    }
-    else if (FAILED(hr))
-        Log("renderer: mapping guest memory: OpenExistingHeapFromAddress1 failed %08X", unsigned(hr));
-    if (SUCCEEDED(hr))
-    {
-        D3D12_RESOURCE_DESC bd{};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = g_r.physicalHeap->GetDesc().SizeInBytes;
-        bd.Height = 1;
-        bd.DepthOrArraySize = 1;
-        bd.MipLevels = 1;
-        bd.SampleDesc.Count = 1;
-        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
-        if (FAILED(hr = d->CreatePlacedResource(g_r.physicalHeap.Get(), 0, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_r.physical))))
-        {
-            Log("renderer: placing the guest memory buffer failed %08X", unsigned(hr));
-            g_r.physical.Reset();
-        }
-    }
-    // The calls can succeed on a driver that doesn't alias the memory (vkd3d-proton on RADV): test it.
-    // REGPU_NO_HEAP_SELFTEST=1 trusts the mapping (A/B).
-    if (g_r.physical && !getenv("REGPU_NO_HEAP_SELFTEST") && !PhysicalHeapAliasesGuest(d, g_r.physical.Get()))
-    {
-        Log("renderer: the GPU does not see guest memory through the mapped heap; vertex data is copied instead");
-        g_r.physical.Reset();
-        g_r.physicalHeap.Reset();
-    }
-    Log("renderer: guest memory %s", g_r.physical ? "mapped for the GPU (zero-copy vertex fetch)" : "not mappable; vertex data is copied");
-    // For a port's launcher ("Reduced performance" warning): what this PC actually got.
-    if (FILE* f = _wfopen((regpu::GetConfig().userDir / "zero_copy.txt").c_str(), L"w"))
-    {
-        fputs(g_r.physical ? "1" : "0", f);
-        fclose(f);
-    }
+    MapGuestMemory(d);
 
     // Views for the EDRAM surfaces (created on first use).
     hd.NumDescriptors = kMaxSurfaces;
@@ -1953,6 +1995,9 @@ void BeginFrameIfNeeded()
     }
     f.ringUsed = 0;
     f.uploads.clear();
+    // Guest memory not mapped at init: try again a few times (see MapGuestMemory).
+    if (!g_r.physical && (g_r.frame == 30 || g_r.frame == 120 || g_r.frame == 600 || g_r.frame == 2400) && !getenv("REGPU_NO_MAP_RETRY"))
+        MapGuestMemory(g_r.device);
     // Per-frame table: t0 this frame's ring, t1 guest physical memory.
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
@@ -2104,14 +2149,32 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
 {
     FrameResources& f = Frame();
     const uint8_t* src = GuestPtr<uint8_t>(guest);
-    // A range that isn't readable guest memory (see GuestReadable) is uploaded as zeros.
+    // A range that isn't all readable guest memory (see GuestReadable) is uploaded as its readable
+    // start and zeros past it. A title's buffer can run past its allocation into a page the host
+    // never committed (FH1's minimap geometry ring: its last 48 KB block ends 4 KB past it); zeroing
+    // the whole range dropped what that block drew (the route and the player arrow, every few
+    // frames). Not cached: rare, and the hash would read past the readable part.
+    // REGPU_UPLOAD_ZERO_UNREADABLE=1: all zeros, as before.
     auto zeros = [&] {
+        static LiveSwitch allZeros("REGPU_UPLOAD_ZERO_UNREADABLE");
+        size_t readable = 0;
+        while (!allZeros && readable < bytes)
+        {
+            MEMORY_BASIC_INFORMATION mbi{};
+            const DWORD ok = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE;
+            if (!VirtualQuery(src + readable, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || !(mbi.Protect & ok) || (mbi.Protect & PAGE_GUARD))
+                break;
+            readable = std::min<size_t>(bytes, uintptr_t(mbi.BaseAddress) + mbi.RegionSize - uintptr_t(src));
+        }
         static std::atomic<uint32_t> logged{ 0 };
         if (logged++ < 8)
-            Log("upload: %08X (%u bytes) is not readable guest memory: zeros", guest, bytes);
+            Log("upload: %08X (%u bytes) is not all readable guest memory: %zu bytes copied, zeros after", guest, bytes, readable);
         const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
         if (offset != ~0ull)
-            memset(f.ringCpu + offset, 0, bytes);
+        {
+            memcpy(f.ringCpu + offset, src, readable);
+            memset(f.ringCpu + offset + readable, 0, bytes - readable);
+        }
         return offset;
     };
     // Small buffers are often rewritten between draws (UI quads), so hash all
