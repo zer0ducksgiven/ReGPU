@@ -350,6 +350,7 @@ struct ResolvedTexture
     uint64_t memHash = 0, memChecked = 0;
     bool stale = false;
     uint32_t guestBpp = 4; // bytes per pixel of the guest image: the hash covers only its memory
+    uint32_t guestFormat = 0; // the copy's destination format (RB_COPY_DEST_INFO bits 7-12)
     // The title resolves differently sized images (bloom chain) to one address within a
     // frame: keep earlier sizes here and swap them in rather than recreating them.
     std::vector<ResolvedTexture> spares;
@@ -5344,28 +5345,54 @@ bool InitUpscale()
 // toe: without it the picture was ~20% brighter than the console's). REGPU_NO_GAMMA=1 shows the front buffer as is.
 std::atomic<uint32_t> g_gammaTable[256];
 std::atomic<bool> g_gammaSet{ false };
+// The piecewise-linear ramp (DC_LUT_PWL_DATA), which the display uses for a k_2_10_10_10 front
+// buffer (as Xenia decides, after D3D's InitializePresentationParameters: the table for 8_8_8_8,
+// PWL for 2_10_10_10). FH1 presents 2_10_10_10 with a PWL ramp that darkens the low end (1/16 to
+// 0.017); shown through its identity table instead, shadows were too bright against stock
+// (festival stand wall 21.5 vs 16.6, now 16.8).
+std::atomic<uint32_t> g_gammaPwl[128][3];
+std::atomic<bool> g_gammaPwlSet{ false };
 ComPtr<ID3D12Resource> g_gammaOut;
 ComPtr<ID3D12Resource> g_enhanceOut; // enhanced lighting output (Settings::enhance)
 
-// Returns the graded copy of `image` (in COPY_SOURCE state), or null to show it as is.
-ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image)
+// Returns the graded copy of `image` (in COPY_SOURCE state), or null to show it as is. `pwl`: the
+// front buffer is k_2_10_10_10, so the display uses the PWL ramp. REGPU_NO_GAMMA_PWL=1: always the table.
+ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
 {
-    static LiveSwitch off("REGPU_NO_GAMMA");
-    if (off || !g_gammaSet.load(std::memory_order_relaxed) || !InitUpscale())
+    static LiveSwitch off("REGPU_NO_GAMMA"), noPwl("REGPU_NO_GAMMA_PWL");
+    pwl = pwl && !noPwl && g_gammaPwlSet.load(std::memory_order_relaxed);
+    if (off || (!pwl && !g_gammaSet.load(std::memory_order_relaxed)) || !InitUpscale())
         return nullptr;
-    // 17 points of the table (green; the title writes equal channels), at x = k/16.
+    // 17 points of the ramp (green; the title writes equal channels), at x = k/16.
     float points[17];
     bool identity = true;
     for (uint32_t k = 0; k <= 16; k++)
     {
-        const float at = k * 255.0f / 16.0f;
-        const uint32_t i = std::min(uint32_t(at), 254u);
-        const float t = at - float(i);
-        const float a = float((g_gammaTable[i].load(std::memory_order_relaxed) >> 10) & 0x3FF) / 1023.0f;
-        const float b = float((g_gammaTable[i + 1].load(std::memory_order_relaxed) >> 10) & 0x3FF) / 1023.0f;
-        points[k] = a + (b - a) * t;
+        if (pwl)
+        {
+            // A 10-bit value: its top 7 bits pick the entry, its low 3 step along the delta
+            // (base and delta are 16-bit, bits 0-5 zero).
+            const uint32_t v = std::min(k * 1023u / 16u, 1023u), e = g_gammaPwl[v >> 3][1].load(std::memory_order_relaxed);
+            points[k] = float(std::min((e & 0xFFFF) + (((e >> 16) * (v & 7)) >> 3), 0xFFFFu)) / 65535.0f;
+        }
+        else
+        {
+            const float at = k * 255.0f / 16.0f;
+            const uint32_t i = std::min(uint32_t(at), 254u);
+            const float t = at - float(i);
+            const float a = float((g_gammaTable[i].load(std::memory_order_relaxed) >> 10) & 0x3FF) / 1023.0f;
+            const float b = float((g_gammaTable[i + 1].load(std::memory_order_relaxed) >> 10) & 0x3FF) / 1023.0f;
+            points[k] = a + (b - a) * t;
+        }
         identity &= std::fabs(points[k] - k / 16.0f) < 0.002f;
     }
+    static std::atomic<uint64_t> loggedHash{ 0 };
+    static std::atomic<int> logs{ 0 }; // (titles fade the ramp in: the first few changes)
+    uint64_t h = pwl ? 1 : 2;
+    for (float pt : points)
+        h = (h ^ uint32_t(pt * 65535.0f)) * 0x100000001B3ull;
+    if (loggedHash.exchange(h) != h && logs++ < 4)
+        Log("gamma: display ramp (%s): %.3f %.3f %.3f %.3f %.3f ... %.3f", pwl ? "PWL" : "table", points[0], points[1], points[2], points[4], points[8], points[16]);
     if (identity)
         return nullptr;
     const D3D12_RESOURCE_DESC desc = image->GetDesc();
@@ -5834,6 +5861,7 @@ void Resolve()
         if (g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
             UpscaleScene(base);
         g_r.resolved[base].swapped = swapRB;
+        g_r.resolved[base].guestFormat = depth ? 0u : destFormat;
         // Images the game reads on the CPU are also written to memory (regpu.h Host::resolveWriteback;
         // without it, REGPU_RESOLVE_WRITEBACK's "WxH,WxH" sizes of 8888 colour, at once).
         regpu::Writeback request;
@@ -9346,7 +9374,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (fromResolve)
     {
         image = it->second.resource.Get();
-        graded = GradeFrontBuffer(image);
+        graded = GradeFrontBuffer(image, it->second.guestFormat == 7);
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = image;
@@ -9699,6 +9727,15 @@ void RendererSetGammaEntry(uint32_t index, uint32_t rgb10)
     {
         g_gammaTable[index].store(rgb10, std::memory_order_relaxed);
         g_gammaSet.store(true, std::memory_order_relaxed);
+    }
+}
+
+void RendererSetGammaPwl(uint32_t index, uint32_t component, uint32_t data)
+{
+    if (index < 128 && component < 3)
+    {
+        g_gammaPwl[index][component].store(data, std::memory_order_relaxed);
+        g_gammaPwlSet.store(true, std::memory_order_relaxed);
     }
 }
 

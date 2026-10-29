@@ -697,16 +697,38 @@ constexpr uint32_t SCRATCH_ADDR = 0x01DD;
 // mask bit set are mirrored to memory: D3D's fences rely on it.
 // The display's gamma table (DC_LUT_*): the title writes the entry index, then the entry
 // (10:10:10 RGB). The presenter applies it, as the display hardware does.
-constexpr uint32_t DC_LUT_RW_INDEX = 0x1922, DC_LUT_30_COLOR = 0x1925;
-uint32_t g_lutIndex = 0;
+// In PWL mode (DC_LUT_RW_MODE bit 0) the title writes the piecewise-linear ramp instead: 128
+// entries of base and delta, each as red, green, blue writes (those the write-enable mask, blue
+// green red, allows), the index stepping after blue. As Xenia does.
+constexpr uint32_t DC_LUT_RW_MODE = 0x1921, DC_LUT_RW_INDEX = 0x1922, DC_LUT_PWL_DATA = 0x1924, DC_LUT_30_COLOR = 0x1925,
+                   DC_LUT_WRITE_EN_MASK = 0x1927;
+uint32_t g_lutIndex = 0, g_lutComponent = 0;
+
+void WriteLut(uint32_t index, uint32_t value)
+{
+    if (index == DC_LUT_RW_INDEX)
+    {
+        g_lutIndex = value & 0xFF;
+        g_lutComponent = 0;
+    }
+    else if (index == DC_LUT_30_COLOR)
+        RendererSetGammaEntry(g_lutIndex++ & 0xFF, value);
+    else if (index == DC_LUT_PWL_DATA && (Reg(DC_LUT_RW_MODE) & 1))
+    {
+        if ((Reg(DC_LUT_WRITE_EN_MASK) >> (2 - g_lutComponent)) & 1)
+            RendererSetGammaPwl(g_lutIndex & 0x7F, g_lutComponent, value);
+        if (++g_lutComponent == 3)
+        {
+            g_lutComponent = 0;
+            g_lutIndex = (g_lutIndex & 0x80) | ((g_lutIndex + 1) & 0x7F);
+        }
+    }
+}
 
 void WriteRegister(uint32_t index, uint32_t value)
 {
     SetReg(index, value);
-    if (index == DC_LUT_RW_INDEX)
-        g_lutIndex = value & 0xFF;
-    else if (index == DC_LUT_30_COLOR)
-        RendererSetGammaEntry(g_lutIndex++ & 0xFF, value);
+    WriteLut(index, value);
     if (seg::g_open)
     {
         const uint32_t be[2] = { index, __builtin_bswap32(value) };
@@ -1640,10 +1662,7 @@ void regpu::driver::WriteRegister(uint32_t index, uint32_t value)
     // calibration): without it the presenter showed the identity ramp and the image's tones were
     // off against the console's. (The rest of WriteRegister records into the command stream: not
     // from a guest thread.)
-    if (index == DC_LUT_RW_INDEX)
-        g_lutIndex = value & 0xFF;
-    else if (index == DC_LUT_30_COLOR)
-        RendererSetGammaEntry(g_lutIndex++ & 0xFF, value);
+    WriteLut(index, value);
 }
 
 #if REGPU_GUEST_EXPORTS

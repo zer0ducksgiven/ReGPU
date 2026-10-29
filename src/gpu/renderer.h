@@ -20,6 +20,8 @@ bool RendererCompileIdle();
 void RendererSaveCaches();
 // The display gamma table entry `index` (10:10:10 RGB), applied when presenting.
 void RendererSetGammaEntry(uint32_t index, uint32_t rgb10);
+// One entry of the display's piecewise-linear gamma ramp (DC_LUT_PWL_DATA: base, delta), 0-127, per channel.
+void RendererSetGammaPwl(uint32_t index, uint32_t component, uint32_t data);
 // Benchmark: frame times are recorded while on; the report summarises them.
 void BenchmarkRecord(bool on);
 void BenchmarkWriteReport(const char* path);
