@@ -696,8 +696,7 @@ struct Emitter
                 : "float3(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ", " + reg +
                 comp[(f.srcSwizzle >> 4) & 3] + ")";
             char call[320];
-            static const bool lean = getenv("REGPU_LEAN_FETCH") != nullptr; // Preamble()
-            if (lean && pixel && f.dimension == 1)
+            if (LeanFetch() && pixel && f.dimension == 1)
                 snprintf(call, sizeof(call), "TFetch2D(%u, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
                     f.denormalized ? "true" : "false", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
             else
@@ -991,7 +990,6 @@ namespace
 // fetch in a pixel shader (the instruction's dimension) samples once, through the static samplers
 // as an array indexed by the fetch constant's filter, instead of one branch per sampler, and has
 // no 3D or cube paths. Full-screen post shaders make a dozen fetches a pixel (FH1's shadow mask).
-const bool g_leanFetch = getenv("REGPU_LEAN_FETCH") != nullptr;
 
 const char kLeanFetch[] = R"(
 SamplerState gsamp[8] : register(s0, space1); // s0-s7 again, as a table (renderer.cpp)
@@ -1040,11 +1038,16 @@ float4 TFetch2D(uint slot, float3 coord, bool denorm, float bias, float2 texel)
 std::string Preamble()
 {
     std::string h = kPreamble;
-    return g_leanFetch ? h + kLeanFetch : h;
+    return LeanFetch() ? h + kLeanFetch : h;
 }
 } // namespace
 
-bool LeanFetch() { return g_leanFetch; }
+// Read at first use (the renderer's root signature), not at load: a port may set it before Start.
+bool LeanFetch()
+{
+    static const bool lean = getenv("REGPU_LEAN_FETCH") != nullptr;
+    return lean;
+}
 
 bool BakedVertexFetch()
 {
