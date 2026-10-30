@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include "gpu/hlsl.h"
 #include "live_switch.h"
@@ -49,10 +50,14 @@ ByteAddressBuffer gphys : register(t1);   // guest physical memory (large vertex
 Texture2D<float4> gtex[] : register(t0, space1);
 TextureCube<float4> gcube[] : register(t0, space2);
 Texture3D<float4> gvol[] : register(t0, space3);
-SamplerState sLinearWrap : register(s0);
-SamplerState sLinearClamp : register(s1);
-SamplerState sPointClamp : register(s2);
-SamplerState sPointWrap : register(s3);
+// The four guest samplers as one array (a descriptor table, renderer.cpp), indexed by the fetch's mode
+// (0 linear wrap, 1 linear clamp, 2 point clamp, 3 point wrap): one sample instruction per fetch instead
+// of a branch to each of four.
+SamplerState gSamplers[4] : register(s0);
+#define sLinearWrap gSamplers[0]
+#define sLinearClamp gSamplers[1]
+#define sPointClamp gSamplers[2]
+#define sPointWrap gSamplers[3]
 
 static const float FLT_MAX = 3.402823466e+38;
 
@@ -273,10 +278,7 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
         Texture3D<float4> tv = gvol[index];
         const uint vmode = tinfo[slot].x & 3u;
         if (vertexStage) return tv.SampleLevel(sLinearClamp, coord, max(bias, 0));
-        if (vmode == 1) return tv.SampleBias(sLinearClamp, coord, bias);
-        if (vmode == 2) return tv.SampleBias(sPointClamp, coord, bias);
-        if (vmode == 3) return tv.SampleBias(sPointWrap, coord, bias);
-        return tv.SampleBias(sLinearWrap, coord, bias);
+        return tv.SampleBias(gSamplers[vmode], coord, bias);
     }
     if ((tinfo[slot].w & 0xFFu) == 3)
     {
@@ -287,6 +289,11 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
     if (denorm) uv = (uv + texel) / texelSize;
     else uv += texel / texelSize;
+    // Mirrored (tinfo.x bits 20 U, 21 V: repeating; 22 U, 23 V: once, then clamped below).
+    if ((tinfo[slot].x >> 20) & 1u) uv.x = 1.0 - abs(frac(uv.x * 0.5) * 2.0 - 1.0);
+    if ((tinfo[slot].x >> 21) & 1u) uv.y = 1.0 - abs(frac(uv.y * 0.5) * 2.0 - 1.0);
+    if ((tinfo[slot].x >> 22) & 1u) uv.x = abs(uv.x);
+    if ((tinfo[slot].x >> 23) & 1u) uv.y = abs(uv.y);
     // Clamp to border (tinfo.x bit 16; bit 17 white): outside the image the border colour, as
     // shadow maps rely on (white: nothing casts a shadow beyond the map).
     if (((tinfo[slot].x >> 16) & 1u) && any(uv < 0.0 || uv > 1.0))
@@ -300,17 +307,10 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     // Vertex shaders read data tables this way (PGR4's riders: bone matrices, three texels a bone):
     // the fetch constant's filter applies, point sampling exactly one texel. Always linear here,
     // each matrix row was blended with its neighbours and the bodies came out mangled.
-    // (fxc wants a literal sampler per call: one branch each.)
-    if (vertexStage && mode == 2)
-        return t.SampleLevel(sPointClamp, uv, max(bias, 0));
-    if (vertexStage && mode == 3)
-        return t.SampleLevel(sPointWrap, uv, max(bias, 0));
+    // (Linear filtering clamps there: mode 0 reads as 1.)
     if (vertexStage)
-        return t.SampleLevel(sLinearClamp, uv, max(bias, 0));
-    if (mode == 1) return REGPU_SAMPLE_BIAS_2D(t, sLinearClamp, uv, bias);
-    if (mode == 2) return REGPU_SAMPLE_BIAS_2D(t, sPointClamp, uv, bias);
-    if (mode == 3) return REGPU_SAMPLE_BIAS_2D(t, sPointWrap, uv, bias);
-    return REGPU_SAMPLE_BIAS_2D(t, sLinearWrap, uv, bias);
+        return t.SampleLevel(gSamplers[max(mode, 1u)], uv, max(bias, 0));
+    return REGPU_SAMPLE_BIAS_2D(t, gSamplers[mode], uv, bias);
 }
 
 float4 CubeOp(float4 a, float4 b)
@@ -410,6 +410,15 @@ struct Emitter
 
     static std::string Masked(const std::string& target, const std::string& value, uint32_t mask)
     {
+        // One swizzled write for the components in order (r.xyz = v.xyz), unless REGPU_FULL_ALU.
+        if (!FullAlu() && std::popcount(mask & 15u) > 1)
+        {
+            std::string comps;
+            for (int c = 0; c < 4; c++)
+                if ((mask >> c) & 1)
+                    comps += "xyzw"[c];
+            return target + "." + comps + " = " + value + "." + comps + "; ";
+        }
         std::string s;
         for (int c = 0; c < 4; c++)
         {
@@ -529,11 +538,32 @@ struct Emitter
         }
     }
 
+    // REGPU_FULL_ALU=1: every instruction computes both halves through v and s, and masked writes go one
+    // component at a time, as before (A/B).
+    static bool FullAlu()
+    {
+        static const bool full = getenv("REGPU_FULL_ALU") != nullptr;
+        return full;
+    }
+
     void EmitAlu(const Alu& a)
     {
-        std::string body = "{ float4 v = float4(0, 0, 0, 0); float s = ps; ";
+        // Leaner code for the common cases, the same results: the scalar half "retain previous" (op 50,
+        // unclamped, unwritten) leaves ps as it is, and a vector result nothing reads (no component
+        // written, no predicate, kill or address side effect) isn't computed. Shaders compile without
+        // optimisation, so all of it reached the GPU's compiler as written (FM2 port: 229 -> 240 fps).
+        const bool lean = !FullAlu();
+        const bool scalarKept = lean && a.scalarOp == 50 && !a.scalarClamp && !a.scalarMask;
+        const bool vectorSideEffect = (a.vectorOp >= 20 && a.vectorOp <= 27) || a.vectorOp == 29;
+        const bool vectorUnused = lean && !a.vectorMask && !vectorSideEffect &&
+            !(a.exportData && a.scalarDestRelative); // (a relative export zeroes the unwritten components)
+        if (scalarKept && vectorUnused && !a.exportData)
+            return; // a no-op
+        std::string body = std::string("{ ") + (vectorUnused ? "" : "float4 v = float4(0, 0, 0, 0); ") + (scalarKept ? "" : "float s = ps; ");
         const std::string A = Src(a.src[0]), B = Src(a.src[1]), C = Src(a.src[2]);
-        if (a.vectorOp >= 20 && a.vectorOp <= 23)
+        if (vectorUnused)
+            ;
+        else if (a.vectorOp >= 20 && a.vectorOp <= 23)
         {
             static const char* cmp[] = { "== 0.0", "!= 0.0", "> 0.0", ">= 0.0" };
             // SETP_*_PUSH (Xenia ucode.h): p = src0.w == 0 && src1.w <op> 0; dest = 0 when
@@ -553,14 +583,16 @@ struct Emitter
         }
         else
             body += "v = " + VectorExpr(a, A, B, C) + "; ";
-        if (a.vectorClamp)
+        if (a.vectorClamp && !vectorUnused)
             body += "v = saturate(v); ";
-        body += ScalarCode(a) + " ";
+        if (!scalarKept)
+            body += ScalarCode(a) + " ";
         if (a.vectorOp == 29) // MAXAv: a0 from the first operand's W, after the reads
             body += "a0 = clamp(int(floor((" + A + ").w + 0.5)), -256, 255); ";
         if (a.scalarClamp)
             body += "s = saturate(s); ";
-        body += "ps = s; ";
+        if (!scalarKept)
+            body += "ps = s; ";
 
         if (a.exportData)
         {

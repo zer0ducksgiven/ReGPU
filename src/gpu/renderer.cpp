@@ -453,6 +453,7 @@ struct Renderer
 
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12DescriptorHeap> srvHeap;     // shader visible
+    ComPtr<ID3D12DescriptorHeap> samplerHeap; // shader visible: the four guest samplers (root table 4)
     ComPtr<ID3D12DescriptorHeap> stagingHeap; // CPU: null texture SRV
     UINT srvStride = 0;
     ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap;
@@ -1502,7 +1503,7 @@ void Init()
         bindless[i].RegisterSpace = 1 + i;
         bindless[i].OffsetInDescriptorsFromTableStart = 0;
     }
-    D3D12_ROOT_PARAMETER params[5]{};
+    D3D12_ROOT_PARAMETER params[6]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -1540,20 +1541,50 @@ void Init()
         samplers[i].ShaderRegister = i;
         samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
+    // The samplers sit in a descriptor table, not static samplers: the fetch helper indexes them by the
+    // fetch's mode (one sample instruction instead of a branch to each of four), and a shader can't index
+    // static samplers (FM2 port: 214 -> 225 fps).
+    D3D12_DESCRIPTOR_RANGE samplerRange{};
+    samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+    samplerRange.NumDescriptors = 4;
+    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[4].DescriptorTable.NumDescriptorRanges = 1;
+    params[4].DescriptorTable.pDescriptorRanges = &samplerRange;
+    params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC sh{};
+        sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        sh.NumDescriptors = 4;
+        sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        Check(d->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&g_r.samplerHeap)), "CreateDescriptorHeap(samplers)");
+        const UINT stride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        for (UINT i = 0; i < 4; i++)
+        {
+            D3D12_SAMPLER_DESC sd{};
+            sd.Filter = samplers[i].Filter;
+            sd.AddressU = samplers[i].AddressU;
+            sd.AddressV = samplers[i].AddressV;
+            sd.AddressW = samplers[i].AddressW;
+            sd.MaxAnisotropy = samplers[i].MaxAnisotropy;
+            sd.ComparisonFunc = samplers[i].ComparisonFunc;
+            sd.MaxLOD = samplers[i].MaxLOD;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetCPUDescriptorHandleForHeapStart();
+            h.ptr += size_t(i) * stride;
+            d->CreateSampler(&sd, h);
+        }
+    }
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 4;
+    rs.NumParameters = 5;
     rs.pParameters = params;
-    rs.NumStaticSamplers = 4;
-    rs.pStaticSamplers = samplers;
     ComPtr<ID3DBlob> blob, error;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
         Fatal("renderer: root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
     Check(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_r.rootSignature)), "CreateRootSignature");
     // Motion-vector pipelines: the same plus b2, last frame's vertex constants of the draw.
-    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[4].Descriptor.ShaderRegister = 2;
-    params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    rs.NumParameters = 5;
+    params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[5].Descriptor.ShaderRegister = 2;
+    params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rs.NumParameters = 6;
     blob.Reset();
     error.Reset();
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
@@ -1764,6 +1795,7 @@ LiveSwitch g_sw_REGPU_NO_FETCH_BOUNDS("REGPU_NO_FETCH_BOUNDS");
 LiveSwitch g_sw_REGPU_NO_GPU_SWIZZLE("REGPU_NO_GPU_SWIZZLE");
 LiveSwitch g_sw_REGPU_NO_HUD_SQUEEZE("REGPU_NO_HUD_SQUEEZE");
 LiveSwitch g_sw_REGPU_NO_INDEXED("REGPU_NO_INDEXED");
+LiveSwitch g_sw_REGPU_NO_STRIP_CUT("REGPU_NO_STRIP_CUT");
 LiveSwitch g_sw_REGPU_NO_KILL_SKIP("REGPU_NO_KILL_SKIP");
 LiveSwitch g_sw_REGPU_NO_LIVE_CUBE("REGPU_NO_LIVE_CUBE");
 LiveSwitch g_sw_REGPU_NO_MIPS("REGPU_NO_MIPS");
@@ -2034,8 +2066,8 @@ void BeginFrameIfNeeded()
     f.descriptorsUsed = 2;
     EvictBindless();
     ReclaimTextureBlocks();
-    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
-    C().list->SetDescriptorHeaps(1, heaps);
+    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
+    C().list->SetDescriptorHeaps(2, heaps);
     C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     g_drawState.Invalidate();
     SelectSurfaces(true);
@@ -3557,6 +3589,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.RasterizerState.CullMode = !cullable || noCull ? D3D12_CULL_MODE_NONE
         : (mode & 3) == 1 ? D3D12_CULL_MODE_FRONT : (mode & 3) == 2 ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.IBStripCutValue = key.flags & 0x100 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = kColorFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
@@ -3681,11 +3714,13 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
     return !opaque || GameSettled();
 }
 
-ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false)
+ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false)
 {
     PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
     if (motion)
         key.flags |= 4;
+    if (stripCut)
+        key.flags |= 0x100; // strips restart at index 0xFFFF (DrawImpl)
     thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (pipelines are never removed)
     // Runs of draws share a pipeline: the last one's answer first, before the map.
     thread_local PipelineKey lastKey{};
@@ -5363,8 +5398,8 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NGX may have changed the list's heaps, root signatures and pipeline: set ours again.
-    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
-    C().list->SetDescriptorHeaps(1, heaps);
+    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
+    C().list->SetDescriptorHeaps(2, heaps);
     C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     C().list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_drawState.Invalidate();
@@ -6810,8 +6845,8 @@ ID3D12GraphicsCommandList* AcquireList()
 // The state every draw list starts with.
 void ListPrologue(RecordedList& list)
 {
-    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
-    list.SetDescriptorHeaps(1, heaps);
+    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
+    list.SetDescriptorHeaps(2, heaps);
     list.SetGraphicsRootSignature(g_r.rootSignature.Get());
     list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
@@ -8015,8 +8050,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // expansion, 7 ms a frame in FH1 TU4.)
     const bool indexRewritten = RendererEarlyFences() && indexSource == 0 && prim == 13 &&
         DynamicBuffer(dmaBase & 0x1FFFFFFF, (dmaSize & 0xFFFFFF) * (((initiator >> 11) & 1) ? 4u : 2u));
+    // A strip from a 16-bit index buffer restarting at 0xFFFF is drawn indexed, the GPU restarting it
+    // (the pipeline's strip cut value), as Xenia does. Expanded on the CPU, these were copied into the
+    // ring every frame: 7 MB a frame in PGR4's races (4% of the command processor on an FX-8350).
+    // REGPU_NO_STRIP_CUT=1: expanded as before (A/B).
+    const bool stripCut = prim == 6 && restartOn && indexSource == 0 && !((initiator >> 11) & 1) &&
+        (gpureg::Get(VGT_MULTI_PRIM_IB_RESET_INDX) & 0xFFFF) == 0xFFFF && !g_sw_REGPU_NO_STRIP_CUT && !g_sw_REGPU_NO_INDEXED;
     const bool directIndex = g_r.physical && !noDirectIndex && !indexOverrun && !indexRewritten && (indexSource == 0 || indexSource == 2) &&
-        (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
+        (prim == 4 || prim == 13 || (prim == 6 && (!restartOn || stripCut)));
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
     IndexListEntry* indexEntry = directIndex ? nullptr : CachedIndexList(initiator, dmaBase, dmaSize);
     static const std::vector<uint32_t> noList;
@@ -8080,11 +8121,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const CompiledShader* mps = wantMotion ? MotionShader(ps) : nullptr;
     bool motion = mvs && mps && mvs->IsReady() && mps->IsReady();
     D3D12_GPU_VIRTUAL_ADDRESS motionPrevious = 0; // last frame's vertex constants of this draw (b2)
-    ID3D12PipelineState* pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true) : nullptr;
+    ID3D12PipelineState* pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex) : nullptr;
     if (!pso)
     {
         motion = false;
-        pso = GetPipeline(vs, ps, edramMode == 5, cullable);
+        pso = GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex);
     }
     if (!pso)
     {
@@ -8419,6 +8460,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         if (indexedCount < 3 || !GetIndexBuffer(dmaBase & 0x1FFFFFFF & ~(is32 ? 3u : 1u), count, is32, dmaSize >> 30, indexView))
             indexedCount = 0;
     }
+    if (stripCut && directIndex && !indexedCount)
+    {
+        // (The shader's own index fetch can't restart a strip.)
+        TraceSkip("strip cut", initiator);
+        g_r.skippedThisFrame++;
+        return;
+    }
     if (indexedCount)
     {
         vc->vte[1] = 1u | 8u; // the vertex ID is the index
@@ -8495,9 +8543,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     Section(4);
     // Textures are bindless: each one has a permanent descriptor in the heap's
     // bindless region, and the draw passes its index in the constants.
-    memset(pc->tinfo, 0, sizeof(pc->tinfo));
-    memset(pc->tbias, 0, sizeof(pc->tbias));
     const uint32_t usedSlots = ps.info.usedTextureSlots | vs.info.usedTextureSlots;
+    // Only the slots up to the highest used one reach the ring (below), unless whole blocks are copied:
+    // clearing all 32 was 1 KB a draw (3.5% of the command processor in PGR4's races on an FX-8350).
+    {
+        const size_t clear = g_sw_REGPU_FULL_CONSTANT_BLOCKS ? 32 : usedSlots ? 32 - uint32_t(__builtin_clz(usedSlots)) : 0;
+        memset(pc->tinfo, 0, clear * sizeof(pc->tinfo[0]));
+        memset(pc->tbias, 0, clear * sizeof(pc->tbias[0]));
+    }
     if (g_bindingsFrame != g_r.frame || g_bindingsEpoch != g_resolveEpoch)
     {
         if (!g_bindings)
@@ -8599,6 +8652,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         if (!clamp && !oldClamp)
             ti[0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
+        // Mirrored modes (1 mirrored repeat; 3, 5, 7 mirror once, then clamp): the shader folds the
+        // coordinate first (bits 20, 21 repeat; 22, 23 once), and the axis is still clamped after the
+        // fold (wrapped, the filter blends the opposite edge in). Clamped alone, a mirrored half
+        // smeared the edge column across (FM2 port: the telemetry's car diagram, as Xenia shows it).
+        static LiveSwitch noMirror("REGPU_NO_TEXTURE_MIRROR"); // A/B: mirrored modes clamped only
+        if (!oldClamp && !noMirror)
+            ti[0] |= (clampX == 1 ? 1u << 20 : 0u) | (clampY == 1 ? 1u << 21 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 22 : 0u) |
+                (clampY >= 3 && (clampY & 1) ? 1u << 23 : 0u);
         // Clamp to border on both axes (modes 6, 7): the shader returns the border colour
         // outside the image (dword 5 bits 0-1: 1 white, else black).
         if (clampX >= 6 && clampY >= 6)
@@ -8888,11 +8949,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     C().list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     C().list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
     if (motion)
-        C().list->SetGraphicsRootConstantBufferView(4, motionPrevious);
+        C().list->SetGraphicsRootConstantBufferView(5, motionPrevious);
     if (const D3D12_GPU_DESCRIPTOR_HANDLE t2 = Gpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride); t2.ptr != ds.table2.ptr)
     {
         ds.table2 = t2;
         C().list->SetGraphicsRootDescriptorTable(2, t2);
+        // (Set with table 2: it is reset whenever the root signature or the heaps change.)
+        C().list->SetGraphicsRootDescriptorTable(4, g_r.samplerHeap->GetGPUDescriptorHandleForHeapStart());
     }
     if (const D3D12_GPU_DESCRIPTOR_HANDLE t3 = Gpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride); t3.ptr != ds.table3.ptr)
     {
