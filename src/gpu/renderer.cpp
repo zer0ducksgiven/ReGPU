@@ -408,6 +408,16 @@ struct PipelineKey
     uint32_t biasScale = 0, biasOffset = 0; // polygon offset (float bits), 0 when off
     bool operator==(const PipelineKey&) const = default;
 };
+// A polygon offset (float bits) rounded to 4 mantissa bits (within 3%): pipelines keyed by it. PGR4
+// moves one pass's offset a little every frame (1.5e-4 to 2.3e-4), and each value was a new pipeline,
+// built while the frame waited: 22,000 of the FX's 23,000 cached pipelines were that one shader pair.
+// REGPU_EXACT_DEPTH_BIAS=1: exact, as before.
+uint32_t RoundedBias(uint32_t bits)
+{
+    static const bool exact = getenv("REGPU_EXACT_DEPTH_BIAS") != nullptr;
+    return exact || (bits & 0x7F800000) == 0x7F800000 ? bits : (bits + (1u << 18)) & ~((1u << 19) - 1);
+}
+
 struct PipelineKeyHash
 {
     size_t operator()(const PipelineKey& k) const
@@ -483,7 +493,7 @@ struct Renderer
     std::unordered_map<uint64_t, CachedTexture> textures;
     std::unordered_map<uint64_t, CachedTexture> cubes;
     std::unordered_map<uint64_t, CachedTexture> volumes; // 3D textures
-    std::unordered_map<uint32_t, CachedTexture> mipChains; // resolved textures with their mips, by base
+    std::unordered_map<uint64_t, CachedTexture> mipChains; // resolved textures with their mips, by base and shape
     // Bindless texture descriptors.
     struct BindlessEntry
     {
@@ -885,26 +895,31 @@ uint64_t Fnv(const void* data, size_t bytes, uint64_t h = 0xCBF29CE484222325ull)
     return h;
 }
 
-// Every byte of the data, four independent 64-bit lanes at a time (a dword-by-dword chain waits on each
-// multiply). For data whose every byte matters and that is checked every frame: index buffers.
+// Every byte of the data. For data whose every byte matters and that is checked every frame: index buffers.
 uint64_t FullHash(const uint8_t* data, size_t bytes)
 {
-    uint64_t a = 0xCBF29CE484222325ull ^ bytes, b = 0x9E3779B97F4A7C15ull, c = 0xC2B2AE3D27D4EB4Full, d = 0x165667B19E3779F9ull;
+    // Every byte, 32 at a time in SSE2 lanes (XXH3's accumulate: 32x32-bit multiplies); 64-bit
+    // multiplies were the cost on older CPUs (an FX-8350 hashing PGR4's 7 MB of strips a frame).
+    const __m128i k0 = _mm_set_epi64x(0xC2B2AE3D27D4EB4Full, 0x9E3779B97F4A7C15ull), k1 = _mm_set_epi64x(0xFF51AFD7ED558CCDull, 0x165667B19E3779F9ull);
+    __m128i a0 = _mm_set_epi64x(0, int64_t(bytes)), a1 = k1;
     size_t i = 0;
     for (; i + 32 <= bytes; i += 32)
     {
-        uint64_t v[4];
-        memcpy(v, data + i, 32);
-        a = (a ^ v[0]) * 0xFF51AFD7ED558CCDull;
-        b = (b ^ v[1]) * 0xC4CEB9FE1A85EC53ull;
-        c = (c ^ v[2]) * 0xFF51AFD7ED558CCDull;
-        d = (d ^ v[3]) * 0xC4CEB9FE1A85EC53ull;
-        a ^= a >> 29; b ^= b >> 31; c ^= c >> 29; d ^= d >> 31;
+        const __m128i d0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
+        const __m128i d1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i + 16));
+        const __m128i x0 = _mm_xor_si128(d0, k0), x1 = _mm_xor_si128(d1, k1);
+        a0 = _mm_add_epi64(_mm_add_epi64(a0, _mm_shuffle_epi32(d0, 0x4E)), _mm_mul_epu32(x0, _mm_srli_epi64(x0, 32)));
+        a1 = _mm_add_epi64(_mm_add_epi64(a1, _mm_shuffle_epi32(d1, 0x4E)), _mm_mul_epu32(x1, _mm_srli_epi64(x1, 32)));
     }
+    alignas(16) uint64_t v[4];
+    _mm_store_si128(reinterpret_cast<__m128i*>(v), a0);
+    _mm_store_si128(reinterpret_cast<__m128i*>(v + 2), a1);
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (uint64_t x : v)
+        h = (h ^ x ^ (x >> 29)) * 0xFF51AFD7ED558CCDull;
     for (; i < bytes; i++)
-        a = (a ^ data[i]) * 0x100000001B3ull;
-    uint64_t h = a ^ (b * 0x9E3779B97F4A7C15ull) ^ (c * 0xC2B2AE3D27D4EB4Full) ^ (d * 0x165667B19E3779F9ull);
-    h = (h ^ (h >> 33)) * 0xFF51AFD7ED558CCDull;
+        h = (h ^ data[i]) * 0x100000001B3ull;
+    h = (h ^ (h >> 33)) * 0xC4CEB9FE1A85EC53ull;
     return h ^ (h >> 33);
 }
 
@@ -2528,6 +2543,7 @@ struct Manifest
             {
                 k.vs = vs;
                 k.ps = ps;
+                k.biasOffset = RoundedBias(k.biasOffset);
                 if (known.insert(k).second)
                     pending.push_back(k);
             }
@@ -3683,7 +3699,7 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
     const uint32_t sc = gpureg::Get(PA_SU_SC_MODE_CNTL);
     const bool polyOffset = !noPolyOffset && ((depth >> 1) & 1) && ((sc >> 11) & 3);
     const uint32_t biasScale = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2380 : 0x2382) : 0;
-    const uint32_t biasOffset = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2381 : 0x2383) : 0;
+    const uint32_t biasOffset = polyOffset ? RoundedBias(gpureg::Get((sc >> 11) & 1 ? 0x2381 : 0x2383)) : 0;
     PipelineKey key{ vsHash, psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
         uint32_t(alphaToMask) | (uint32_t(cullable) << 1) | (uint32_t(noDepthClip) << 2) };
     key.biasScale = biasScale;
@@ -4090,8 +4106,10 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
     const uint32_t hw = std::max(uint32_t(uint64_t(level0.hostWidth) * w / std::max(level0.width, 1u)), 1u);
     const uint32_t hh = std::max(uint32_t(uint64_t(level0.hostHeight) * h / std::max(level0.height, 1u)), 1u);
 
-    auto& chain = g_r.mipChains[fetch.Address()];
     const UINT count = UINT(levels.size());
+    // One per shape too: a base fetched with two sizes or level counts in a frame recreated its chain
+    // at each change (PGR4's races: 160 textures created a second).
+    auto& chain = g_r.mipChains[uint64_t(fetch.Address()) << 32 ^ (uint64_t(hw) << 18 ^ uint64_t(hh) << 4 ^ count) * 0x9E3779B1u ^ uint64_t(level0.format)];
     // Assembled again whenever one of its levels has been resolved since, not once per frame: a fetch
     // reads memory as it is at the draw (one title blurs a shadow in two transposed passes, both
     // resolved to level 0, and the chain built after the first was kept: the shadow came out
