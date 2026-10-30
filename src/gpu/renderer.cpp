@@ -434,6 +434,15 @@ struct PipelineEntry
 {
     ComPtr<ID3D12PipelineState> pso;
     std::atomic<int> state{ 0 }; // 0 building, 1 ready, 2 failed
+    // The build, run once by whoever claims it first: a pool thread, or a draw that must wait for it
+    // (WaitForPipeline), so that draw doesn't wait behind every build queued before it.
+    std::function<void()> build;
+    std::atomic<bool> claimed{ false };
+    void Build()
+    {
+        if (!claimed.exchange(true, std::memory_order_acq_rel))
+            build();
+    }
 };
 
 struct Renderer
@@ -3783,7 +3792,9 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     char label[64];
     snprintf(label, sizeof(label), "pipeline %08llx/%08llx", (unsigned long long)(key.vs >> 32), (unsigned long long)(key.ps >> 32));
     g_stats.Begin(label);
-    pool.Push([entry, pd, vsKeep = vs.code, psKeep = ps.code, key]() mutable {
+    // (A plain pointer back to the entry: pipelines are never removed.)
+    entry->build =[e = entry.get(), pd, vsKeep = vs.code, psKeep = ps.code, key]() mutable {
+        PipelineEntry* entry = e;
         const auto createStart = std::chrono::steady_clock::now();
         bool hit = false;
         const HRESULT hr = g_pipelineLibrary.CreateOrLoad(g_r.device, pd, key, entry->pso, &hit);
@@ -3795,7 +3806,8 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         (hit ? g_stats.pipelinesLoaded : g_stats.pipelinesBuilt)++;
         entry->state.store(FAILED(hr) ? 2 : 1, std::memory_order_release);
         g_stats.End(!hit);
-    });
+    };
+    pool.Push([entry] { entry->Build(); });
     g_pipelinesCreated++;
     g_frameEvents.pipelines++;
     return entry;
@@ -3811,6 +3823,11 @@ ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry
     static LiveSwitch async("REGPU_ASYNC_PIPELINES");
     if (async && !force && entry->state.load(std::memory_order_acquire) == 0)
         return nullptr;
+    // Not started yet: built here, now. Queued behind the pool's other builds, a draw that must wait
+    // for its pipeline waited for all of them: on the FX (a cold cache entering FH1's world) over 20 s,
+    // and the title never queued work again. REGPU_NO_INLINE_PIPELINE=1: wait in the queue, as before.
+    if (static LiveSwitch noInline("REGPU_NO_INLINE_PIPELINE"); !noInline)
+        entry->Build();
     WaitHoldingImpl([&] { return entry->state.load(std::memory_order_acquire) != 0; });
     return entry->state.load() == 1 ? entry->pso.Get() : nullptr;
 }
