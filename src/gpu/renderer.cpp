@@ -7002,8 +7002,14 @@ void RendererSaveCaches()
 void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash)
 {
     std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
+    uint64_t& current = type == 0 ? C().vsHash : C().psHash;
+    // Titles reload the bound shader before most draws: the same hash is the same used microcode, so
+    // the copy is already there (FH1: ~2% of the draw thread on an FX-8350). REGPU_NO_SAME_SHADER_SKIP=1: copy anyway.
+    static LiveSwitch noSkip("REGPU_NO_SAME_SHADER_SKIP");
+    if (current == hash && code.size() == usedDwords && !noSkip)
+        return;
     code.assign(microcodeBE, microcodeBE + usedDwords);
-    (type == 0 ? C().vsHash : C().psHash) = hash;
+    current = hash;
 }
 
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
