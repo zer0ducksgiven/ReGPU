@@ -4912,10 +4912,24 @@ struct Phase
     std::unordered_multiset<uint64_t> drawn;
     uint32_t counts[4]{}; // REGPU_TRACE_TILES: first tile before / after its first resolve, later tiles the same
     uint32_t bases[2]{};  // REGPU_TRACE_TILES: colour | depth EDRAM bases of the first and the later tiles' last draws
+    bool laterCleared = false; // the later tiles' rows were readied for the widened first tile (LaterClear)
 };
 Phase g_phase;
 thread_local bool t_widened = false; // WindowScissor's last answer was widened
 bool g_mergedResolve = false;        // the resolve about to run is a merged first tile's (its clear stays in the tile)
+// Unmerged, a later tile draws over what the first tile's clearing resolve left in the EDRAM; merged,
+// the widened first tile draws the later tiles' rows over whatever the end of the last frame left
+// there (post-processing). So before its first widened draw, those rows get that clear (from the last
+// frame's resolve). PGR4's race: its scene leaves alpha alone and the motion blur weights its samples
+// by it; over the last frame's leftovers the blur stopped at the tile line.
+// REGPU_NO_TILE_MERGE_LATER_CLEAR=1: not cleared (A/B).
+struct LaterClear
+{
+    bool color = false, depth = false, depthFloat = false;
+    uint32_t colorHi = 0, colorLo = 0, depthValue = 0, colorFormat = 0;
+    int32_t pending[4]{}; // rows to clear before the next draw (bottom <= top: none)
+};
+LaterClear g_laterClear;
 // Surfaces whose later tiles clear with rectangles sized to the tile before resolving (PGR4's
 // menus): the first tile's scissor does not widen those, so the scene behind is not merged there.
 std::set<uint32_t> g_unsafe;
@@ -4930,6 +4944,13 @@ bool Widen(uint32_t surface, int32_t r[4])
     for (const Entry& e : t->entries)
         if (e.surface == surface && e.first[0] == r[0] && e.first[1] == r[1] && e.first[2] == r[2] && e.first[3] == r[3])
         {
+            static LiveSwitch noLaterClear("REGPU_NO_TILE_MERGE_LATER_CLEAR");
+            if (g_phase.surface == surface && !g_phase.laterCleared && !noLaterClear && (g_laterClear.color || g_laterClear.depth))
+            {
+                g_phase.laterCleared = true;
+                const int32_t rows[4]{ e.all[0], e.first[3], e.all[2], e.all[3] };
+                memcpy(g_laterClear.pending, rows, sizeof(rows));
+            }
             memcpy(r, e.all, sizeof(e.all));
             return true;
         }
@@ -6112,6 +6133,15 @@ void Resolve()
     static LiveSwitch noClearExtend("REGPU_NO_CLEAR_EXTEND");
     // (Not in a merged tile pass (TileMerge): the later tiles' rows are drawn already.)
     const bool merged = std::exchange(TileMerge::g_mergedResolve, false);
+    // A merged first tile's clearing resolve readies the EDRAM for the later tiles: kept for their rows
+    // (TileMerge::LaterClear).
+    if (merged)
+    {
+        TileMerge::LaterClear& lc = TileMerge::g_laterClear;
+        lc.color = (control >> 8) & 1, lc.depth = (control >> 9) & 1;
+        lc.colorHi = gpureg::Get(RB_COLOR_CLEAR), lc.colorLo = gpureg::Get(RB_COLOR_CLEAR_LO), lc.depthValue = gpureg::Get(RB_DEPTH_CLEAR);
+        lc.colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF, lc.depthFloat = (gpureg::Get(RB_DEPTH_INFO) >> 16) & 1;
+    }
     if (!noClearExtend && !merged && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, kWidth) && rect.left == 0)
         clearRect.bottom = PassHeight();
     if ((control >> 8) & 1) // colour clear (ARGB)
@@ -8867,6 +8897,29 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         return;
     }
     D3D12_RECT hostScissor = ToHost(scissor);
+    if (TileMerge::LaterClear& lc = TileMerge::g_laterClear; lc.pending[3] > lc.pending[1])
+    {
+        const D3D12_RECT rows = ToHost(D3D12_RECT{ lc.pending[0], lc.pending[1], lc.pending[2], lc.pending[3] });
+        lc.pending[3] = lc.pending[1];
+        if (lc.color)
+        {
+            float color[4];
+            ClearColor(lc.colorFormat, lc.colorLo, lc.colorHi, color);
+            TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
+            C().list->ClearRenderTargetView(C().rtv, color, 1, &rows);
+        }
+        if (lc.depth)
+        {
+            const uint32_t d = lc.depthValue >> 8;
+            float depth = float(d) / 16777215.0f;
+            if (lc.depthFloat)
+            {
+                const uint32_t ex = d >> 20, m = d & 0xFFFFF;
+                depth = std::clamp(ex ? std::ldexp(1.0f + float(m) / 1048576.0f, int(ex) - 15) : std::ldexp(float(m) / 1048576.0f, -14), 0.0f, 1.0f);
+            }
+            C().list->ClearDepthStencilView(C().dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(lc.depthValue & 0xFF), 1, &rows);
+        }
+    }
     if (LiveSwitch &traceWidened = g_sw_REGPU_TRACE_TILE_WIDEN; traceWidened && TileMerge::t_widened)
     {
         static uint64_t logged = 0;
