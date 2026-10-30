@@ -135,7 +135,8 @@ void RaiseInterrupt(uint32_t source, uint32_t cpu)
 // draws, swaps, and the memory writes the title treats as fences, so those land only after
 // the draws before them. Waits, conditional writes and interrupts first let the worker
 // catch up. Opt-in with REGPU_DRAW_THREAD=1: the worker alone still does nearly all the work
-// (translation, not parsing, is the cost), so it pays off once draws are spread over workers.
+// (translation, not parsing, is the cost), but the parsing then overlaps it: FH1 free roam on a
+// 5800X, 98-100 -> 106-108 fps once its main and render threads overlapped.
 namespace work
 {
 enum : uint32_t { kPad, kRegs, kShader, kDraw, kSwap, kWriteBack, kStore };
@@ -144,7 +145,8 @@ std::vector<uint32_t> g_ring(kWords);
 alignas(64) std::atomic<uint64_t> g_head{ 0 }; // written by the command processor
 alignas(64) std::atomic<uint64_t> g_tail{ 0 }; // written by the worker
 std::vector<uint8_t> g_file(0x8000 * 4);       // the worker's register file (registers up to 0x7FFF)
-const bool g_enabled = getenv("REGPU_DRAW_THREAD") != nullptr; // off by default (no gain until draws translate in parallel)
+// Read when the command processor starts (a host may set REGPU_DRAW_THREAD before regpu::Start).
+bool g_enabled = false;
 std::atomic<bool> g_started{ false };
 
 // Space for a record of `words` payload words; returns where to write it.
@@ -1322,6 +1324,7 @@ namespace
 void CommandProcessorLoop(PPCContext& ctx)
 {
     t_cpContext = &ctx;
+    work::g_enabled = getenv("REGPU_DRAW_THREAD") != nullptr;
     if (work::g_enabled)
     {
         memcpy(work::g_file.data(), gpureg::LiveFile(), work::g_file.size());
