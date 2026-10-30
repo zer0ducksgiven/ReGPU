@@ -696,8 +696,13 @@ struct Emitter
                 : "float3(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ", " + reg +
                 comp[(f.srcSwizzle >> 4) & 3] + ")";
             char call[320];
-            snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
-                f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
+            static const bool lean = getenv("REGPU_LEAN_FETCH") != nullptr; // Preamble()
+            if (lean && pixel && f.dimension == 1)
+                snprintf(call, sizeof(call), "TFetch2D(%u, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
+                    f.denormalized ? "true" : "false", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
+            else
+                snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
+                    f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
             // Declared, then assigned: fxc drops the value when the fetch initialises the declaration
             // in some shaders ("internal error: invalid access of unbound variable").
             body = std::string("{ float4 t; t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
@@ -980,6 +985,67 @@ const char* HlslPreamble()
     return kPreamble;
 }
 
+namespace
+{
+// REGPU_LEAN_FETCH=1 (opt-in, read at translation; its shaders cache apart, by their HLSL): a 2D
+// fetch in a pixel shader (the instruction's dimension) samples once, through the static samplers
+// as an array indexed by the fetch constant's filter, instead of one branch per sampler, and has
+// no 3D or cube paths. Full-screen post shaders make a dozen fetches a pixel (FH1's shadow mask).
+const bool g_leanFetch = getenv("REGPU_LEAN_FETCH") != nullptr;
+
+const char kLeanFetch[] = R"(
+SamplerState gsamp[8] : register(s0, space1); // s0-s7 again, as a table (renderer.cpp)
+
+float4 TFetch2D(uint slot, float3 coord, bool denorm, float bias, float2 texel)
+{
+    // A 3D or cube texture behind a 2D fetch: the full path (its heap index isn't a Texture2D's).
+    if ((tinfo[slot].w & 0xFFu) >= 2u)
+        return TFetch(slot, coord, denorm, false, bias, texel);
+    const uint info = tinfo[slot].x;
+    float2 uv = coord.xy;
+    const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
+    if (denorm) uv = (uv + texel) / texelSize;
+    else uv += texel / texelSize;
+    if (((info >> 16) & 1u) && any(uv < 0.0 || uv > 1.0))
+        return ((info >> 17) & 1u) ? float4(1, 1, 1, 1) : float4(0, 0, 0, 0);
+    if ((info >> 18) & 1u) uv.x = clamp(uv.x, 0.5 / texelSize.x, 1.0 - 0.5 / texelSize.x);
+    if ((info >> 19) & 1u) uv.y = clamp(uv.y, 0.5 / texelSize.y, 1.0 - 0.5 / texelSize.y);
+    if (tbias[slot].z > 0.0) uv *= tbias[slot].zw;
+    // Sampler index: the filter mode (1-3 its own sampler), else the anisotropy (s4-s7), else s0.
+    const uint mode = info & 3u, aniso = (info >> 20) & 7u;
+    const uint s = mode != 0u ? mode : (aniso >= 1u && aniso <= 4u ? aniso + 3u : 0u);
+    float4 v = gtex[asuint(tbias[slot].y)].SampleBias(gsamp[s], uv, bias);
+    uint gamma = (info >> 24) & 0xFu;
+    if (gamma != 0u)
+    {
+        [unroll] for (uint g = 0; g < 4; g++)
+            if ((gamma >> g) & 1u)
+                v[g] = PWLGammaToLinear(v[g]);
+    }
+    int expAdjust = int(info << 18) >> 26;
+    if (expAdjust != 0) v *= exp2(float(expAdjust));
+    uint w = tinfo[slot].w;
+    if (!(w >> 31))
+        return v;
+    float4 r;
+    [unroll] for (uint c = 0; c < 4; c++)
+    {
+        uint sel = (w >> (8 + 3 * c)) & 7u;
+        r[c] = sel < 4u ? v[sel] : (sel == 5u ? 1.0 : 0.0);
+    }
+    return r;
+}
+)";
+
+std::string Preamble()
+{
+    std::string h = kPreamble;
+    return g_leanFetch ? h + kLeanFetch : h;
+}
+} // namespace
+
+bool LeanFetch() { return g_leanFetch; }
+
 bool BakedVertexFetch()
 {
     static const bool baked = getenv("REGPU_DYNAMIC_VFETCH") == nullptr;
@@ -1064,7 +1130,7 @@ TranslatedShader TranslateShader(const Shader& shader)
         return result;
     }
 
-    std::string h = kPreamble;
+    std::string h = Preamble();
     std::vector<uint32_t> regs = ScalarRegisters(e.out);
     std::string decl;
     if (!shader.pixel)

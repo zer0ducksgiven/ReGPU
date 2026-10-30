@@ -51,3 +51,5 @@ bool BakedVertexFetch();
 
 // Shared HLSL declarations both stages compile against.
 const char* HlslPreamble();
+// REGPU_LEAN_FETCH=1: lean 2D pixel fetches through a sampler table (root parameter 4, space1).
+bool LeanFetch();

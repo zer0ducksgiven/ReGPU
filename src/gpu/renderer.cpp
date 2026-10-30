@@ -462,6 +462,7 @@ struct Renderer
 
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12DescriptorHeap> srvHeap;     // shader visible
+    ComPtr<ID3D12DescriptorHeap> samplerHeap; // REGPU_LEAN_FETCH: s0-s7 again as a table (space1, root parameter 4)
     ComPtr<ID3D12DescriptorHeap> stagingHeap; // CPU: null texture SRV
     UINT srvStride = 0;
     ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap;
@@ -1590,7 +1591,7 @@ void Init()
         bindless[i].RegisterSpace = 1 + i;
         bindless[i].OffsetInDescriptorsFromTableStart = 0;
     }
-    D3D12_ROOT_PARAMETER params[5]{};
+    D3D12_ROOT_PARAMETER params[6]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -1638,20 +1639,54 @@ void Init()
         samplers[i].ShaderRegister = i;
         samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
+    // REGPU_LEAN_FETCH (hlsl.cpp): the same eight samplers as a table in space1, which a shader can
+    // index (static samplers can't back a dynamically indexed array).
+    D3D12_DESCRIPTOR_RANGE samplerRange{};
+    samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+    samplerRange.NumDescriptors = 8;
+    samplerRange.RegisterSpace = 1;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     rs.NumParameters = 4;
     rs.pParameters = params;
     rs.NumStaticSamplers = 8;
     rs.pStaticSamplers = samplers;
+    if (LeanFetch())
+    {
+        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[4].DescriptorTable.NumDescriptorRanges = 1;
+        params[4].DescriptorTable.pDescriptorRanges = &samplerRange;
+        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rs.NumParameters = 5;
+        D3D12_DESCRIPTOR_HEAP_DESC sh{};
+        sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        sh.NumDescriptors = 8;
+        sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        Check(d->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&g_r.samplerHeap)), "CreateDescriptorHeap(sampler)");
+        const UINT stride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        for (UINT i = 0; i < 8; i++)
+        {
+            D3D12_SAMPLER_DESC s{};
+            s.Filter = samplers[i].Filter;
+            s.AddressU = samplers[i].AddressU;
+            s.AddressV = samplers[i].AddressV;
+            s.AddressW = samplers[i].AddressW;
+            s.MaxAnisotropy = samplers[i].MaxAnisotropy;
+            s.ComparisonFunc = samplers[i].ComparisonFunc;
+            s.MaxLOD = samplers[i].MaxLOD;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetCPUDescriptorHandleForHeapStart();
+            h.ptr += size_t(i) * stride;
+            d->CreateSampler(&s, h);
+        }
+    }
     ComPtr<ID3DBlob> blob, error;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
         Fatal("renderer: root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
     Check(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_r.rootSignature)), "CreateRootSignature");
     // Motion-vector pipelines: the same plus b2, last frame's vertex constants of the draw.
-    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[4].Descriptor.ShaderRegister = 2;
-    params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    rs.NumParameters = 5;
+    params[rs.NumParameters].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[rs.NumParameters].Descriptor.ShaderRegister = 2;
+    params[rs.NumParameters].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rs.NumParameters++;
     blob.Reset();
     error.Reset();
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
@@ -2134,8 +2169,8 @@ void BeginFrameIfNeeded()
     f.descriptorsUsed = 2;
     EvictBindless();
     ReclaimTextureBlocks();
-    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
-    C().list->SetDescriptorHeaps(1, heaps);
+    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
+    C().list->SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
     C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     g_drawState.Invalidate();
     SelectSurfaces(true);
@@ -5659,8 +5694,8 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NGX may have changed the list's heaps, root signatures and pipeline: set ours again.
-    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
-    C().list->SetDescriptorHeaps(1, heaps);
+    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
+    C().list->SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
     C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     C().list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_drawState.Invalidate();
@@ -7156,8 +7191,8 @@ ID3D12GraphicsCommandList* AcquireList()
 // The state every draw list starts with.
 void ListPrologue(RecordedList& list)
 {
-    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
-    list.SetDescriptorHeaps(1, heaps);
+    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
+    list.SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
     list.SetGraphicsRootSignature(g_r.rootSignature.Get());
     list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
@@ -9279,7 +9314,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     C().list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     C().list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
     if (motion)
-        C().list->SetGraphicsRootConstantBufferView(4, motionPrevious);
+        C().list->SetGraphicsRootConstantBufferView(LeanFetch() ? 5 : 4, motionPrevious);
     if (const D3D12_GPU_DESCRIPTOR_HANDLE t2 = Gpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride); t2.ptr != ds.table2.ptr)
     {
         ds.table2 = t2;
@@ -9289,6 +9324,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         ds.table3 = t3;
         C().list->SetGraphicsRootDescriptorTable(3, t3);
+        if (g_r.samplerHeap) // set again with the table (after a root signature switch)
+            C().list->SetGraphicsRootDescriptorTable(4, g_r.samplerHeap->GetGPUDescriptorHandleForHeapStart());
     }
     // REGPU_CAPTURE_COMPOSITE=<n>: trace (as F12) the n-th frame that draws into the 2048-wide
     // surface (pitch field 0x820: a 2048-wide composite), from its first such draw on.
