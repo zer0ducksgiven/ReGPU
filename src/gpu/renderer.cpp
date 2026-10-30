@@ -8593,6 +8593,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vte[0] |= 1u << 29;
     if (!noRectSnap && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots && (ScaleX() != 1.0f || ScaleY() != 1.0f))
         vc->vte[0] |= 1u << 30;
+    // The same snap for a texture-less rectangle through another MSAA view (vscale.w, voffset.w > 1):
+    // the half-pixel shift added after the view scale put the far edge of FH1's 4x clear of its
+    // 1024x1024 shadow maps on the last row's centres, so row 1023 kept 0 (always shadowed) and drew
+    // a thin dark line on the ground where the car's shadow box ends. Snapped, the rectangle covers
+    // the view pixels whose centres it covers. REGPU_NO_VIEW_RECT_SNAP=1: shifted as before (A/B).
+    if (static LiveSwitch noViewRectSnap("REGPU_NO_VIEW_RECT_SNAP"); !noViewRectSnap && !oldClearShift && !ps.info.usedTextureSlots &&
+        !vs.info.usedTextureSlots && vc->vscale[3] >= 1.0f && vc->voffset[3] >= 1.0f && (vc->vscale[3] > 1.0f || vc->voffset[3] > 1.0f))
+        vc->vte[0] |= 1u << 30;
     // Viewport-transformed draws with D3D9 pixel centres (PA_SU_VTX_CNTL bit 0 clear) are shifted half a
     // pixel, as the screen-space ones are (hlsl.cpp, bit 28). Unshifted, FH1's image sat 0.6-0.7 px off
     // stock's (HUD, banners) and its screen-space shadow lookups landed between mask texels: the shadows
