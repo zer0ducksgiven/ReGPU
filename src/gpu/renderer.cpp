@@ -9513,6 +9513,49 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
             Log("perf:   uploads: %.1f MB hashed, %.1f MB copied (%.0f copies, %.0f reused) per frame",
                 double(g_uploadStats.hashed.exchange(0)) / g_perf.frames / 1048576.0, double(g_uploadStats.copied.exchange(0)) / g_perf.frames / 1048576.0,
                 double(g_uploadStats.copies.exchange(0)) / g_perf.frames, double(g_uploadStats.hits.exchange(0)) / g_perf.frames);
+        if (perf && g_perf.frames)
+        {
+            // Order of RecordedList::Op.
+            static const char* const names[] = { "barrier", "copy", "rootsig", "table", "cbv", "root32", "targets", "pipeline", "viewport",
+                "scissor", "stencilref", "blendfactor", "topology", "heaps", "draw", "endquery", "resolvequery", "clearrtv", "cleardsv",
+                "creatertv", "createdsv", "drawindexed", "indexbuffer", "copybuffer", "csrootsig", "cstable", "csroot32", "dispatch", "beginquery" };
+            std::string s;
+            for (size_t i = 0; i < std::size(names); i++)
+                if (const uint64_t n = g_recordedOps[i].exchange(0); n >= g_perf.frames)
+                    s += " " + std::string(names[i]) + " " + std::to_string(n / g_perf.frames);
+            Log("perf:   recorded per frame:%s | %llu barriers", s.c_str(), (unsigned long long)(g_recordedBarriers.exchange(0) / g_perf.frames));
+            // REGPU_TRACE_BARRIERS=1: barriers per frame by call site (module offset, for llvm-symbolizer) and
+            // transition (before -> after state, or UAV/aliasing).
+            static const bool traceBarriers = getenv("REGPU_TRACE_BARRIERS") != nullptr;
+            static std::mutex barrierMutex;
+            static std::map<std::tuple<uintptr_t, uint32_t, uint32_t>, uint64_t> barrierSites;
+            if (traceBarriers && !g_barrierSites)
+                g_barrierSites = [](void* caller, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+                    HMODULE self = nullptr;
+                    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        reinterpret_cast<LPCWSTR>(&InitDepthBlit), &self);
+                    const uintptr_t at = uintptr_t(caller) - uintptr_t(self);
+                    std::lock_guard lock(barrierMutex);
+                    for (UINT i = 0; i < n; i++)
+                    {
+                        const bool transition = b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                        barrierSites[{ at, transition ? uint32_t(b[i].Transition.StateBefore) : 0xFFFF0000u | b[i].Type,
+                            transition ? uint32_t(b[i].Transition.StateAfter) : 0 }]++;
+                    }
+                };
+            if (traceBarriers)
+            {
+                std::lock_guard lock(barrierMutex);
+                std::vector<std::pair<uint64_t, std::tuple<uintptr_t, uint32_t, uint32_t>>> v;
+                for (auto& [k, n] : barrierSites)
+                    v.push_back({ n, k });
+                std::sort(v.rbegin(), v.rend());
+                for (size_t i = 0; i < v.size() && i < 12; i++)
+                    Log("perf:   barriers %llu/frame at +%llx: %x -> %x", (unsigned long long)(v[i].first / g_perf.frames),
+                        (unsigned long long)std::get<0>(v[i].second), std::get<1>(v[i].second), std::get<2>(v[i].second));
+                barrierSites.clear();
+            }
+        }
         if (perf && !g_created.empty())
         {
             std::string s;

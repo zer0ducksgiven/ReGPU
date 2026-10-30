@@ -16,6 +16,12 @@
 
 #include <d3d12.h>
 
+// REGPU_PERF: calls recorded, by op (RecordedList::Op), and resource barriers in them.
+inline std::atomic<uint64_t> g_recordedOps[32];
+inline std::atomic<uint64_t> g_recordedBarriers{ 0 };
+// REGPU_TRACE_BARRIERS: called with each barrier call's return address (renderer.cpp counts them).
+inline void (*g_barrierSites)(void* caller, UINT n, const D3D12_RESOURCE_BARRIER* b) = nullptr;
+
 class RecordedList
 {
 public:
@@ -42,7 +48,12 @@ public:
         return m_real;
     }
 
-    void ResourceBarrier(UINT n, const D3D12_RESOURCE_BARRIER* b) { Put(kBarrier, &n, sizeof(n), b, sizeof(*b) * n); }
+    void ResourceBarrier(UINT n, const D3D12_RESOURCE_BARRIER* b)
+    {
+        if (g_barrierSites)
+            g_barrierSites(__builtin_return_address(0), n, b);
+        Put(kBarrier, &n, sizeof(n), b, sizeof(*b) * n);
+    }
     void CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box)
     {
         struct A { D3D12_TEXTURE_COPY_LOCATION dst, src; UINT x, y, z; BOOL hasBox; D3D12_BOX box; } a{ *dst, *src, x, y, z, box != nullptr, box ? *box : D3D12_BOX{} };
@@ -139,6 +150,9 @@ private:
 
     void Put(Op op, const void* a, size_t na, const void* b = nullptr, size_t nb = 0)
     {
+        if (op == kBarrier)
+            g_recordedBarriers.fetch_add(*static_cast<const UINT*>(a), std::memory_order_relaxed);
+        g_recordedOps[op].fetch_add(1, std::memory_order_relaxed);
         const size_t at = m_current.size();
         const uint32_t header[2] = { op, uint32_t((na + nb + 7) & ~size_t(7)) }; // 8-byte aligned commands
         m_current.resize(at + sizeof(header) + header[1]);
