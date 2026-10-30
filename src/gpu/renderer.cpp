@@ -2317,6 +2317,30 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     // Each recording thread keeps its own cache (cleared when the frame changes).
     thread_local FrameMap<std::pair<UINT64, uint64_t>> uploads;
     g_uploadStats.hashed += bytes;
+    // REGPU_TRACE_UPLOADS=1: the ranges hashed most (bytes and uses a frame), every 240 frames. FH1 free
+    // roam: one 32 KB vertex range used by 352 draws a frame is 40% of the ~26 MB.
+    if (static const bool traceUploads = getenv("REGPU_TRACE_UPLOADS") != nullptr; traceUploads)
+    {
+        static std::mutex m;
+        static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> byKey; // hashed bytes, uses
+        static uint64_t lastFrame = 0;
+        std::lock_guard lock(m);
+        auto& e = byKey[key];
+        e.first += bytes;
+        e.second++;
+        if (g_r.frame >= lastFrame + 240)
+        {
+            std::vector<std::pair<uint64_t, uint64_t>> v;
+            for (auto& [k, x] : byKey)
+                v.push_back({ x.first, k });
+            std::sort(v.rbegin(), v.rend());
+            for (size_t i = 0; i < v.size() && i < 10; i++)
+                Log("uploads: %08X %u bytes: %.2f MB hashed a frame, %.1f uses a frame", uint32_t(v[i].second >> 32), uint32_t(v[i].second),
+                    v[i].first / 240.0 / 1048576.0, byKey[v[i].second].second / 240.0);
+            byKey.clear();
+            lastFrame = g_r.frame;
+        }
+    }
     if (const auto* known = uploads.Find(key, g_r.frame); known && known->second == sample)
     {
         g_uploadStats.hits++;
