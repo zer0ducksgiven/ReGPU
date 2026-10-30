@@ -5402,6 +5402,9 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     ResolvedTexture& dest = g_r.resolved[base];
     const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
     EnsureResolved(dest, width, height, hostWidth, hostHeight, format);
+    if (RendererTracing())
+        Log("resolve: -> %08X %ux%u as %ux%u host (scale %.3f x %.3f, texture %ux%u)", base, width, height, hostWidth, hostHeight, ScaleX(), ScaleY(),
+            dest.hostWidth, dest.hostHeight);
     // What memory holds under the image, for the stale check (ResolveCurrent): once per frame, as tiles
     // land in the same image. An image resolved every frame (shadow maps, bloom) only needs it every
     // 8th: the check waits until a resolve has not been repeated for 8 frames, so its baseline is
@@ -8476,8 +8479,22 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // (Rect lists only: triangle lists and strips read their indices through the index arena, which
     // copies them; refusing those sent every draw of a rewritten index buffer to the CPU's index
     // expansion, 7 ms a frame in FH1 TU4.)
-    const bool indexRewritten = RendererEarlyFences() && indexSource == 0 && prim == 13 &&
-        DynamicBuffer(dmaBase & 0x1FFFFFFF, (dmaSize & 0xFFFFFF) * (((initiator >> 11) & 1) ? 4u : 2u));
+    // Small index buffers are always copied, whatever the primitive: direct indices are read by the
+    // vertex shader when the host GPU runs, frames after the command processor saw them. FH1 writes the
+    // same 36 indices of each shadow cascade box (a rect list) every frame, clearing and refilling the
+    // memory in place; a content check sees nothing change (and called it rewritten on some frames, not
+    // others), and whenever the GPU ran a few frames behind (2560x1440 and up, another game on the GPU) it
+    // read the cleared indices: every other frame the cascade drew degenerate triangles and the sun
+    // shadows flickered (RenderDoc, two frames: same vertices, indices all zero). Copying a few hundred
+    // bytes costs nothing; large ones (static meshes) stay in place unless seen changing.
+    // REGPU_DIRECT_DYNAMIC_INDICES=1: as before, in place unless an early-fence rect list changed (A/B).
+    static LiveSwitch directDynamicIndices("REGPU_DIRECT_DYNAMIC_INDICES");
+    const uint32_t indexBytes = (dmaSize & 0xFFFFFF) * (((initiator >> 11) & 1) ? 4u : 2u);
+    constexpr uint32_t kCopiedIndexBytes = 16u << 10;
+    const bool indexRewritten = indexSource == 0 &&
+        (directDynamicIndices ? prim == 13 && RendererEarlyFences() && DynamicBuffer(dmaBase & 0x1FFFFFFF, indexBytes)
+                              : (prim == 4 || prim == 6 || prim == 13) &&
+                                    (indexBytes < kCopiedIndexBytes || ((prim != 13 || RendererEarlyFences()) && DynamicBuffer(dmaBase & 0x1FFFFFFF, indexBytes))));
     const bool directIndex = g_r.physical && !noDirectIndex && !indexOverrun && !indexRewritten && (indexSource == 0 || indexSource == 2) &&
         (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
@@ -10369,7 +10386,22 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             std::error_code ec;
             if (const auto dir = std::filesystem::path(shotPath).parent_path(); !dir.empty())
                 std::filesystem::create_directories(dir, ec);
-            WritePng(shotPath.c_str(), dw, dh, full);
+            // A ".raw" path (debug "shots ... raw"): 640x360 RGBA, nearest, no encoding, so a burst
+            // barely slows the game.
+            if (shotPath.size() > 4 && shotPath.compare(shotPath.size() - 4, 4, ".raw") == 0)
+            {
+                std::vector<uint8_t> thumb(640 * 360 * 4);
+                for (uint32_t y = 0; y < 360; y++)
+                    for (uint32_t x = 0; x < 640; x++)
+                        memcpy(&thumb[(size_t(y) * 640 + x) * 4], &full[(size_t(y) * dh / 360 * dw + size_t(x) * dw / 640) * 4], 4);
+                if (FILE* fp = fopen(shotPath.c_str(), "wb"))
+                {
+                    fwrite(thumb.data(), 1, thumb.size(), fp);
+                    fclose(fp);
+                }
+            }
+            else
+                WritePng(shotPath.c_str(), dw, dh, full);
             DebugShotDone(shotPath);
         }
         else
