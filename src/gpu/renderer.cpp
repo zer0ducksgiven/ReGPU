@@ -7276,9 +7276,16 @@ void WriteResolvePixels(const uint8_t* pixels, UINT pitch, DXGI_FORMAT hostForma
                         const uint8_t* px = pixels + size_t(hy) * pitch + size_t(hx) * hostBpp;
                         for (int k = 0; k < 4; k++)
                         {
-                            uint16_t h;
-                            memcpy(&h, px + k * 2, 2);
-                            c[k] += hostBpp == 8 ? regpu::resolve::HalfToFloat(h) : float(px[k]) / 255.0f;
+                            // (Halves only from an 8-byte texel: read from an RGBA8 one, the last texel's
+                            // read ran 4 bytes past the buffer, a fault where it ends on a page: the FX's GTX 970.)
+                            if (hostBpp == 8)
+                            {
+                                uint16_t h;
+                                memcpy(&h, px + k * 2, 2);
+                                c[k] += regpu::resolve::HalfToFloat(h);
+                            }
+                            else
+                                c[k] += float(px[k]) / 255.0f;
                         }
                     }
                 const float n = float((hx1 - hx0) * (hy1 - hy0));
@@ -9722,9 +9729,11 @@ void PrecompileAll()
                 if (!ps && Manifest::LoadShader(true, key.ps, code))
                     ps = &GetShader(key.ps, code, true);
             }
-            if (!vs || !ps || vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending)
+            // A shader not stored (a static one from Host::staticShaders, installed after this): skip the
+            // pipeline. Waiting for it, as before, waited for good (FH1 on the FX: a black screen).
+            if (vs && ps && (vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending))
                 break; // wait for this one to finish compiling before going on
-            if (vs->state.load() == CompiledShader::Ready && ps->state.load() == CompiledShader::Ready)
+            if (vs && ps && vs->state.load() == CompiledShader::Ready && ps->state.load() == CompiledShader::Ready)
             {
                 if (!g_r.pipelines.count(key))
                 {
