@@ -664,13 +664,22 @@ uint32_t g_passDraws = 0;
 // Occlusion queries (EVENT_WRITE_ZPD: the sun flare's visibility). Each guest query becomes a
 // D3D12 one; the guest gets the result of the same query (by order in the frame) from the
 // last frame that has completed, so the command processor never waits for the GPU.
-constexpr UINT kOcclusionPerFrame = 64;
+constexpr UINT kOcclusionPerFrame = 512; // D3D queries per frame slot (a guest query is one or more)
 ComPtr<ID3D12QueryHeap> g_occlusionHeap;
 ComPtr<ID3D12Resource> g_occlusionReadback;
-std::vector<std::pair<UINT, UINT>> g_occlusionPending[3]; // per frame slot: (order in the frame, query index)
-std::vector<int64_t> g_occlusionResult;                     // by order in the frame: host samples, -1 none yet
+// A guest query's D3D queries: its depth-tested samples (main) and, for each draw in it, the same draw
+// with the depth test always passing (coverage: the console's Total).
+struct OcclusionParts
+{
+    UINT order = 0;
+    std::vector<UINT> main, coverage;
+};
+std::vector<OcclusionParts> g_occlusionPending[3];  // per frame slot
+std::vector<int64_t> g_occlusionResult;              // by order in the frame: host samples, -1 none yet
+std::vector<int64_t> g_occlusionCoverage;            // by order in the frame: host samples covered, -1 none
+OcclusionParts g_occlusionCurrent;
 uint64_t g_occlusionFrame = ~0ull;
-UINT g_occlusionCount = 0, g_occlusionIndex = 0, g_occlusionOrder = 0;
+UINT g_occlusionCount = 0, g_occlusionIndex = 0, g_occlusionOrder = 0, g_occlusionOrders = 0; // D3D queries used, open one, guest order, guest queries
 bool g_occlusionOpen = false;
 std::map<std::string, std::pair<double, uint64_t>> g_passTotals; // ms, draws
 uint64_t g_passFrames = 0;
@@ -1929,11 +1938,20 @@ void BeginFrameIfNeeded()
         const D3D12_RANGE range{ size_t(frameIndex) * kOcclusionPerFrame * 8, size_t(frameIndex + 1) * kOcclusionPerFrame * 8 };
         if (SUCCEEDED(g_occlusionReadback->Map(0, &range, reinterpret_cast<void**>(&counts))))
         {
-            for (const auto& [order, index] : g_occlusionPending[frameIndex])
+            for (const OcclusionParts& q : g_occlusionPending[frameIndex])
             {
-                if (g_occlusionResult.size() <= order)
-                    g_occlusionResult.resize(order + 1, -1);
-                g_occlusionResult[order] = int64_t(counts[index]);
+                if (g_occlusionResult.size() <= q.order)
+                {
+                    g_occlusionResult.resize(q.order + 1, -1);
+                    g_occlusionCoverage.resize(q.order + 1, -1);
+                }
+                int64_t passed = 0, covered = 0;
+                for (UINT i : q.main)
+                    passed += int64_t(counts[i]);
+                for (UINT i : q.coverage)
+                    covered += int64_t(counts[i]);
+                g_occlusionResult[q.order] = passed;
+                g_occlusionCoverage[q.order] = q.coverage.empty() ? -1 : covered;
             }
             const D3D12_RANGE none{ 0, 0 };
             g_occlusionReadback->Unmap(0, &none);
@@ -3731,9 +3749,17 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
     return !opaque || GameSettled();
 }
 
-ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false)
+ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool stripCut = false,
+    bool coverage = false)
 {
     PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
+    if (coverage)
+    {
+        // An occlusion query's coverage draw: the depth test always passes, nothing is written.
+        key.depth = (key.depth & ~0x77u) | 0x72u;
+        key.stencilMaskMode &= ~(0xFu << 24);
+        key.flags |= 0x200;
+    }
     if (motion)
         key.flags |= 4;
     if (stripCut)
@@ -6910,6 +6936,7 @@ void QueueLists(UINT n, ID3D12CommandList* const* lists)
 
 // Ends the main list so far (queued for submission) and continues the frame in a fresh one.
 void EndOcclusionQuery();
+void EndOcclusionPart();
 
 void SplitMainList()
 {
@@ -6939,12 +6966,19 @@ void WaitForQueueIdle()
     }
 }
 
+// Ends the open query's current D3D part (the guest query stays open).
+void EndOcclusionPart()
+{
+    C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+    C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex, 1, g_occlusionReadback.Get(), UINT64(g_occlusionIndex) * 8);
+}
+
 void EndOcclusionQuery()
 {
     g_occlusionOpen = false;
     C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
     C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex, 1, g_occlusionReadback.Get(), UINT64(g_occlusionIndex) * 8);
-    g_occlusionPending[g_r.frameIndex].push_back({ g_occlusionOrder, g_occlusionIndex });
+    g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent);
 }
 
 // Deferred write-backs (regpu.h Writeback::Mode::Deferred): the requested part of a resolve is copied to
@@ -7581,8 +7615,9 @@ void RendererOcclusionBegin()
     {
         g_occlusionFrame = g_r.frame;
         g_occlusionCount = 0;
+        g_occlusionOrders = 0;
     }
-    if (g_occlusionOpen || g_occlusionCount >= kOcclusionPerFrame)
+    if (g_occlusionOpen || g_occlusionCount + 4 > kOcclusionPerFrame)
         return;
     if (!g_occlusionHeap)
     {
@@ -7594,13 +7629,16 @@ void RendererOcclusionBegin()
         if (!g_occlusionHeap || !g_occlusionReadback)
             return;
     }
-    g_occlusionOrder = g_occlusionCount++;
-    g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionOrder;
+    g_occlusionOrder = g_occlusionOrders++;
+    g_occlusionCurrent = {};
+    g_occlusionCurrent.order = g_occlusionOrder;
+    g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
+    g_occlusionCurrent.main.push_back(g_occlusionIndex);
     C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
     g_occlusionOpen = true;
 }
 
-bool OcclusionEndImpl(uint32_t& samples);
+bool OcclusionEndImpl(uint32_t& samples, uint32_t& total);
 namespace
 {
 namespace Unstable
@@ -7612,11 +7650,11 @@ extern uint32_t g_logged;
 
 // REGPU_TRACE_UNSTABLE: a query's answer that turns from hidden to visible or back between frames
 // (no result yet counts as visible: the caller answers 1000 samples).
-bool RendererOcclusionEnd(uint32_t& samples)
+bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total)
 {
     const UINT order = g_occlusionOrder;
     const bool open = g_occlusionOpen;
-    const bool known = OcclusionEndImpl(samples);
+    const bool known = OcclusionEndImpl(samples, total);
     if (open && Unstable::On())
     {
         // By order in the frame and frame parity: -1 no result yet, 0 hidden, 1 visible.
@@ -7643,7 +7681,7 @@ bool RendererOcclusionEnd(uint32_t& samples)
     return known;
 }
 
-bool OcclusionEndImpl(uint32_t& samples)
+bool OcclusionEndImpl(uint32_t& samples, uint32_t& total)
 {
     if (!g_occlusionOpen)
         return false;
@@ -7656,6 +7694,10 @@ bool OcclusionEndImpl(uint32_t& samples)
     const uint32_t guestMsaa = (gpureg::Get(RB_SURFACE_INFO) >> 16) & 3;
     const double perHost = double(1u << guestMsaa) / (double(ScaleX()) * double(ScaleY()) * double(g_msaa));
     samples = uint32_t(std::min(double(g_occlusionResult[order]) * perHost + 0.5, 4294967295.0));
+    // Total: the samples the query's draws covered, depth test aside (their coverage draws); without
+    // one (REGPU_NO_OCCLUSION_COVERAGE, or none yet), the passed count as before.
+    const int64_t covered = order < g_occlusionCoverage.size() ? g_occlusionCoverage[order] : -1;
+    total = covered >= 0 ? std::max(samples, uint32_t(std::min(double(covered) * perHost + 0.5, 4294967295.0))) : samples;
     return true;
 }
 
@@ -9128,6 +9170,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         for (uint32_t c : { 0u, 1u, 5u, 6u, 7u, 14u, 22u, 254u, 255u })
             Log("    pc%u = %g %g %g %g", c, pcRing->c[c][0], pcRing->c[c][1], pcRing->c[c][2], pcRing->c[c][3]);
     }
+    // A draw inside an occlusion query is also drawn with the depth test always passing, in a query of
+    // its own: the samples it covers, the console's Total (a game fades a light flare by the share that
+    // passed). From pgr4-native's occlusion pairs. REGPU_NO_OCCLUSION_COVERAGE=1: not drawn (Total = ZPass).
+    static LiveSwitch noCoverage("REGPU_NO_OCCLUSION_COVERAGE");
+    ID3D12PipelineState* coveragePso = g_occlusionOpen && !noCoverage && !motion && g_occlusionCount + 2 <= kOcclusionPerFrame
+        ? GetPipeline(vs, ps, edramMode == 5, cullable, false, stripCut && directIndex, true) : nullptr;
     {
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const D3D_PRIMITIVE_TOPOLOGY topology = indexedCount && prim == 6 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -9136,17 +9184,35 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             g_drawState.topology = topology;
             C().list->IASetPrimitiveTopology(topology);
         }
-        if (indexedCount)
+        if (indexedCount && memcmp(&indexView, &g_drawState.indexBuffer, sizeof(indexView)) != 0)
         {
-            if (memcmp(&indexView, &g_drawState.indexBuffer, sizeof(indexView)) != 0)
-            {
-                g_drawState.indexBuffer = indexView;
-                C().list->IASetIndexBuffer(&indexView);
-            }
-            C().list->DrawIndexedInstanced(indexedCount, 1, 0, 0, 0);
+            g_drawState.indexBuffer = indexView;
+            C().list->IASetIndexBuffer(&indexView);
         }
-        else
-            C().list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
+        auto issue = [&] {
+            if (indexedCount)
+                C().list->DrawIndexedInstanced(indexedCount, 1, 0, 0, 0);
+            else
+                C().list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
+        };
+        if (coveragePso)
+        {
+            // The open query's part so far ends; the coverage draw gets a query of its own; the query
+            // goes on in a new part (queries never overlap).
+            EndOcclusionPart();
+            const UINT covered = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
+            C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered);
+            C().list->SetPipelineState(coveragePso);
+            issue();
+            C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered);
+            C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered, 1, g_occlusionReadback.Get(), UINT64(covered) * 8);
+            g_occlusionCurrent.coverage.push_back(covered);
+            C().list->SetPipelineState(pso);
+            g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
+            g_occlusionCurrent.main.push_back(g_occlusionIndex);
+            C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+        }
+        issue();
         if (g_perfTiming)
         {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

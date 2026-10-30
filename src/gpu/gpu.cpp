@@ -958,16 +958,26 @@ uint32_t ExecutePacket(uint32_t ptr)
         // or workers, whose lists the query would not wrap): the sun flare fades behind trees.
         static LiveSwitch fake("REGPU_FAKE_OCCLUSION"); // A/B: the old fixed answer
         const bool real = !fake && !work::Active() && !seg::Enabled();
-        uint32_t samples = 1000;
+        uint32_t samples = 1000, total = 1000;
         if (real && !end)
             RendererOcclusionBegin();
-        else if (real && !RendererOcclusionEnd(samples))
-            samples = 1000; // no result yet (the first frames): fully visible
+        else if (real && !RendererOcclusionEnd(samples, total))
+            samples = total = 1000; // no result yet (the first frames): fully visible
         memset(c, 0, 8 * 4);
         if (end)
         {
+            // Total: every sample the query's draws covered; ZPass: those that passed. With both equal a
+            // light flare (PGR4's brake lights) could only be fully on or 0/0, and flickered as its few
+            // pixels passed or failed.
             c[4] = samples; // ZPass_A
-            c[0] = samples; // Total_A
+            c[0] = total;   // Total_A
+            // REGPU_TRACE_ZPD_RESULTS=1: the answers given (40 after it is switched on).
+            static LiveSwitch traceResults("REGPU_TRACE_ZPD_RESULTS");
+            static int resultsLogged = 0;
+            if (!traceResults)
+                resultsLogged = 0;
+            else if (resultsLogged++ < 40)
+                Log("zpd result: zpass %u total %u", samples, total);
         }
         break;
     }

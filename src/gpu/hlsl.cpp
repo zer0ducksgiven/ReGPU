@@ -207,6 +207,16 @@ float3 CubeDirection(float3 stf)
 }
 
 float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel);
+static int gFilterOverride = -1; // the fetch instruction's filter (0 point, 1 linear), -1 the constant's
+// The sampler for a fetch: the constant's mode (0 linear wrap, 1 linear clamp, 2 point clamp, 3 point
+// wrap), its filter replaced by the instruction's when it has one.
+uint FetchMode(uint mode)
+{
+    const bool wrap = mode == 0u || mode == 3u;
+    if (gFilterOverride == 0) return wrap ? 3u : 2u;
+    if (gFilterOverride == 1) return wrap ? 0u : 1u;
+    return mode;
+}
 
 // Sampling with a LOD bias is a pixel-shader-only operation: a vertex shader cannot compute an
 // implicit LOD, and dxc rejects the module outright ("sampling with implicit lod is only allowed
@@ -303,7 +313,7 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     if ((tinfo[slot].x >> 18) & 1u) uv.x = clamp(uv.x, 0.5 / texelSize.x, 1.0 - 0.5 / texelSize.x);
     if ((tinfo[slot].x >> 19) & 1u) uv.y = clamp(uv.y, 0.5 / texelSize.y, 1.0 - 0.5 / texelSize.y);
     if (tbias[slot].z > 0.0) uv *= tbias[slot].zw; // declared image inside a wider resolved texture (renderer.cpp)
-    uint mode = tinfo[slot].x & 3u;
+    uint mode = FetchMode(tinfo[slot].x & 3u);
     // Vertex shaders read data tables this way (PGR4's riders: bone matrices, three texels a bone):
     // the fetch constant's filter applies, point sampling exactly one texel. Always linear here,
     // each matrix row was blended with its neighbours and the bodies came out mangled.
@@ -719,7 +729,14 @@ struct Emitter
                 f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
             // Declared, then assigned: fxc drops the value when the fetch initialises the declaration
             // in some shaders ("internal error: invalid access of unbound variable").
-            body = std::string("{ float4 t; t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+            // The instruction's own filter (mag filter 0 point, 1 linear) overrides the fetch constant's,
+            // as on the console. PGR4's brake light glow reads an 8x6 visibility map in its vertex
+            // shader with point filtering; filtered by the constant's linear filter, each bulb's glow
+            // came and went as the car moved a fraction of a texel. REGPU_NO_FETCH_FILTER_OVERRIDE=1: ignored.
+            static const bool noOverride = getenv("REGPU_NO_FETCH_FILTER_OVERRIDE") != nullptr;
+            const bool overrides = !noOverride && (f.magFilter == 0 || f.magFilter == 1);
+            body = std::string("{ float4 t; ") + (overrides ? "gFilterOverride = " + std::to_string(f.magFilter) + "; " : "") + "t = " + call + "; " +
+                (overrides ? "gFilterOverride = -1; " : "") + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
             result.usedTextureSlots |= 1u << f.constIndex;
         }
         else if (f.opcode == 18 && pixel)
