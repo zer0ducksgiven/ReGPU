@@ -9853,8 +9853,19 @@ void PrecompileAll()
         if (now - lastPresent > std::chrono::milliseconds(33))
         {
             lastPresent = now;
-            g_hold.active = true;
-            HoldPresent();
+            // Past a moment the stored set's shaders are compiling (a first boot after a translator
+            // change rebuilds them all, minutes on a large cache): the host's boot screen with this
+            // phase's progress, not a held black frame.
+            const regpu::Host& host = regpu::GetHost();
+            std::vector<uint8_t> frame;
+            if (now - start > std::chrono::seconds(2) && host.bootScreen &&
+                host.bootScreen(L"COMPILING SHADERS", uint32_t(nextKey), uint32_t(keys.size()), frame))
+                BootPresent(frame);
+            else
+            {
+                g_hold.active = true;
+                HoldPresent();
+            }
         }
         Sleep(1);
     }
