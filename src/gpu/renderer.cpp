@@ -2251,7 +2251,7 @@ bool GuestReadable(const uint8_t* p, size_t bytes)
 // REGPU_PERF: UploadGuest's bytes hashed and copied (logged with the frame stats).
 struct UploadStats
 {
-    std::atomic<uint64_t> hashed{ 0 }, copied{ 0 }, hits{ 0 }, copies{ 0 };
+    std::atomic<uint64_t> hashed{ 0 }, copied{ 0 }, hits{ 0 }, copies{ 0 }, sampledHits{ 0 };
 } g_uploadStats;
 
 // Copies a guest range into the ring once per frame; draws sharing a vertex
@@ -2302,6 +2302,38 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     // kept the first draw's copy, and later draws put marks at old positions. REGPU_UPLOAD_SAMPLED=1:
     // 16 samples, as before. (Without the mapping every large buffer is copied: sampled there.)
     static LiveSwitch uploadSampled("REGPU_UPLOAD_SAMPLED");
+    const uint64_t key = uint64_t(guest) << 32 | bytes;
+    // Each recording thread keeps its own cache (cleared when the frame changes).
+    thread_local FrameMap<std::pair<UINT64, uint64_t>> uploads;
+    // A range never seen changing, hashed for 600 frames, is checked in full at its first use in a frame
+    // and later in the frame by the sampled hash. FH1 free roam reuses one 32 KB vertex range 352 times a
+    // frame; hashed in full each time, the uploads were 8% of the frame time on a paused frame. A range
+    // seen changing once (a sampled check that finds a change counts) is checked in full at every use
+    // for good, as the skid marks need: so only a range's first change ever, made between two draws of a
+    // frame where the samples miss it, could be read stale, and only for the rest of that frame (a
+    // skid mark buffer idle since the load, at the first slide). Opt-in for that:
+    // REGPU_UPLOAD_STABLE_REUSE=1 (FH1: +5% on a paused frame, +1-2% driving, perf timing on).
+    struct Stable
+    {
+        uint64_t full = 0, sampled = 0, since = 0, sampledFrame = ~0ull;
+        bool changed = false;
+    };
+    thread_local std::unordered_map<uint64_t, Stable> stable;
+    static LiveSwitch stableReuse("REGPU_UPLOAD_STABLE_REUSE");
+    const bool trackStable = stableReuse && !uploadSampled;
+    const auto* known = uploads.Find(key, g_r.frame);
+    if (known && trackStable)
+        if (auto it = stable.find(key); it != stable.end() && it->second.sampledFrame == g_r.frame && !it->second.changed &&
+            g_r.frame >= it->second.since + 600)
+        {
+            if (ContentHash(src, bytes) == it->second.sampled)
+            {
+                g_uploadStats.hits++;
+                g_uploadStats.sampledHits++;
+                return known->first;
+            }
+            it->second.changed = true;
+        }
     if (bytes > fullHashBytes && g_r.physical && !uploadSampled)
         sample = FullHash(src, bytes);
     else if (bytes <= fullHashBytes)
@@ -2313,9 +2345,24 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
             memcpy(&v, src + (uint64_t(bytes - 8) * i / 15), 8);
             sample = (sample ^ v) * 0x100000001B3ull;
         }
-    const uint64_t key = uint64_t(guest) << 32 | bytes;
-    // Each recording thread keeps its own cache (cleared when the frame changes).
-    thread_local FrameMap<std::pair<UINT64, uint64_t>> uploads;
+    if (trackStable)
+    {
+        // Ring-style ranges keep appearing at new addresses: past 64K ranges, those never seen changing
+        // are dropped (and start their 600 frames again); the ones that changed stay marked.
+        if (stable.size() > (1u << 16))
+            std::erase_if(stable, [](const auto& e) { return !e.second.changed; });
+        Stable& s = stable[key];
+        if (!s.since)
+            s.since = g_r.frame;
+        else if (s.full != sample)
+            s.changed = true;
+        s.full = sample;
+        if (s.sampledFrame != g_r.frame || !known || known->second != sample)
+        {
+            s.sampled = ContentHash(src, bytes);
+            s.sampledFrame = g_r.frame;
+        }
+    }
     g_uploadStats.hashed += bytes;
     // REGPU_TRACE_UPLOADS=1: the ranges hashed most (bytes and uses a frame), every 240 frames. FH1 free
     // roam: one 32 KB vertex range used by 352 draws a frame is 40% of the ~26 MB.
@@ -2341,7 +2388,7 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
             lastFrame = g_r.frame;
         }
     }
-    if (const auto* known = uploads.Find(key, g_r.frame); known && known->second == sample)
+    if (known && known->second == sample)
     {
         g_uploadStats.hits++;
         return known->first;
@@ -9534,9 +9581,10 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         if (perf && g_perf.frames)
             Log("perf:   descriptor tables built %.0f, reused %.0f per frame", double(g_perf.tablesBuilt) / g_perf.frames, double(g_perf.tablesReused) / g_perf.frames);
         if (perf && g_perf.frames)
-            Log("perf:   uploads: %.1f MB hashed, %.1f MB copied (%.0f copies, %.0f reused) per frame",
+            Log("perf:   uploads: %.1f MB hashed, %.1f MB copied (%.0f copies, %.0f reused, %.0f of them by samples) per frame",
                 double(g_uploadStats.hashed.exchange(0)) / g_perf.frames / 1048576.0, double(g_uploadStats.copied.exchange(0)) / g_perf.frames / 1048576.0,
-                double(g_uploadStats.copies.exchange(0)) / g_perf.frames, double(g_uploadStats.hits.exchange(0)) / g_perf.frames);
+                double(g_uploadStats.copies.exchange(0)) / g_perf.frames, double(g_uploadStats.hits.exchange(0)) / g_perf.frames,
+                double(g_uploadStats.sampledHits.exchange(0)) / g_perf.frames);
         if (perf && g_perf.frames)
         {
             // Order of RecordedList::Op.
