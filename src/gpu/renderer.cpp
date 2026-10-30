@@ -923,6 +923,40 @@ __attribute__((target("avx2"))) uint64_t FullHashAvx2(const uint8_t* data, size_
     return h ^ (h >> 33);
 }
 
+// FullHashAvx2's accumulate in 128-bit halves, for CPUs without AVX2 (FX-8350: its 64-bit multiplies
+// are slow, the scalar lanes below were ~13% of the draw thread).
+uint64_t FullHashSse2(const uint8_t* data, size_t bytes)
+{
+    const __m128i k0 = _mm_set_epi64x(0x7C01812CF721AD1Cull, 0xDB979083E96DD4DEull), k1 = _mm_set_epi64x(0x1CAD21F72C81017Cull, 0xBE4BA423396CFEB8ull);
+    const __m128i k2 = _mm_set_epi64x(0xD8ACDEA946EF1938ull, 0x3F349CE33F76FAA8ull), k3 = _mm_set_epi64x(0x1F67B3B7A4A44072ull, 0x78E5C0CC4EE679CBull);
+    __m128i a0 = _mm_set1_epi64x(int64_t(0x9E3779B97F4A7C15ull ^ bytes)), a1 = a0;
+    __m128i b0 = _mm_set1_epi64x(int64_t(0xC2B2AE3D27D4EB4Full)), b1 = b0;
+    const auto acc = [](__m128i& s, __m128i d, __m128i k) {
+        const __m128i x = _mm_xor_si128(d, k);
+        s = _mm_add_epi64(s, _mm_add_epi64(_mm_mul_epu32(x, _mm_srli_epi64(x, 32)), _mm_shuffle_epi32(d, 0x4E)));
+    };
+    size_t i = 0;
+    for (; i + 64 <= bytes; i += 64)
+    {
+        acc(a0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i)), k0);
+        acc(a1, _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i + 16)), k1);
+        acc(b0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i + 32)), k2);
+        acc(b1, _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i + 48)), k3);
+    }
+    alignas(16) uint64_t lanes[8];
+    _mm_store_si128(reinterpret_cast<__m128i*>(lanes), a0);
+    _mm_store_si128(reinterpret_cast<__m128i*>(lanes + 2), a1);
+    _mm_store_si128(reinterpret_cast<__m128i*>(lanes + 4), b0);
+    _mm_store_si128(reinterpret_cast<__m128i*>(lanes + 6), b1);
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (uint64_t v : lanes)
+        h = (h ^ v) * 0xFF51AFD7ED558CCDull, h ^= h >> 29;
+    for (; i < bytes; i++)
+        h = (h ^ data[i]) * 0x100000001B3ull;
+    h = (h ^ (h >> 33)) * 0xC4CEB9FE1A85EC53ull;
+    return h ^ (h >> 33);
+}
+
 // Every byte of the data, four independent 64-bit lanes at a time (a dword-by-dword chain waits on each
 // multiply). For data whose every byte matters and that is checked every frame: index buffers.
 // (AVX2 where the CPU has it; REGPU_SCALAR_HASH=1: the scalar lanes.)
@@ -931,6 +965,9 @@ uint64_t FullHash(const uint8_t* data, size_t bytes)
     static const bool avx2 = IsProcessorFeaturePresent(40 /* PF_AVX2_INSTRUCTIONS_AVAILABLE */) && !getenv("REGPU_SCALAR_HASH");
     if (avx2 && bytes >= 256)
         return FullHashAvx2(data, bytes);
+    static LiveSwitch scalar("REGPU_SCALAR_HASH_LIVE"); // the scalar lanes on a CPU without AVX2 (A/B)
+    if (!avx2 && bytes >= 256 && !scalar)
+        return FullHashSse2(data, bytes);
     uint64_t a = 0xCBF29CE484222325ull ^ bytes, b = 0x9E3779B97F4A7C15ull, c = 0xC2B2AE3D27D4EB4Full, d = 0x165667B19E3779F9ull;
     size_t i = 0;
     for (; i + 32 <= bytes; i += 32)
