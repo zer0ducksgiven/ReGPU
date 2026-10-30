@@ -1262,6 +1262,7 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    case 5: if (!(oC[0].a != pinfo2.x)) discard; break;\n"
              "    case 6: if (!(oC[0].a >= pinfo2.x)) discard; break;\n"
              "    }\n"
+             "    if (pinfo.z & 64u) { uint2 q = uint2(input.pos.xy) & 1u; if (!(oC[0].a >= 1.0 - float((pinfo.z >> (8u + ((q.x << 1) | q.y) * 2u)) & 3u) * 0.25)) discard; } // alpha to mask, dithered\n"
              "    oC[0] *= exp2(float(int(pinfo.w))); // colour exponent bias (RB_COLOR_INFO), after the alpha test\n"
              "    if (pinfo.z & 8u) oC[0] = clamp(oC[0], -32.0, 32.0); // 16_16 fixed range\n"
              "    if (pinfo.z & 32u) oC[0].a = round(saturate(oC[0].a) * 3.0) / 3.0; // 2-bit alpha surface (k_2_10_10_10_FLOAT)\n"

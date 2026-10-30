@@ -3550,7 +3550,8 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     rt.DestBlendAlpha = AlphaBlend(dstA);
     rt.BlendOpAlpha = BlendOp(opA);
     rt.RenderTargetWriteMask = UINT8(mask);
-    pd.BlendState.AlphaToCoverageEnable = alphaToMask; // one sample: coverage where alpha >= 0.5
+    // (One sample: dithered in the pixel shader instead, see DrawImpl, unless REGPU_NO_ALPHA_DITHER.)
+    pd.BlendState.AlphaToCoverageEnable = alphaToMask && (g_msaa > 1 || getenv("REGPU_NO_ALPHA_DITHER"));
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -6007,6 +6008,16 @@ void Resolve()
         const float* destRange = !depth && !noFixed16Clamp && destFormat >= 24 && destFormat <= 26
             ? (numberFormat == 1 || numberFormat == 3 ? kSigned16 : kUnsigned16)
             : !depth && destFormat == 7 && format == DXGI_FORMAT_R16G16B16A16_FLOAT ? kUnorm : nullptr;
+        // A 7e3 surface (colour formats 3, 12) holds 0..31.875: additive blends past that saturate in
+        // the EDRAM, but sum on in our half-float target, so the copy is held to it (scaled with the
+        // exponent bias). Unclamped, PGR4's menu crowd flashes (a pile of additive sprites) fed its
+        // bloom values far past the console's: a white-cyan glare over the crowd.
+        // REGPU_NO_7E3_RESOLVE_CLAMP=1: unclamped.
+        static LiveSwitch no7e3Clamp("REGPU_NO_7E3_RESOLVE_CLAMP");
+        float k7e3[2] = { 0.0f, 31.875f * std::ldexp(1.0f, bias) };
+        if (const uint32_t colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF;
+            !destRange && !depth && !no7e3Clamp && format == DXGI_FORMAT_R16G16B16A16_FLOAT && (colorFormat == 3 || colorFormat == 12))
+            destRange = k7e3;
         // A k_8_8_8_8_GAMMA surface (colour format 1) holds gamma in memory: our surfaces keep linear,
         // so the copy encodes it, as the EDRAM does, for the gamma-signed fetches that read it back
         // and for the front buffer.
@@ -8721,8 +8732,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // A k_2_10_10_10_FLOAT surface (formats 3, 12) keeps 2 bits of alpha (see the resolve's
         // REGPU_NO_RESOLVE_ALPHA2); the draw's output is rounded as the EDRAM stores it. (Blending
         // with the stored alpha still reads ours, unrounded.) REGPU_NO_ALPHA2=1: as before.
+        // Not when the colour blend reads the source alpha (factors 6, 7, 16): the blender takes the
+        // shader's alpha at full precision, only the stored value has 2 bits. Rounded, PGR4's menu
+        // ground (blended over the tyre smoke by its alpha) cut the smoke into hard grey steps.
         static LiveSwitch noAlpha2("REGPU_NO_ALPHA2");
-        if (!noAlpha2 && (format == 3 || format == 12))
+        const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0), srcFactor = blend & 0x1F, dstFactor = (blend >> 8) & 0x1F;
+        auto readsSrcAlpha = [](uint32_t f) { return f == 6 || f == 7 || f == 16; };
+        if (!noAlpha2 && (format == 3 || format == 12) && !readsSrcAlpha(srcFactor) && !readsSrcAlpha(dstFactor))
             pc->info[2] |= 32u;
     }
     // A vertex shader that allocates interpolators but exports none (depth-only shaders end with an
@@ -8732,6 +8748,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // In depth-only passes such kills are skipped (bit 2). REGPU_NO_KILL_SKIP=1: kept.
     if (LiveSwitch &noKillSkip = g_sw_REGPU_NO_KILL_SKIP; !noKillSkip && edramMode == 5 && !vs.info.interpolatorsWritten)
         pc->info[2] |= 4u;
+    // Alpha to mask (RB_COLORCONTROL bit 4) on a single-sample target: as Xenia, a 2x2 dither, each
+    // pixel keeping its colour where alpha >= 1 - offset/4, the offsets RB_COLORCONTROL bits 24-31
+    // (pinfo.z bit 6, offsets in bits 8-15). D3D's coverage cut everything at alpha 0.5: PGR4's menu
+    // tyre smoke came out as hard-edged grey shapes. REGPU_NO_ALPHA_DITHER=1: D3D's coverage.
+    if (static LiveSwitch noAlphaDither("REGPU_NO_ALPHA_DITHER"); !noAlphaDither && g_msaa == 1 && edramMode != 5 && (colorControl >> 4) & 1)
+        pc->info[2] |= 64u | (colorControl >> 24) << 8;
     // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
     // and must keep spanning the width (squeezing them warped the image outside 16:9).
     vc->vwide[3] = g_drawSamplesResolve ? 0.0f : 1.0f;
