@@ -884,10 +884,44 @@ uint64_t Fnv(const void* data, size_t bytes, uint64_t h = 0xCBF29CE484222325ull)
     return h;
 }
 
+// FullHash with AVX2: 64 bytes a step in two 256-bit accumulators (each 32-bit half of the data, mixed
+// with a key, multiplied into the other half: XXH3's accumulate). FH1 hashes ~16 MB of vertex and index
+// data a frame (buffers reused within the frame are checked again before each draw); the scalar lanes
+// took ~1 ms of it.
+__attribute__((target("avx2"))) uint64_t FullHashAvx2(const uint8_t* data, size_t bytes)
+{
+    const __m256i k0 = _mm256_set_epi64x(0x1CAD21F72C81017Cull, 0xBE4BA423396CFEB8ull, 0x7C01812CF721AD1Cull, 0xDB979083E96DD4DEull);
+    const __m256i k1 = _mm256_set_epi64x(0x1F67B3B7A4A44072ull, 0x78E5C0CC4EE679CBull, 0xD8ACDEA946EF1938ull, 0x3F349CE33F76FAA8ull);
+    __m256i a = _mm256_set1_epi64x(int64_t(0x9E3779B97F4A7C15ull ^ bytes)), b = _mm256_set1_epi64x(int64_t(0xC2B2AE3D27D4EB4Full));
+    size_t i = 0;
+    for (; i + 64 <= bytes; i += 64)
+    {
+        const __m256i d0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
+        const __m256i d1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i + 32));
+        const __m256i x0 = _mm256_xor_si256(d0, k0), x1 = _mm256_xor_si256(d1, k1);
+        a = _mm256_add_epi64(a, _mm256_add_epi64(_mm256_mul_epu32(x0, _mm256_srli_epi64(x0, 32)), _mm256_shuffle_epi32(d0, 0x4E)));
+        b = _mm256_add_epi64(b, _mm256_add_epi64(_mm256_mul_epu32(x1, _mm256_srli_epi64(x1, 32)), _mm256_shuffle_epi32(d1, 0x4E)));
+    }
+    alignas(32) uint64_t lanes[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), a);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes + 4), b);
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (uint64_t v : lanes)
+        h = (h ^ v) * 0xFF51AFD7ED558CCDull, h ^= h >> 29;
+    for (; i < bytes; i++)
+        h = (h ^ data[i]) * 0x100000001B3ull;
+    h = (h ^ (h >> 33)) * 0xC4CEB9FE1A85EC53ull;
+    return h ^ (h >> 33);
+}
+
 // Every byte of the data, four independent 64-bit lanes at a time (a dword-by-dword chain waits on each
 // multiply). For data whose every byte matters and that is checked every frame: index buffers.
+// (AVX2 where the CPU has it; REGPU_SCALAR_HASH=1: the scalar lanes.)
 uint64_t FullHash(const uint8_t* data, size_t bytes)
 {
+    static const bool avx2 = IsProcessorFeaturePresent(40 /* PF_AVX2_INSTRUCTIONS_AVAILABLE */) && !getenv("REGPU_SCALAR_HASH");
+    if (avx2 && bytes >= 256)
+        return FullHashAvx2(data, bytes);
     uint64_t a = 0xCBF29CE484222325ull ^ bytes, b = 0x9E3779B97F4A7C15ull, c = 0xC2B2AE3D27D4EB4Full, d = 0x165667B19E3779F9ull;
     size_t i = 0;
     for (; i + 32 <= bytes; i += 32)
@@ -2214,6 +2248,12 @@ bool GuestReadable(const uint8_t* p, size_t bytes)
     return true;
 }
 
+// REGPU_PERF: UploadGuest's bytes hashed and copied (logged with the frame stats).
+struct UploadStats
+{
+    std::atomic<uint64_t> hashed{ 0 }, copied{ 0 }, hits{ 0 }, copies{ 0 };
+} g_uploadStats;
+
 // Copies a guest range into the ring once per frame; draws sharing a vertex
 // buffer reuse the copy. A sampled hash catches ranges rewritten mid-frame.
 UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
@@ -2276,8 +2316,14 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     const uint64_t key = uint64_t(guest) << 32 | bytes;
     // Each recording thread keeps its own cache (cleared when the frame changes).
     thread_local FrameMap<std::pair<UINT64, uint64_t>> uploads;
+    g_uploadStats.hashed += bytes;
     if (const auto* known = uploads.Find(key, g_r.frame); known && known->second == sample)
+    {
+        g_uploadStats.hits++;
         return known->first;
+    }
+    g_uploadStats.copies++;
+    g_uploadStats.copied += bytes;
     if (RendererTracing() && bytes > (16u << 10))
         Log("upload: %08X %u bytes (ring %llu)", guest, bytes, (unsigned long long)f.ringUsed.load());
     const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
@@ -9463,6 +9509,10 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         g_gpuFrames = 0;
         if (perf && g_perf.frames)
             Log("perf:   descriptor tables built %.0f, reused %.0f per frame", double(g_perf.tablesBuilt) / g_perf.frames, double(g_perf.tablesReused) / g_perf.frames);
+        if (perf && g_perf.frames)
+            Log("perf:   uploads: %.1f MB hashed, %.1f MB copied (%.0f copies, %.0f reused) per frame",
+                double(g_uploadStats.hashed.exchange(0)) / g_perf.frames / 1048576.0, double(g_uploadStats.copied.exchange(0)) / g_perf.frames / 1048576.0,
+                double(g_uploadStats.copies.exchange(0)) / g_perf.frames, double(g_uploadStats.hits.exchange(0)) / g_perf.frames);
         if (perf && !g_created.empty())
         {
             std::string s;
