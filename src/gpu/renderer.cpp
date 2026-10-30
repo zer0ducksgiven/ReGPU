@@ -512,6 +512,65 @@ struct Renderer
 
 Renderer g_r;
 std::atomic<uint32_t> g_lastFrameDraws{ 0 }; // the debug server's status
+
+// REGPU_LEAN_FETCH's sampler table (Init): the eight samplers in banks. A change of texture filtering
+// (regpu::SetAnisotropy) is written into the next bank and the draws switch to it, so frames still in
+// flight keep reading the one they were recorded with.
+constexpr UINT kSamplerBanks = 4;
+D3D12_SAMPLER_DESC g_samplerBase[8]{};
+UINT g_samplerStride = 0;
+std::atomic<UINT> g_samplerBank{ 0 };
+std::atomic<int> g_anisoRequest{ -1 }, g_anisoApplied{ -1 };
+std::mutex g_samplerMutex;
+
+void WriteSamplerBank(UINT bank, int aniso)
+{
+    for (UINT i = 0; i < 8; i++)
+    {
+        D3D12_SAMPLER_DESC s = g_samplerBase[i];
+        // The wrapping linear samplers (s0 and the anisotropic s4-s7): surface textures. The clamped
+        // and point ones (shadow maps, render targets, lookups) stay as they are.
+        const bool surface = i == 0 || i >= 4;
+        if (surface && aniso == 0)
+        {
+            s.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            s.MaxAnisotropy = 0;
+        }
+        else if (surface && aniso > 0)
+        {
+            s.Filter = aniso > 1 ? D3D12_FILTER_ANISOTROPIC : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            s.MaxAnisotropy = UINT(std::clamp(aniso, 1, 16));
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += size_t(bank * 8 + i) * g_samplerStride;
+        g_r.device->CreateSampler(&s, h);
+    }
+}
+
+// The sampler table for the next draw, after a filtering change if one is pending (draw thread).
+D3D12_GPU_DESCRIPTOR_HANDLE SamplerTable()
+{
+    if (g_anisoRequest.load(std::memory_order_relaxed) != g_anisoApplied.load(std::memory_order_acquire))
+    {
+        std::lock_guard lock(g_samplerMutex); // (draw workers may get here together)
+        if (const int want = g_anisoRequest.load(); want != g_anisoApplied.load())
+        {
+            const UINT bank = (g_samplerBank.load() + 1) % kSamplerBanks;
+            WriteSamplerBank(bank, want);
+            g_samplerBank.store(bank);
+            g_anisoApplied.store(want, std::memory_order_release);
+            Log("renderer: texture filtering %d (sampler bank %u)", want, bank);
+        }
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetGPUDescriptorHandleForHeapStart();
+    h.ptr += uint64_t(g_samplerBank.load()) * 8 * g_samplerStride;
+    return h;
+}
+}
+
+void regpu::SetAnisotropy(int maxAnisotropy)
+{
+    g_anisoRequest.store(maxAnisotropy, std::memory_order_relaxed);
 }
 uint32_t RendererLastFrameDraws() { return g_lastFrameDraws.load(std::memory_order_relaxed); }
 namespace
@@ -871,7 +930,7 @@ struct DrawState
     uint32_t stencilRef = ~0u;
     float blendFactor[4] = { -1, -1, -1, -1 };
     ID3D12PipelineState* pso = nullptr;
-    D3D12_GPU_DESCRIPTOR_HANDLE table2{}, table3{};
+    D3D12_GPU_DESCRIPTOR_HANDLE table2{}, table3{}, samplers{};
     D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     bool motionTargets = false; // the motion target is bound as the second render target
     bool motionRoot = false;    // the motion root signature is set
@@ -1659,13 +1718,13 @@ void Init()
         rs.NumParameters = 5;
         D3D12_DESCRIPTOR_HEAP_DESC sh{};
         sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-        sh.NumDescriptors = 8;
+        sh.NumDescriptors = 8 * kSamplerBanks;
         sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         Check(d->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&g_r.samplerHeap)), "CreateDescriptorHeap(sampler)");
-        const UINT stride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        g_samplerStride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
         for (UINT i = 0; i < 8; i++)
         {
-            D3D12_SAMPLER_DESC s{};
+            D3D12_SAMPLER_DESC& s = g_samplerBase[i];
             s.Filter = samplers[i].Filter;
             s.AddressU = samplers[i].AddressU;
             s.AddressV = samplers[i].AddressV;
@@ -1673,10 +1732,8 @@ void Init()
             s.MaxAnisotropy = samplers[i].MaxAnisotropy;
             s.ComparisonFunc = samplers[i].ComparisonFunc;
             s.MaxLOD = samplers[i].MaxLOD;
-            D3D12_CPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetCPUDescriptorHandleForHeapStart();
-            h.ptr += size_t(i) * stride;
-            d->CreateSampler(&s, h);
         }
+        WriteSamplerBank(0, -1);
     }
     ComPtr<ID3DBlob> blob, error;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
@@ -9324,9 +9381,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         ds.table3 = t3;
         C().list->SetGraphicsRootDescriptorTable(3, t3);
-        if (g_r.samplerHeap) // set again with the table (after a root signature switch)
-            C().list->SetGraphicsRootDescriptorTable(4, g_r.samplerHeap->GetGPUDescriptorHandleForHeapStart());
+        ds.samplers = {}; // set again with it (after a root signature switch)
     }
+    if (g_r.samplerHeap)
+        if (const D3D12_GPU_DESCRIPTOR_HANDLE s = SamplerTable(); s.ptr != ds.samplers.ptr)
+        {
+            ds.samplers = s;
+            C().list->SetGraphicsRootDescriptorTable(4, s);
+        }
     // REGPU_CAPTURE_COMPOSITE=<n>: trace (as F12) the n-th frame that draws into the 2048-wide
     // surface (pitch field 0x820: a 2048-wide composite), from its first such draw on.
     if (static const int compositeN = getenv("REGPU_CAPTURE_COMPOSITE") ? atoi(getenv("REGPU_CAPTURE_COMPOSITE")) : 0;

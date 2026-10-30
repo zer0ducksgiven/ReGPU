@@ -1445,17 +1445,19 @@ void CommandProcessorLoop(PPCContext& ctx)
 
 // Frames per second the game may present: max FPS, or the display's refresh rate if lower
 // and vsync is on.
+// Follows the settings as they change (regpu::SetFrameLimit: a host's options screen).
 uint32_t FrameCap()
 {
-    static const uint32_t cap = [] {
-        const Settings& s = GetSettings();
-        uint32_t c = s.maxFps;
-        if (s.vsync)
-            c = std::min(c, DisplayRefreshHz());
+    static const uint32_t refresh = DisplayRefreshHz();
+    const Settings& s = GetSettings();
+    uint32_t c = s.maxFps;
+    if (s.vsync)
+        c = std::min(c, refresh);
+    c = std::max(c, 30u);
+    static std::atomic<uint32_t> logged{ 0 };
+    if (logged.exchange(c) != c)
         Log("gpu: frame cap %u fps (max %u, vsync %s)", c, s.maxFps, s.vsync ? "on" : "off");
-        return std::max(c, 30u);
-    }();
-    return cap;
+    return c;
 }
 
 void VblankLoop()
@@ -1467,11 +1469,9 @@ void VblankLoop()
         // The title presents on vblanks: every one in gameplay, often every second one in menus. It
         // keeps game time by the clock, not by frames, so vblanks run at twice the frame cap
         // (120-720 Hz) and the limiter in VdSwap sets the frame rate for both.
-        static const int64_t defaultUs = [] {
-            const char* v = getenv("REGPU_VBLANK_HZ");
-            const int hz = v ? std::clamp(atoi(v), 30, 1000) : std::clamp(int(FrameCap()) * 2, 120, 720);
-            return int64_t(1000000 / hz);
-        }();
+        static const char* fixedHz = getenv("REGPU_VBLANK_HZ");
+        const int hz = fixedHz ? std::clamp(atoi(fixedHz), 30, 1000) : std::clamp(int(FrameCap()) * 2, 120, 720);
+        const int64_t defaultUs = int64_t(1000000 / hz);
         // A host that owns the video mode (driver::SetRefreshRate) sets the rate instead.
         const int64_t hostUs = g_vblankUs.load(std::memory_order_relaxed);
         next += std::chrono::microseconds(hostUs ? hostUs : defaultUs);
@@ -1587,7 +1587,7 @@ void PaceSwap(uint64_t frame)
     // Frame limiter (settings: max FPS, the display's refresh with vsync): the title's render
     // thread waits for its next frame slot. Vblanks run faster than the cap, so menus (which
     // present every second vblank) and gameplay (every vblank) both reach it.
-    static const int64_t minFrameUs = int64_t(1000000 / FrameCap());
+    const int64_t minFrameUs = int64_t(1000000 / FrameCap());
     if (minFrameUs)
     {
         static auto next = Clock::now();
@@ -1603,6 +1603,13 @@ void PaceSwap(uint64_t frame)
         next = std::max(next, now) + std::chrono::microseconds(minFrameUs);
     }
 }
+}
+
+void regpu::SetFrameLimit(uint32_t maxFps, bool vsync)
+{
+    Settings& s = GetSettings();
+    s.maxFps = maxFps;
+    s.vsync = vsync;
 }
 
 // Driver entry points (include/regpu/driver.h) ------------------------------
