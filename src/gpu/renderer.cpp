@@ -9249,6 +9249,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // In depth-only passes such kills are skipped (bit 2). REGPU_NO_KILL_SKIP=1: kept.
     if (LiveSwitch &noKillSkip = g_sw_REGPU_NO_KILL_SKIP; !noKillSkip && edramMode == 5 && !vs.info.interpolatorsWritten)
         pc->info[2] |= 4u;
+    // The pixel position register (PsParamGen) holds the pixel's integer position, D3D9's convention
+    // (Xenia: the host pixel rounded down, then the render scale undone); the host pixel's centre was
+    // half a host pixel past it. Screen-space lookups that add half a texel then read past the pixel's
+    // own texel (at 1.5, FH1's shadow passes' depth fetches one row apart could fall on one host row).
+    // Bit 6. REGPU_OLD_PIXEL_POS=1: the centre (A/B).
+    if (static LiveSwitch oldPixelPos("REGPU_OLD_PIXEL_POS"); !oldPixelPos)
+        pc->info[2] |= 64u;
     // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
     // and must keep spanning the width (squeezing them warped the image outside 16:9).
     vc->vwide[3] = g_drawSamplesResolve ? 0.0f : 1.0f;
