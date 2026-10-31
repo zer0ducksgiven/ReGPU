@@ -56,6 +56,21 @@ void DepthCopyMain(uint3 id : SV_DispatchThreadID)
     dst[p] = src.Load(int3(p, 0)).rrrr;
 }
 
+// Debug view of a temporal upscaler input, written over its output. rcasCon.x: 0 motion (RG, UV
+// offsets to last frame; grey is still, red and green are motion), 1 depth (R, as stored);
+// rcasCon.y (float bits): the motion gain, how much one UV unit moves the colour.
+[numthreads(8, 8, 1)]
+void ViewMain(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= outSize.xy))
+        return;
+    const float4 s = src.Load(int3(id.xy, 0));
+    if (rcasCon.x == 0u)
+        dst[id.xy] = float4(saturate(0.5 + s.rg * asfloat(rcasCon.y)), 0.5, 1.0);
+    else
+        dst[id.xy] = float4(saturate(s.rrr), 1.0);
+}
+
 // The display gamma table, as the console's display applies it to the front buffer: 17
 // points (con0..con3, rcasCon.x; floats) at 0, 1/16 .. 1, linear between; outSize the size.
 float GammaCurve(float x, float p[17])

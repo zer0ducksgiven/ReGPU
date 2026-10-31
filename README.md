@@ -38,6 +38,12 @@ target_link_libraries(game PRIVATE regpu)
 
 Options: `REGPU_FSR3` (with the FidelityFX signed DLLs), `REGPU_DLSS` and `REGPU_DLSS_DIR`.
 
+Upscaler debug views (live, with a temporal upscaler on: `py -3 tools/regpuctl.py switch NAME 1`):
+`REGPU_VIEW_MOTION=1` shows the motion the upscaler gets in place of its output (grey is still, red
+and green are motion, about +-8 px over the full range); `REGPU_VIEW_DEPTH=1` shows its depth as
+stored. The FSR 4 option is `Config::upscaler = Fsr4`; `REGPU_FSR_VERSION=<text>` picks the
+FidelityFX upscaler version whose name contains the text (the log lists them).
+
 Ship Microsoft's `d3dcompiler_47.dll` (the Windows SDK's `Redist\D3D\x64`, redistributable) beside
 your executable: ReGPU loads it from there first. Under Wine/Proton the system copy is Wine's own,
 which can't compile the translated shaders.

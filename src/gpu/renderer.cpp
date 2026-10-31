@@ -94,7 +94,7 @@ struct Upscale
 {
     bool tried = false, ready = false;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> easu, rcas, depthCopy, gamma, enhance;
+    ComPtr<ID3D12PipelineState> easu, rcas, depthCopy, gamma, enhance, view;
     ComPtr<ID3D12Resource> dlaaOut; // DLAA output (scene size), copied back into the scene image
     ComPtr<ID3D12Resource> depth; // temporal: the scene's depth as R32 (render size, top left)
     ComPtr<ID3D12Resource> temp; // EASU output (RGBA16F)
@@ -5671,6 +5671,7 @@ void BeginTemporalFrame()
 }
 
 void UpscaleResolved(uint32_t base);
+void ViewUpscalerInput(ID3D12Resource* source, DXGI_FORMAT sourceFormat, ID3D12Resource* out, bool depth, uint32_t width, uint32_t height);
 
 // DLSS or FSR 3 on the scene image at `base`: colour (render size), depth and motion (top left of
 // output-sized textures); the upscaled image replaces it like UpscaleResolved.
@@ -5759,6 +5760,16 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     const bool ok = dlss ? DlssEvaluate(C().list->Real(), setup, in)
                          : GetSettings().upscaler == Settings::Upscaler::Fsr4 ? Fsr4Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness)
                                                              : Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
+    {
+        static LiveSwitch viewMotion("REGPU_VIEW_MOTION"), viewDepth("REGPU_VIEW_DEPTH");
+        if (ok && (viewMotion || viewDepth))
+        {
+            if (viewMotion)
+                ViewUpscalerInput(g_upscale.motion.Get(), DXGI_FORMAT_R16G16_FLOAT, in.output, false, outWidth, outHeight);
+            else
+                ViewUpscalerInput(g_upscale.depth.Get(), DXGI_FORMAT_R32_FLOAT, in.output, true, outWidth, outHeight);
+        }
+    }
     barrier(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     if (dlaa && ok)
     {
@@ -5785,6 +5796,47 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
         return false;
     }
     return true;
+}
+
+// REGPU_VIEW_MOTION / REGPU_VIEW_DEPTH (live, see tools/regpuctl.py switch): show the upscaler's
+// motion or depth input in place of its output, to tune the motion path. Motion: grey is still, red
+// and green are motion (about +-8 px over the full range); depth: the stored value (reversed depth
+// reads white when near). `source` is in NON_PIXEL_SHADER_RESOURCE, `out` in UNORDERED_ACCESS.
+void ViewUpscalerInput(ID3D12Resource* source, DXGI_FORMAT sourceFormat, ID3D12Resource* out, bool depth, uint32_t width, uint32_t height)
+{
+    FrameResources& f = Frame();
+    if (!g_upscale.view || f.descriptorsUsed + 2 > kDescriptorsPerFrame)
+        return;
+    const UINT slots = f.descriptorBase + f.descriptorsUsed;
+    f.descriptorsUsed += 2;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = sourceFormat;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    g_r.device->CreateShaderResourceView(source, &srv, Cpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = out->GetDesc().Format;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_r.device->CreateUnorderedAccessView(out, nullptr, &uav, Cpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    uint32_t c[24] = {};
+    c[16] = depth ? 1u : 0u; // rcasCon.x
+    const float gain = float(width) / 16.0f; // one pixel of motion is 1/width: +-8 px fills the range
+    memcpy(&c[17], &gain, sizeof(gain));     // rcasCon.y
+    c[20] = width;
+    c[21] = height;
+    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() }; // (the upscaler may have changed them)
+    C().list->SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
+    C().list->SetComputeRootSignature(g_upscale.root.Get());
+    C().list->SetComputeRoot32BitConstants(0, 24, c, 0);
+    C().list->SetPipelineState(g_upscale.view.Get());
+    C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    C().list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    b.UAV.pResource = out;
+    C().list->ResourceBarrier(1, &b);
 }
 
 // The temporal upscale of the scene image at `base` (colour, depth, motion, jitter); FSR 1
@@ -5853,6 +5905,9 @@ bool InitUpscale()
         return false;
     pd.CS = { kEnhanceMain, sizeof(kEnhanceMain) };
     if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.enhance))))
+        return false;
+    pd.CS = { kViewMain, sizeof(kViewMain) };
+    if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.view))))
         return false;
     g_upscale.ready = true;
     Log("upscale: FSR 1 ready (scene at %.0f%% of %ux%u)", GetSettings().SceneScale() * 100.0f, OutputWidth(), OutputHeight());
