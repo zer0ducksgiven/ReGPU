@@ -6,6 +6,9 @@
 struct TextureFetch
 {
     uint32_t dwords[6];
+    // A mip level in the packed tail (TextureMipLevel): its place in the tail's tile, in blocks;
+    // overrides the fetch's own packed-mip offset. ~0u: none.
+    uint32_t tailX = ~0u, tailY = 0;
 
     uint32_t Type() const { return dwords[0] & 3; } // 2 = texture
     bool Tiled() const { return dwords[0] >> 31; }

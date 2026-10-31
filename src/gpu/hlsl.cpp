@@ -50,14 +50,14 @@ ByteAddressBuffer gphys : register(t1);   // guest physical memory (large vertex
 Texture2D<float4> gtex[] : register(t0, space1);
 TextureCube<float4> gcube[] : register(t0, space2);
 Texture3D<float4> gvol[] : register(t0, space3);
-// The four guest samplers as one array (a descriptor table, renderer.cpp), indexed by the fetch's mode
-// (0 linear wrap, 1 linear clamp, 2 point clamp, 3 point wrap): one sample instruction per fetch instead
-// of a branch to each of four.
-SamplerState gSamplers[4] : register(s0);
-#define sLinearWrap gSamplers[0]
-#define sLinearClamp gSamplers[1]
-#define sPointClamp gSamplers[2]
-#define sPointWrap gSamplers[3]
+SamplerState sLinearWrap : register(s0);
+SamplerState sLinearClamp : register(s1);
+SamplerState sPointClamp : register(s2);
+SamplerState sPointWrap : register(s3);
+SamplerState sAniso2Wrap : register(s4);
+SamplerState sAniso4Wrap : register(s5);
+SamplerState sAniso8Wrap : register(s6);
+SamplerState sAniso16Wrap : register(s7);
 
 static const float FLT_MAX = 3.402823466e+38;
 
@@ -288,7 +288,10 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
         Texture3D<float4> tv = gvol[index];
         const uint vmode = tinfo[slot].x & 3u;
         if (vertexStage) return tv.SampleLevel(sLinearClamp, coord, max(bias, 0));
-        return tv.SampleBias(gSamplers[vmode], coord, bias);
+        if (vmode == 1) return tv.SampleBias(sLinearClamp, coord, bias);
+        if (vmode == 2) return tv.SampleBias(sPointClamp, coord, bias);
+        if (vmode == 3) return tv.SampleBias(sPointWrap, coord, bias);
+        return tv.SampleBias(sLinearWrap, coord, bias);
     }
     if ((tinfo[slot].w & 0xFFu) == 3)
     {
@@ -299,11 +302,11 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
     if (denorm) uv = (uv + texel) / texelSize;
     else uv += texel / texelSize;
-    // Mirrored (tinfo.x bits 20 U, 21 V: repeating; 22 U, 23 V: once, then clamped below).
-    if ((tinfo[slot].x >> 20) & 1u) uv.x = 1.0 - abs(frac(uv.x * 0.5) * 2.0 - 1.0);
-    if ((tinfo[slot].x >> 21) & 1u) uv.y = 1.0 - abs(frac(uv.y * 0.5) * 2.0 - 1.0);
-    if ((tinfo[slot].x >> 22) & 1u) uv.x = abs(uv.x);
-    if ((tinfo[slot].x >> 23) & 1u) uv.y = abs(uv.y);
+    // Mirrored (tinfo.x bits 28 U, 29 V: repeating; 30 U, 31 V: once, then clamped below).
+    if ((tinfo[slot].x >> 28) & 1u) uv.x = 1.0 - abs(frac(uv.x * 0.5) * 2.0 - 1.0);
+    if ((tinfo[slot].x >> 29) & 1u) uv.y = 1.0 - abs(frac(uv.y * 0.5) * 2.0 - 1.0);
+    if ((tinfo[slot].x >> 30) & 1u) uv.x = abs(uv.x);
+    if ((tinfo[slot].x >> 31) & 1u) uv.y = abs(uv.y);
     // Clamp to border (tinfo.x bit 16; bit 17 white): outside the image the border colour, as
     // shadow maps rely on (white: nothing casts a shadow beyond the map).
     if (((tinfo[slot].x >> 16) & 1u) && any(uv < 0.0 || uv > 1.0))
@@ -317,10 +320,23 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     // Vertex shaders read data tables this way (PGR4's riders: bone matrices, three texels a bone):
     // the fetch constant's filter applies, point sampling exactly one texel. Always linear here,
     // each matrix row was blended with its neighbours and the bodies came out mangled.
-    // (Linear filtering clamps there: mode 0 reads as 1.)
+    // (fxc wants a literal sampler per call: one branch each.)
+    if (vertexStage && mode == 2)
+        return t.SampleLevel(sPointClamp, uv, max(bias, 0));
+    if (vertexStage && mode == 3)
+        return t.SampleLevel(sPointWrap, uv, max(bias, 0));
     if (vertexStage)
-        return t.SampleLevel(gSamplers[max(mode, 1u)], uv, max(bias, 0));
-    return REGPU_SAMPLE_BIAS_2D(t, gSamplers[mode], uv, bias);
+        return t.SampleLevel(sLinearClamp, uv, max(bias, 0));
+    if (mode == 1) return REGPU_SAMPLE_BIAS_2D(t, sLinearClamp, uv, bias);
+    if (mode == 2) return REGPU_SAMPLE_BIAS_2D(t, sPointClamp, uv, bias);
+    if (mode == 3) return REGPU_SAMPLE_BIAS_2D(t, sPointWrap, uv, bias);
+    // The fetch's anisotropy (renderer.cpp, tinfo.x bits 20-22): 1 2x, 2 4x, 3 8x, 4 16x.
+    uint aniso = (tinfo[slot].x >> 20) & 7u;
+    if (aniso == 1u) return REGPU_SAMPLE_BIAS_2D(t, sAniso2Wrap, uv, bias);
+    if (aniso == 2u) return REGPU_SAMPLE_BIAS_2D(t, sAniso4Wrap, uv, bias);
+    if (aniso == 3u) return REGPU_SAMPLE_BIAS_2D(t, sAniso8Wrap, uv, bias);
+    if (aniso == 4u) return REGPU_SAMPLE_BIAS_2D(t, sAniso16Wrap, uv, bias);
+    return REGPU_SAMPLE_BIAS_2D(t, sLinearWrap, uv, bias);
 }
 
 float4 CubeOp(float4 a, float4 b)
@@ -511,7 +527,10 @@ struct Emitter
         case 28: return "p = (" + A + " != 0.0); s = p ? 0.0 : 1.0;";
         case 29: return "p = (" + A + " > 0.0); s = p ? 0.0 : 1.0;";
         case 30: return "p = (" + A + " >= 0.0); s = p ? 0.0 : 1.0;";
-        case 31: return "p = (" + A + " == 0.0); s = p ? 0.0 : ((" + A + " == 1.0) ? 0.0 : " + A + ");";
+        // setp_inv: src 1 sets the predicate (dest 0); otherwise it clears, dest 1 for 0 or src itself
+        // (Xenia's ucode.h). The predicate was set for 0 instead: FH1's sun-shadow passes then ran their
+        // far cascade's taps on pixels the near ones had already shaded, a dark band ahead of the camera.
+        case 31: return "p = (" + A + " == 1.0); s = p ? 0.0 : ((" + A + " == 0.0) ? 1.0 : " + A + ");";
         case 32: return "p = (" + A + " - 1.0 <= 0.0); s = p ? 0.0 : " + A + " - 1.0;";
         case 33: return "p = false; s = FLT_MAX;";
         case 34: return "p = (" + A + " == 0.0); s = " + A + ";";
@@ -725,8 +744,12 @@ struct Emitter
                 : "float3(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ", " + reg +
                 comp[(f.srcSwizzle >> 4) & 3] + ")";
             char call[320];
-            snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
-                f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
+            if (LeanFetch() && pixel && f.dimension == 1)
+                snprintf(call, sizeof(call), "TFetch2D(%u, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
+                    f.denormalized ? "true" : "false", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
+            else
+                snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
+                    f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
             // Declared, then assigned: fxc drops the value when the fetch initialises the declaration
             // in some shaders ("internal error: invalid access of unbound variable").
             // The instruction's own filter (mag filter 0 point, 1 linear) overrides the fetch constant's,
@@ -1016,6 +1039,71 @@ const char* HlslPreamble()
     return kPreamble;
 }
 
+namespace
+{
+// REGPU_LEAN_FETCH=1 (opt-in, read at translation; its shaders cache apart, by their HLSL): a 2D
+// fetch in a pixel shader (the instruction's dimension) samples once, through the static samplers
+// as an array indexed by the fetch constant's filter, instead of one branch per sampler, and has
+// no 3D or cube paths. Full-screen post shaders make a dozen fetches a pixel (FH1's shadow mask).
+
+const char kLeanFetch[] = R"(
+SamplerState gsamp[8] : register(s0, space1); // s0-s7 again, as a table (renderer.cpp)
+
+float4 TFetch2D(uint slot, float3 coord, bool denorm, float bias, float2 texel)
+{
+    // A 3D or cube texture behind a 2D fetch: the full path (its heap index isn't a Texture2D's).
+    if ((tinfo[slot].w & 0xFFu) >= 2u)
+        return TFetch(slot, coord, denorm, false, bias, texel);
+    const uint info = tinfo[slot].x;
+    float2 uv = coord.xy;
+    const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
+    if (denorm) uv = (uv + texel) / texelSize;
+    else uv += texel / texelSize;
+    if (((info >> 16) & 1u) && any(uv < 0.0 || uv > 1.0))
+        return ((info >> 17) & 1u) ? float4(1, 1, 1, 1) : float4(0, 0, 0, 0);
+    if ((info >> 18) & 1u) uv.x = clamp(uv.x, 0.5 / texelSize.x, 1.0 - 0.5 / texelSize.x);
+    if ((info >> 19) & 1u) uv.y = clamp(uv.y, 0.5 / texelSize.y, 1.0 - 0.5 / texelSize.y);
+    if (tbias[slot].z > 0.0) uv *= tbias[slot].zw;
+    // Sampler index: the filter mode (1-3 its own sampler), else the anisotropy (s4-s7), else s0.
+    const uint mode = info & 3u, aniso = (info >> 20) & 7u;
+    const uint s = mode != 0u ? mode : (aniso >= 1u && aniso <= 4u ? aniso + 3u : 0u);
+    float4 v = gtex[asuint(tbias[slot].y)].SampleBias(gsamp[s], uv, bias);
+    uint gamma = (info >> 24) & 0xFu;
+    if (gamma != 0u)
+    {
+        [unroll] for (uint g = 0; g < 4; g++)
+            if ((gamma >> g) & 1u)
+                v[g] = PWLGammaToLinear(v[g]);
+    }
+    int expAdjust = int(info << 18) >> 26;
+    if (expAdjust != 0) v *= exp2(float(expAdjust));
+    uint w = tinfo[slot].w;
+    if (!(w >> 31))
+        return v;
+    float4 r;
+    [unroll] for (uint c = 0; c < 4; c++)
+    {
+        uint sel = (w >> (8 + 3 * c)) & 7u;
+        r[c] = sel < 4u ? v[sel] : (sel == 5u ? 1.0 : 0.0);
+    }
+    return r;
+}
+)";
+
+std::string Preamble()
+{
+    std::string h = kPreamble;
+    return LeanFetch() ? h + kLeanFetch : h;
+}
+} // namespace
+
+// Read at first use (the renderer's root signature), not at load: a port may set it before Start.
+bool LeanFetch()
+{
+    static const bool lean = getenv("REGPU_LEAN_FETCH") != nullptr;
+    return lean;
+}
+
 bool BakedVertexFetch()
 {
     static const bool baked = getenv("REGPU_DYNAMIC_VFETCH") == nullptr;
@@ -1100,7 +1188,7 @@ TranslatedShader TranslateShader(const Shader& shader)
         return result;
     }
 
-    std::string h = kPreamble;
+    std::string h = Preamble();
     std::vector<uint32_t> regs = ScalarRegisters(e.out);
     std::string decl;
     if (!shader.pixel)
@@ -1232,6 +1320,10 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    if (halfPixel && !snap && (vte.x & (1u << 31))) p.xy += 0.5;\n"
              "    if (vscale.w > 0.0) p.xy *= float2(vscale.w, voffset.w);\n"
              "    if (halfPixel && !snap && !(vte.x & (1u << 31))) p.xy += 0.5;\n"
+             "    // vte.x bit 28: a viewport-transformed draw with D3D9 pixel centres (PA_SU_VTX_CNTL bit 0\n"
+             "    // clear) is shifted the same half pixel, as Xenia does: the console samples it at integer\n"
+             "    // positions, and screen-space lookups that add half a texel then land on texel centres.\n"
+             "    if (!halfPixel && (vte.x & (1u << 28))) p.xy += 0.5;\n"
              "    p.xy += pointOffset;\n"
              "    if (vte.x & (1u << 8)) w = 1.0;\n"
              "    float2 ndc = float2(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0);\n"

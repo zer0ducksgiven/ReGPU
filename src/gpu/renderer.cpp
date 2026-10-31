@@ -444,6 +444,15 @@ struct PipelineEntry
 {
     ComPtr<ID3D12PipelineState> pso;
     std::atomic<int> state{ 0 }; // 0 building, 1 ready, 2 failed
+    // The build, run once by whoever claims it first: a pool thread, or a draw that must wait for it
+    // (WaitForPipeline), so that draw doesn't wait behind every build queued before it.
+    std::function<void()> build;
+    std::atomic<bool> claimed{ false };
+    void Build()
+    {
+        if (!claimed.exchange(true, std::memory_order_acq_rel))
+            build();
+    }
 };
 
 struct Renderer
@@ -463,7 +472,7 @@ struct Renderer
 
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12DescriptorHeap> srvHeap;     // shader visible
-    ComPtr<ID3D12DescriptorHeap> samplerHeap; // shader visible: the four guest samplers (root table 4)
+    ComPtr<ID3D12DescriptorHeap> samplerHeap; // REGPU_LEAN_FETCH: s0-s7 again as a table (space1, root parameter 4)
     ComPtr<ID3D12DescriptorHeap> stagingHeap; // CPU: null texture SRV
     UINT srvStride = 0;
     ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap;
@@ -513,6 +522,65 @@ struct Renderer
 
 Renderer g_r;
 std::atomic<uint32_t> g_lastFrameDraws{ 0 }; // the debug server's status
+
+// REGPU_LEAN_FETCH's sampler table (Init): the eight samplers in banks. A change of texture filtering
+// (regpu::SetAnisotropy) is written into the next bank and the draws switch to it, so frames still in
+// flight keep reading the one they were recorded with.
+constexpr UINT kSamplerBanks = 4;
+D3D12_SAMPLER_DESC g_samplerBase[8]{};
+UINT g_samplerStride = 0;
+std::atomic<UINT> g_samplerBank{ 0 };
+std::atomic<int> g_anisoRequest{ -1 }, g_anisoApplied{ -1 };
+std::mutex g_samplerMutex;
+
+void WriteSamplerBank(UINT bank, int aniso)
+{
+    for (UINT i = 0; i < 8; i++)
+    {
+        D3D12_SAMPLER_DESC s = g_samplerBase[i];
+        // The wrapping linear samplers (s0 and the anisotropic s4-s7): surface textures. The clamped
+        // and point ones (shadow maps, render targets, lookups) stay as they are.
+        const bool surface = i == 0 || i >= 4;
+        if (surface && aniso == 0)
+        {
+            s.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            s.MaxAnisotropy = 0;
+        }
+        else if (surface && aniso > 0)
+        {
+            s.Filter = aniso > 1 ? D3D12_FILTER_ANISOTROPIC : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            s.MaxAnisotropy = UINT(std::clamp(aniso, 1, 16));
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += size_t(bank * 8 + i) * g_samplerStride;
+        g_r.device->CreateSampler(&s, h);
+    }
+}
+
+// The sampler table for the next draw, after a filtering change if one is pending (draw thread).
+D3D12_GPU_DESCRIPTOR_HANDLE SamplerTable()
+{
+    if (g_anisoRequest.load(std::memory_order_relaxed) != g_anisoApplied.load(std::memory_order_acquire))
+    {
+        std::lock_guard lock(g_samplerMutex); // (draw workers may get here together)
+        if (const int want = g_anisoRequest.load(); want != g_anisoApplied.load())
+        {
+            const UINT bank = (g_samplerBank.load() + 1) % kSamplerBanks;
+            WriteSamplerBank(bank, want);
+            g_samplerBank.store(bank);
+            g_anisoApplied.store(want, std::memory_order_release);
+            Log("renderer: texture filtering %d (sampler bank %u)", want, bank);
+        }
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetGPUDescriptorHandleForHeapStart();
+    h.ptr += uint64_t(g_samplerBank.load()) * 8 * g_samplerStride;
+    return h;
+}
+}
+
+void regpu::SetAnisotropy(int maxAnisotropy)
+{
+    g_anisoRequest.store(maxAnisotropy, std::memory_order_relaxed);
 }
 uint32_t RendererLastFrameDraws() { return g_lastFrameDraws.load(std::memory_order_relaxed); }
 namespace
@@ -882,7 +950,7 @@ struct DrawState
     uint32_t stencilRef = ~0u;
     float blendFactor[4] = { -1, -1, -1, -1 };
     ID3D12PipelineState* pso = nullptr;
-    D3D12_GPU_DESCRIPTOR_HANDLE table2{}, table3{};
+    D3D12_GPU_DESCRIPTOR_HANDLE table2{}, table3{}, samplers{};
     D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     bool motionTargets = false; // the motion target is bound as the second render target
     bool motionRoot = false;    // the motion root signature is set
@@ -905,31 +973,97 @@ uint64_t Fnv(const void* data, size_t bytes, uint64_t h = 0xCBF29CE484222325ull)
     return h;
 }
 
-// Every byte of the data. For data whose every byte matters and that is checked every frame: index buffers.
-uint64_t FullHash(const uint8_t* data, size_t bytes)
+// FullHash with AVX2: 64 bytes a step in two 256-bit accumulators (each 32-bit half of the data, mixed
+// with a key, multiplied into the other half: XXH3's accumulate). FH1 hashes ~16 MB of vertex and index
+// data a frame (buffers reused within the frame are checked again before each draw); the scalar lanes
+// took ~1 ms of it.
+__attribute__((target("avx2"))) uint64_t FullHashAvx2(const uint8_t* data, size_t bytes)
 {
-    // Every byte, 32 at a time in SSE2 lanes (XXH3's accumulate: 32x32-bit multiplies); 64-bit
-    // multiplies were the cost on older CPUs (an FX-8350 hashing PGR4's 7 MB of strips a frame).
-    const __m128i k0 = _mm_set_epi64x(0xC2B2AE3D27D4EB4Full, 0x9E3779B97F4A7C15ull), k1 = _mm_set_epi64x(0xFF51AFD7ED558CCDull, 0x165667B19E3779F9ull);
-    __m128i a0 = _mm_set_epi64x(0, int64_t(bytes)), a1 = k1;
+    const __m256i k0 = _mm256_set_epi64x(0x1CAD21F72C81017Cull, 0xBE4BA423396CFEB8ull, 0x7C01812CF721AD1Cull, 0xDB979083E96DD4DEull);
+    const __m256i k1 = _mm256_set_epi64x(0x1F67B3B7A4A44072ull, 0x78E5C0CC4EE679CBull, 0xD8ACDEA946EF1938ull, 0x3F349CE33F76FAA8ull);
+    __m256i a = _mm256_set1_epi64x(int64_t(0x9E3779B97F4A7C15ull ^ bytes)), b = _mm256_set1_epi64x(int64_t(0xC2B2AE3D27D4EB4Full));
     size_t i = 0;
-    for (; i + 32 <= bytes; i += 32)
+    for (; i + 64 <= bytes; i += 64)
     {
-        const __m128i d0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
-        const __m128i d1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i + 16));
-        const __m128i x0 = _mm_xor_si128(d0, k0), x1 = _mm_xor_si128(d1, k1);
-        a0 = _mm_add_epi64(_mm_add_epi64(a0, _mm_shuffle_epi32(d0, 0x4E)), _mm_mul_epu32(x0, _mm_srli_epi64(x0, 32)));
-        a1 = _mm_add_epi64(_mm_add_epi64(a1, _mm_shuffle_epi32(d1, 0x4E)), _mm_mul_epu32(x1, _mm_srli_epi64(x1, 32)));
+        const __m256i d0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
+        const __m256i d1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i + 32));
+        const __m256i x0 = _mm256_xor_si256(d0, k0), x1 = _mm256_xor_si256(d1, k1);
+        a = _mm256_add_epi64(a, _mm256_add_epi64(_mm256_mul_epu32(x0, _mm256_srli_epi64(x0, 32)), _mm256_shuffle_epi32(d0, 0x4E)));
+        b = _mm256_add_epi64(b, _mm256_add_epi64(_mm256_mul_epu32(x1, _mm256_srli_epi64(x1, 32)), _mm256_shuffle_epi32(d1, 0x4E)));
     }
-    alignas(16) uint64_t v[4];
-    _mm_store_si128(reinterpret_cast<__m128i*>(v), a0);
-    _mm_store_si128(reinterpret_cast<__m128i*>(v + 2), a1);
+    alignas(32) uint64_t lanes[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), a);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes + 4), b);
     uint64_t h = 0xCBF29CE484222325ull;
-    for (uint64_t x : v)
-        h = (h ^ x ^ (x >> 29)) * 0xFF51AFD7ED558CCDull;
+    for (uint64_t v : lanes)
+        h = (h ^ v) * 0xFF51AFD7ED558CCDull, h ^= h >> 29;
     for (; i < bytes; i++)
         h = (h ^ data[i]) * 0x100000001B3ull;
     h = (h ^ (h >> 33)) * 0xC4CEB9FE1A85EC53ull;
+    return h ^ (h >> 33);
+}
+
+// FullHashAvx2's accumulate in 128-bit halves, for CPUs without AVX2 (FX-8350: its 64-bit multiplies
+// are slow, the scalar lanes below were ~13% of the draw thread).
+uint64_t FullHashSse2(const uint8_t* data, size_t bytes)
+{
+    const __m128i k0 = _mm_set_epi64x(0x7C01812CF721AD1Cull, 0xDB979083E96DD4DEull), k1 = _mm_set_epi64x(0x1CAD21F72C81017Cull, 0xBE4BA423396CFEB8ull);
+    const __m128i k2 = _mm_set_epi64x(0xD8ACDEA946EF1938ull, 0x3F349CE33F76FAA8ull), k3 = _mm_set_epi64x(0x1F67B3B7A4A44072ull, 0x78E5C0CC4EE679CBull);
+    __m128i a0 = _mm_set1_epi64x(int64_t(0x9E3779B97F4A7C15ull ^ bytes)), a1 = a0;
+    __m128i b0 = _mm_set1_epi64x(int64_t(0xC2B2AE3D27D4EB4Full)), b1 = b0;
+    const auto acc = [](__m128i& s, __m128i d, __m128i k) {
+        const __m128i x = _mm_xor_si128(d, k);
+        s = _mm_add_epi64(s, _mm_add_epi64(_mm_mul_epu32(x, _mm_srli_epi64(x, 32)), _mm_shuffle_epi32(d, 0x4E)));
+    };
+    size_t i = 0;
+    for (; i + 64 <= bytes; i += 64)
+    {
+        acc(a0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i)), k0);
+        acc(a1, _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i + 16)), k1);
+        acc(b0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i + 32)), k2);
+        acc(b1, _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i + 48)), k3);
+    }
+    alignas(16) uint64_t lanes[8];
+    _mm_store_si128(reinterpret_cast<__m128i*>(lanes), a0);
+    _mm_store_si128(reinterpret_cast<__m128i*>(lanes + 2), a1);
+    _mm_store_si128(reinterpret_cast<__m128i*>(lanes + 4), b0);
+    _mm_store_si128(reinterpret_cast<__m128i*>(lanes + 6), b1);
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (uint64_t v : lanes)
+        h = (h ^ v) * 0xFF51AFD7ED558CCDull, h ^= h >> 29;
+    for (; i < bytes; i++)
+        h = (h ^ data[i]) * 0x100000001B3ull;
+    h = (h ^ (h >> 33)) * 0xC4CEB9FE1A85EC53ull;
+    return h ^ (h >> 33);
+}
+
+// Every byte of the data, four independent 64-bit lanes at a time (a dword-by-dword chain waits on each
+// multiply). For data whose every byte matters and that is checked every frame: index buffers.
+// (AVX2 where the CPU has it; REGPU_SCALAR_HASH=1: the scalar lanes.)
+uint64_t FullHash(const uint8_t* data, size_t bytes)
+{
+    static const bool avx2 = IsProcessorFeaturePresent(40 /* PF_AVX2_INSTRUCTIONS_AVAILABLE */) && !getenv("REGPU_SCALAR_HASH");
+    if (avx2 && bytes >= 256)
+        return FullHashAvx2(data, bytes);
+    static LiveSwitch scalar("REGPU_SCALAR_HASH_LIVE"); // the scalar lanes on a CPU without AVX2 (A/B)
+    if (!avx2 && bytes >= 256 && !scalar)
+        return FullHashSse2(data, bytes);
+    uint64_t a = 0xCBF29CE484222325ull ^ bytes, b = 0x9E3779B97F4A7C15ull, c = 0xC2B2AE3D27D4EB4Full, d = 0x165667B19E3779F9ull;
+    size_t i = 0;
+    for (; i + 32 <= bytes; i += 32)
+    {
+        uint64_t v[4];
+        memcpy(v, data + i, 32);
+        a = (a ^ v[0]) * 0xFF51AFD7ED558CCDull;
+        b = (b ^ v[1]) * 0xC4CEB9FE1A85EC53ull;
+        c = (c ^ v[2]) * 0xFF51AFD7ED558CCDull;
+        d = (d ^ v[3]) * 0xC4CEB9FE1A85EC53ull;
+        a ^= a >> 29; b ^= b >> 31; c ^= c >> 29; d ^= d >> 31;
+    }
+    for (; i < bytes; i++)
+        a = (a ^ data[i]) * 0x100000001B3ull;
+    uint64_t h = a ^ (b * 0x9E3779B97F4A7C15ull) ^ (c * 0xC2B2AE3D27D4EB4Full) ^ (d * 0x165667B19E3779F9ull);
+    h = (h ^ (h >> 33)) * 0xFF51AFD7ED558CCDull;
     return h ^ (h >> 33);
 }
 
@@ -1486,6 +1620,14 @@ if (FILE* f = _wfopen((regpu::GetConfig().userDir / "zero_copy.txt").c_str(), L"
 }
 }
 
+// REGPU_ANISO_FROM_FETCH: anisotropic filtering as each fetch asks (see Init's samplers). Read when the
+// root signature is built, and by each texture binding.
+bool AnisoFromFetch()
+{
+    static LiveSwitch fromFetch("REGPU_ANISO_FROM_FETCH");
+    return fromFetch;
+}
+
 void Init()
 {
     g_r.device = RenderDevice();
@@ -1543,73 +1685,85 @@ void Init()
     params[3].DescriptorTable.NumDescriptorRanges = 3;
     params[3].DescriptorTable.pDescriptorRanges = bindless;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_STATIC_SAMPLER_DESC samplers[4]{};
+    // s0-s3 linear wrap, linear clamp, point clamp, point wrap; s4-s7 linear wrap at 2x, 4x, 8x, 16x
+    // anisotropy (REGPU_ANISO_FROM_FETCH, below).
+    D3D12_STATIC_SAMPLER_DESC samplers[8]{};
     const D3D12_FILTER filters[4] = { D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_POINT,
         D3D12_FILTER_MIN_MAG_MIP_POINT };
     const D3D12_TEXTURE_ADDRESS_MODE modes[4] = { D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP };
-    for (UINT i = 0; i < 4; i++)
+    for (UINT i = 0; i < 8; i++)
     {
-        samplers[i].Filter = filters[i];
+        samplers[i].Filter = filters[i < 4 ? i : 0];
         // Wrapping linear filtering (surface textures: road, ground) is anisotropic: plain
         // trilinear picks blurred levels at grazing angles (blotchy asphalt). Not the clamped
         // sampler: it also reads shadow maps and other render targets, where averaging depth
         // over a long footprint breaks the shadows (black patches, glitchy object shadows).
+        // REGPU_ANISO_FROM_FETCH: s0 stays trilinear and a fetch gets the anisotropy it asks for (dword 3
+        // bits 25-27), as the console and Xenia give it; forced 16x made FH1's distant ground about 20%
+        // sharper than stock's (fine-detail measure, FX).
         static LiveSwitch noAniso("REGPU_NO_ANISO"); // A/B
-        if (filters[i] == D3D12_FILTER_MIN_MAG_MIP_LINEAR && modes[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP && !noAniso)
+        if (i >= 4)
+        {
+            samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
+            samplers[i].MaxAnisotropy = 2u << (i - 4);
+        }
+        else if (filters[i] == D3D12_FILTER_MIN_MAG_MIP_LINEAR && modes[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP && !noAniso && !AnisoFromFetch())
         {
             samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
             samplers[i].MaxAnisotropy = 16;
         }
-        samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = modes[i];
+        samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = i >= 4 ? D3D12_TEXTURE_ADDRESS_MODE_WRAP : modes[i];
         samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
         samplers[i].ShaderRegister = i;
         samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
-    // The samplers sit in a descriptor table, not static samplers: the fetch helper indexes them by the
-    // fetch's mode (one sample instruction instead of a branch to each of four), and a shader can't index
-    // static samplers (FM2 port: 214 -> 225 fps).
+    // REGPU_LEAN_FETCH (hlsl.cpp): the same eight samplers as a table in space1, which a shader can
+    // index (static samplers can't back a dynamically indexed array).
     D3D12_DESCRIPTOR_RANGE samplerRange{};
     samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-    samplerRange.NumDescriptors = 4;
-    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[4].DescriptorTable.NumDescriptorRanges = 1;
-    params[4].DescriptorTable.pDescriptorRanges = &samplerRange;
-    params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    samplerRange.NumDescriptors = 8;
+    samplerRange.RegisterSpace = 1;
+    D3D12_ROOT_SIGNATURE_DESC rs{};
+    rs.NumParameters = 4;
+    rs.pParameters = params;
+    rs.NumStaticSamplers = 8;
+    rs.pStaticSamplers = samplers;
+    if (LeanFetch())
     {
+        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[4].DescriptorTable.NumDescriptorRanges = 1;
+        params[4].DescriptorTable.pDescriptorRanges = &samplerRange;
+        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rs.NumParameters = 5;
         D3D12_DESCRIPTOR_HEAP_DESC sh{};
         sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-        sh.NumDescriptors = 4;
+        sh.NumDescriptors = 8 * kSamplerBanks;
         sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        Check(d->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&g_r.samplerHeap)), "CreateDescriptorHeap(samplers)");
-        const UINT stride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-        for (UINT i = 0; i < 4; i++)
+        Check(d->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&g_r.samplerHeap)), "CreateDescriptorHeap(sampler)");
+        g_samplerStride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        for (UINT i = 0; i < 8; i++)
         {
-            D3D12_SAMPLER_DESC sd{};
-            sd.Filter = samplers[i].Filter;
-            sd.AddressU = samplers[i].AddressU;
-            sd.AddressV = samplers[i].AddressV;
-            sd.AddressW = samplers[i].AddressW;
-            sd.MaxAnisotropy = samplers[i].MaxAnisotropy;
-            sd.ComparisonFunc = samplers[i].ComparisonFunc;
-            sd.MaxLOD = samplers[i].MaxLOD;
-            D3D12_CPU_DESCRIPTOR_HANDLE h = g_r.samplerHeap->GetCPUDescriptorHandleForHeapStart();
-            h.ptr += size_t(i) * stride;
-            d->CreateSampler(&sd, h);
+            D3D12_SAMPLER_DESC& s = g_samplerBase[i];
+            s.Filter = samplers[i].Filter;
+            s.AddressU = samplers[i].AddressU;
+            s.AddressV = samplers[i].AddressV;
+            s.AddressW = samplers[i].AddressW;
+            s.MaxAnisotropy = samplers[i].MaxAnisotropy;
+            s.ComparisonFunc = samplers[i].ComparisonFunc;
+            s.MaxLOD = samplers[i].MaxLOD;
         }
+        WriteSamplerBank(0, -1);
     }
-    D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 5;
-    rs.pParameters = params;
     ComPtr<ID3DBlob> blob, error;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
         Fatal("renderer: root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
     Check(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_r.rootSignature)), "CreateRootSignature");
     // Motion-vector pipelines: the same plus b2, last frame's vertex constants of the draw.
-    params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[5].Descriptor.ShaderRegister = 2;
-    params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    rs.NumParameters = 6;
+    params[rs.NumParameters].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[rs.NumParameters].Descriptor.ShaderRegister = 2;
+    params[rs.NumParameters].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rs.NumParameters++;
     blob.Reset();
     error.Reset();
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
@@ -1658,7 +1812,9 @@ void Init()
     g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     kRingSize = (getenv("REGPU_RING_MB") ? std::clamp<UINT64>(UINT64(atoi(getenv("REGPU_RING_MB"))), 16, 2048)
-        : regpu::GetConfig().uploadRingMB ? std::clamp<UINT64>(regpu::GetConfig().uploadRingMB, 16, 2048) : g_r.physical && !getenv("REGPU_NO_DIRECT_FETCH") ? 64 : 384) << 20;
+        // (128 MB with the zero-copy mapping, not 64: new vertex buffers are copied for their first 16 frames,
+        // and the frame a world loads in filled 64 MB and dropped draws until the ring had grown.)
+        : regpu::GetConfig().uploadRingMB ? std::clamp<UINT64>(regpu::GetConfig().uploadRingMB, 16, 2048) : g_r.physical && !getenv("REGPU_NO_DIRECT_FETCH") ? 128 : 384) << 20;
     Log("renderer: upload ring %llu MB per frame", (unsigned long long)(kRingSize >> 20));
     for (UINT i = 0; i < kFrames; i++)
     {
@@ -2107,7 +2263,7 @@ void BeginFrameIfNeeded()
     EvictBindless();
     ReclaimTextureBlocks();
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
-    C().list->SetDescriptorHeaps(2, heaps);
+    C().list->SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
     C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     g_drawState.Invalidate();
     SelectSurfaces(true);
@@ -2143,6 +2299,28 @@ UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
     return offset;
 }
 
+// A debug variable the debug server's "env" can set live, read once per frame: getenv on every draw
+// (REGPU_SKIP_SHADERS, REGPU_POLY_OFFSET_SCALE) cost FH1 half its frame rate on this PC.
+struct FrameEnv
+{
+    const char* name;
+    std::string value;
+    uint64_t frame = ~0ull;
+    bool set = false;
+    const char* Get()
+    {
+        if (frame != g_r.frame)
+        {
+            frame = g_r.frame;
+            const char* v = getenv(name);
+            set = v && *v;
+            if (set)
+                value = v;
+        }
+        return set ? value.c_str() : nullptr;
+    }
+};
+
 // A large vertex buffer the title rewrites from frame to frame (PGR4's crowd bone palettes):
 // read in place, the title's next frame can overwrite it before the host GPU runs this one
 // (its fences are signalled when recorded), so it is copied while it keeps changing. Checked
@@ -2164,8 +2342,21 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
     if (s.frame != g_r.frame && due)
     {
         const uint64_t hash = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes);
+        // A buffer seen changing once stays copied: one written in bursts (FH1's skid marks, appended
+        // while the car slides) went back to being read in place 120 frames after its last change and
+        // checked every 16th frame, so the next burst was read while the title wrote it (rare exploded
+        // vertices on the marks). REGPU_DYNAMIC_EXPIRE=1: back to in place after 120 quiet frames, as before.
+        static LiveSwitch expire("REGPU_DYNAMIC_EXPIRE");
         if (s.frame != ~0ull && hash != s.hash)
-            s.dynamicUntil = g_r.frame + 120;
+            s.dynamicUntil = expire ? g_r.frame + 120 : ~0ull;
+        // A buffer seen for the first time is copied until it has stayed the same for 16 frames: with
+        // early fences the title may rewrite it before the host GPU reads it, and ring-style buffers (FH1's
+        // minimap blocks, skid marks, particles) keep appearing at new addresses and sizes, so read in place
+        // at first sight they exploded when the GPU ran behind (busy scenes). REGPU_NEW_BUFFERS_IN_PLACE=1:
+        // read in place until seen changing, as before.
+        static LiveSwitch newInPlace("REGPU_NEW_BUFFERS_IN_PLACE");
+        if (s.frame == ~0ull && !newInPlace)
+            s.dynamicUntil = g_r.frame + 16;
         s.hash = hash;
         s.frame = g_r.frame;
         // REGPU_TRACE_DYNAMIC=1: the buffers being copied, every 600 frames.
@@ -2231,6 +2422,12 @@ bool GuestReadable(const uint8_t* p, size_t bytes)
     return true;
 }
 
+// REGPU_PERF: UploadGuest's bytes hashed and copied (logged with the frame stats).
+struct UploadStats
+{
+    std::atomic<uint64_t> hashed{ 0 }, copied{ 0 }, hits{ 0 }, copies{ 0 }, sampledHits{ 0 };
+} g_uploadStats;
+
 // Copies a guest range into the ring once per frame; draws sharing a vertex
 // buffer reuse the copy. A sampled hash catches ranges rewritten mid-frame.
 UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
@@ -2273,8 +2470,48 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     // allocations, are read in place by the GPU, and the check would cost every upload.)
     if (!g_r.physical && !GuestReadable(src, bytes))
         return zeros();
-    if (bytes <= fullHashBytes)
-        sample = ContentHash(src, bytes);
+    // Large ranges reach this copy path, with guest memory mapped for the GPU, only when they were seen
+    // changing (DynamicBuffer): hash them all, not 16 samples. Sampled, a range rewritten between two
+    // draws of a frame (FH1's skid marks once they pass 16 KB: segments rewritten as the car slides)
+    // kept the first draw's copy, and later draws put marks at old positions. REGPU_UPLOAD_SAMPLED=1:
+    // 16 samples, as before. (Without the mapping every large buffer is copied: sampled there.)
+    static LiveSwitch uploadSampled("REGPU_UPLOAD_SAMPLED");
+    const uint64_t key = uint64_t(guest) << 32 | bytes;
+    // Each recording thread keeps its own cache (cleared when the frame changes).
+    thread_local FrameMap<std::pair<UINT64, uint64_t>> uploads;
+    // A range never seen changing, hashed for 600 frames, is checked in full at its first use in a frame
+    // and later in the frame by the sampled hash. FH1 free roam reuses one 32 KB vertex range 352 times a
+    // frame; hashed in full each time, the uploads were 8% of the frame time on a paused frame. A range
+    // seen changing once (a sampled check that finds a change counts) is checked in full at every use
+    // for good, as the skid marks need: so only a range's first change ever, made between two draws of a
+    // frame where the samples miss it, could be read stale, and only for the rest of that frame (a
+    // skid mark buffer idle since the load, at the first slide). Opt-in for that:
+    // REGPU_UPLOAD_STABLE_REUSE=1 (FH1: +5% on a paused frame, +1-2% driving, perf timing on).
+    struct Stable
+    {
+        uint64_t full = 0, sampled = 0, since = 0, sampledFrame = ~0ull;
+        bool changed = false;
+    };
+    thread_local std::unordered_map<uint64_t, Stable> stable;
+    static LiveSwitch stableReuse("REGPU_UPLOAD_STABLE_REUSE");
+    const bool trackStable = stableReuse && !uploadSampled;
+    const auto* known = uploads.Find(key, g_r.frame);
+    if (known && trackStable)
+        if (auto it = stable.find(key); it != stable.end() && it->second.sampledFrame == g_r.frame && !it->second.changed &&
+            g_r.frame >= it->second.since + 600)
+        {
+            if (ContentHash(src, bytes) == it->second.sampled)
+            {
+                g_uploadStats.hits++;
+                g_uploadStats.sampledHits++;
+                return known->first;
+            }
+            it->second.changed = true;
+        }
+    if (bytes > fullHashBytes && g_r.physical && !uploadSampled)
+        sample = FullHash(src, bytes);
+    else if (bytes <= fullHashBytes)
+        sample = uploadSampled ? ContentHash(src, bytes) : FullHash(src, bytes); // (ContentHash's default stride is 256 bytes)
     else
         for (uint32_t i = 0; i < 16 && bytes >= 8; i++)
         {
@@ -2282,11 +2519,56 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
             memcpy(&v, src + (uint64_t(bytes - 8) * i / 15), 8);
             sample = (sample ^ v) * 0x100000001B3ull;
         }
-    const uint64_t key = uint64_t(guest) << 32 | bytes;
-    // Each recording thread keeps its own cache (cleared when the frame changes).
-    thread_local FrameMap<std::pair<UINT64, uint64_t>> uploads;
-    if (const auto* known = uploads.Find(key, g_r.frame); known && known->second == sample)
+    if (trackStable)
+    {
+        // Ring-style ranges keep appearing at new addresses: past 64K ranges, those never seen changing
+        // are dropped (and start their 600 frames again); the ones that changed stay marked.
+        if (stable.size() > (1u << 16))
+            std::erase_if(stable, [](const auto& e) { return !e.second.changed; });
+        Stable& s = stable[key];
+        if (!s.since)
+            s.since = g_r.frame;
+        else if (s.full != sample)
+            s.changed = true;
+        s.full = sample;
+        if (s.sampledFrame != g_r.frame || !known || known->second != sample)
+        {
+            s.sampled = ContentHash(src, bytes);
+            s.sampledFrame = g_r.frame;
+        }
+    }
+    g_uploadStats.hashed += bytes;
+    // REGPU_TRACE_UPLOADS=1: the ranges hashed most (bytes and uses a frame), every 240 frames. FH1 free
+    // roam: one 32 KB vertex range used by 352 draws a frame is 40% of the ~26 MB.
+    if (static const bool traceUploads = getenv("REGPU_TRACE_UPLOADS") != nullptr; traceUploads)
+    {
+        static std::mutex m;
+        static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> byKey; // hashed bytes, uses
+        static uint64_t lastFrame = 0;
+        std::lock_guard lock(m);
+        auto& e = byKey[key];
+        e.first += bytes;
+        e.second++;
+        if (g_r.frame >= lastFrame + 240)
+        {
+            std::vector<std::pair<uint64_t, uint64_t>> v;
+            for (auto& [k, x] : byKey)
+                v.push_back({ x.first, k });
+            std::sort(v.rbegin(), v.rend());
+            for (size_t i = 0; i < v.size() && i < 10; i++)
+                Log("uploads: %08X %u bytes: %.2f MB hashed a frame, %.1f uses a frame", uint32_t(v[i].second >> 32), uint32_t(v[i].second),
+                    v[i].first / 240.0 / 1048576.0, byKey[v[i].second].second / 240.0);
+            byKey.clear();
+            lastFrame = g_r.frame;
+        }
+    }
+    if (known && known->second == sample)
+    {
+        g_uploadStats.hits++;
         return known->first;
+    }
+    g_uploadStats.copies++;
+    g_uploadStats.copied += bytes;
     if (RendererTracing() && bytes > (16u << 10))
         Log("upload: %08X %u bytes (ring %llu)", guest, bytes, (unsigned long long)f.ringUsed.load());
     const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
@@ -2313,6 +2595,7 @@ struct IndexArena
         uint32_t sizeClass = 0;
         D3D12_GPU_VIRTUAL_ADDRESS staged = 0; // this frame's copy in the upload ring (frame stagedFrame)
         uint64_t stagedFrame = ~0ull;
+        bool changing = false; // seen changing: checked at every draw, not once a frame
     };
     std::unordered_map<uint64_t, Entry> entries;
     bool full = false;
@@ -2348,7 +2631,8 @@ void FlushIndexCopies()
 // The view of the guest index buffer at physical address `base` (count indices), swapped
 // into the arena; false when it cannot be cached (the draw fetches indices itself).
 bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view);
-// Each thread remembers this frame's index buffers (checked once per frame).
+thread_local bool g_indexChanging = false; // set by GetIndexBufferLocked: the entry is checked at every draw
+// Each thread remembers this frame's index buffers (checked once per frame), except ones seen changing.
 bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
 {
     thread_local FrameMap<D3D12_INDEX_BUFFER_VIEW> known;
@@ -2359,9 +2643,11 @@ bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D
         return true;
     }
     std::lock_guard textureLock(g_textureMutex);
+    g_indexChanging = false;
     if (!GetIndexBufferLocked(base, count, is32, endian, view))
         return false;
-    known.Put(key, g_r.frame, view);
+    if (!g_indexChanging)
+        known.Put(key, g_r.frame, view);
     return true;
 }
 
@@ -2413,7 +2699,12 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
         e.sizeClass = sizeClass;
     }
     view = { arena.buffer->GetGPUVirtualAddress() + e.offset, bytes, is32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT };
-    if (e.checkedFrame == g_r.frame)
+    // An index buffer seen changing is checked at every draw: one rewritten between two draws of a frame
+    // (FH1's skid marks, many on screen) otherwise drew later draws with the earlier indices, triangles
+    // stretched to far-off vertices. REGPU_INDEX_CHECK_ONCE=1: once a frame for all, as before.
+    static LiveSwitch checkOnce("REGPU_INDEX_CHECK_ONCE");
+    g_indexChanging = e.changing && !checkOnce;
+    if (e.checkedFrame == g_r.frame && (!e.changing || checkOnce))
     {
         if (e.stagedFrame == g_r.frame)
             view.BufferLocation = e.staged;
@@ -2427,7 +2718,16 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
     static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
     const uint64_t hash = sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
     if (!inserted && hash == e.hash)
+    {
+        if (e.stagedFrame == g_r.frame)
+            view.BufferLocation = e.staged;
         return true;
+    }
+    if (!inserted)
+    {
+        e.changing = true;
+        g_indexChanging = !checkOnce;
+    }
     // Swap into the upload ring (as the vertex shader would read them), then copy.
     const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16);
     if (offset == ~0ull)
@@ -3660,7 +3960,9 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     char label[64];
     snprintf(label, sizeof(label), "pipeline %08llx/%08llx", (unsigned long long)(key.vs >> 32), (unsigned long long)(key.ps >> 32));
     g_stats.Begin(label);
-    pool.Push([entry, pd, vsKeep = vs.code, psKeep = ps.code, key]() mutable {
+    // (A plain pointer back to the entry: pipelines are never removed.)
+    entry->build =[e = entry.get(), pd, vsKeep = vs.code, psKeep = ps.code, key]() mutable {
+        PipelineEntry* entry = e;
         const auto createStart = std::chrono::steady_clock::now();
         bool hit = false;
         const HRESULT hr = g_pipelineLibrary.CreateOrLoad(g_r.device, pd, key, entry->pso, &hit);
@@ -3672,7 +3974,8 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         (hit ? g_stats.pipelinesLoaded : g_stats.pipelinesBuilt)++;
         entry->state.store(FAILED(hr) ? 2 : 1, std::memory_order_release);
         g_stats.End(!hit);
-    });
+    };
+    pool.Push([entry] { entry->Build(); });
     g_pipelinesCreated++;
     g_frameEvents.pipelines++;
     return entry;
@@ -3682,11 +3985,17 @@ void WaitHoldingImpl(const std::function<bool()>& done);
 
 // Waits for the build (draws are never dropped: a missing pipeline used to leave
 // shadow passes undrawn). Cold builds can take 100+ ms; the overlay says so.
-ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry)
+// `force`: wait even with REGPU_ASYNC_PIPELINES (draws a pass cannot lose, see SkippableDraw).
+ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry, bool force = false)
 {
     static LiveSwitch async("REGPU_ASYNC_PIPELINES");
-    if (async && entry->state.load(std::memory_order_acquire) == 0)
+    if (async && !force && entry->state.load(std::memory_order_acquire) == 0)
         return nullptr;
+    // Not started yet: built here, now. Queued behind the pool's other builds, a draw that must wait
+    // for its pipeline waited for all of them: on the FX (a cold cache entering FH1's world) over 20 s,
+    // and the title never queued work again. REGPU_NO_INLINE_PIPELINE=1: wait in the queue, as before.
+    if (static LiveSwitch noInline("REGPU_NO_INLINE_PIPELINE"); !noInline)
+        entry->Build();
     WaitHoldingImpl([&] { return entry->state.load(std::memory_order_acquire) != 0; });
     return entry->state.load() == 1 ? entry->pso.Get() : nullptr;
 }
@@ -3725,7 +4034,16 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
     const uint32_t sc = gpureg::Get(PA_SU_SC_MODE_CNTL);
     const bool polyOffset = !noPolyOffset && ((depth >> 1) & 1) && ((sc >> 11) & 3);
     const uint32_t biasScale = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2380 : 0x2382) : 0;
-    const uint32_t biasOffset = polyOffset ? RoundedBias(gpureg::Get((sc >> 11) & 1 ? 0x2381 : 0x2383)) : 0;
+    uint32_t biasOffset = polyOffset ? RoundedBias(gpureg::Get((sc >> 11) & 1 ? 0x2381 : 0x2383)) : 0;
+    // REGPU_POLY_OFFSET_SCALE=<f>: the constant offset times f (debug; read per draw, part of the key).
+    thread_local FrameEnv scaleEnv{ "REGPU_POLY_OFFSET_SCALE" };
+    if (const char* m = scaleEnv.Get(); m && biasOffset)
+    {
+        float v;
+        memcpy(&v, &biasOffset, 4);
+        v *= float(atof(m));
+        memcpy(&biasOffset, &v, 4);
+    }
     PipelineKey key{ vsHash, psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
         uint32_t(alphaToMask) | (uint32_t(cullable) << 1) | (uint32_t(noDepthClip) << 2) };
     key.biasScale = biasScale;
@@ -3747,10 +4065,24 @@ bool GameSettled()
     return !never && g_lastLongHold.time_since_epoch().count() != 0 && std::chrono::steady_clock::now() - g_lastLongHold > std::chrono::seconds(4);
 }
 
+// Set by the draw: a rectangle list without textures (a clear, a stencil reset, a mask fill).
+thread_local bool g_plainRectDraw = false;
+bool PlainRectMustDraw()
+{
+    static LiveSwitch skipPlainRects("REGPU_SKIP_PLAIN_RECTS"); // 1: skippable like the rest, as before
+    return g_plainRectDraw && !skipPlainRects;
+}
+
 bool SkippableDraw(bool depthOnly, uint32_t blend)
 {
     static LiveSwitch noSkip("REGPU_NO_SKIP_BLENDED");
     if (noSkip || depthOnly)
+        return false;
+    // Not these: the pipelines are tiny and a dropped clear or reset leaves the last frame's stencil or colour
+    // for later passes to draw through (FH1's minimap came out as white blobs for a moment when the world
+    // loaded: 27 such draws were dropped while their pipelines built, the first frame after the load).
+    // REGPU_SKIP_PLAIN_RECTS=1: skippable like the rest, as before.
+    if (PlainRectMustDraw())
         return false;
     const bool opaque = (blend & 0xFF1F1F1F) == 0x00010001 || (blend & 0x1F) == 1 && ((blend >> 8) & 0x1F) == 0;
     return !opaque || GameSettled();
@@ -3806,7 +4138,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     g_waitWhat = depthOnly ? "pipeline (depth only)" : "pipeline";
     g_waitBlend = key.blend;
     const auto waitStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    ID3D12PipelineState* pso = WaitForPipeline(entry);
+    ID3D12PipelineState* pso = WaitForPipeline(entry, PlainRectMustDraw());
     if (g_perfTiming)
         if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count(); ms > 2.0)
             Log("perf: GetPipeline waited %.1f ms for pipeline %016llx/%016llx (state was %d)", ms, (unsigned long long)key.vs, (unsigned long long)key.ps, 0);
@@ -4822,7 +5154,11 @@ IndexListEntry* CachedIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t d
     {
         const uint32_t available = (dmaSize & 0xFFFFFF) /* in indices, as Xenia (num_words) */;
         const uint32_t bytes = std::min(count, available) * (is32 ? 4 : 2);
-        sample = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u))), bytes);
+        // Every index (as GetIndexBuffer): sampled every 256 bytes, indices rewritten between the samples
+        // kept the old expanded list (stretched triangles). REGPU_INDEX_SAMPLED_HASH=1: sampled.
+        static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
+        const uint8_t* p = GuestPtr<uint8_t>(GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u)));
+        sample = sampledIndexHash ? ContentHash(p, bytes) : FullHash(p, bytes);
     }
     thread_local std::unordered_map<uint64_t, IndexListEntry> cache;
     if (cache.size() > 8192)
@@ -5119,6 +5455,22 @@ void EnsureResolved(ResolvedTexture& dest, uint32_t width, uint32_t height, uint
 void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false,
     const float* destRange = nullptr, uint32_t toGamma = 0)
 {
+    // REGPU_FREEZE_RESOLVES=<hex base>[,<hex base>...]: those images keep what they hold, later resolves
+    // to them are skipped (debug: does a flicker come from an image's redraws?). Read every resolve, so
+    // the debug server's "env" sets it live.
+    thread_local FrameEnv freezeEnv{ "REGPU_FREEZE_RESOLVES" };
+    if (const char* freeze = freezeEnv.Get())
+        if (auto it = g_r.resolved.find(base); it != g_r.resolved.end() && it->second.resource)
+            for (const char* p = freeze; *p;)
+            {
+                char* end = nullptr;
+                if (uint32_t(strtoul(p, &end, 16)) == base)
+                {
+                    it->second.frame = g_r.frame;
+                    return;
+                }
+                p = *end ? end + 1 : end;
+            }
     ResolvedTexture& dest = g_r.resolved[base];
     const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
     EnsureResolved(dest, width, height, hostWidth, hostHeight, format);
@@ -5472,7 +5824,7 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NGX may have changed the list's heaps, root signatures and pipeline: set ours again.
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
-    C().list->SetDescriptorHeaps(2, heaps);
+    C().list->SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
     C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     C().list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_drawState.Invalidate();
@@ -6879,8 +7231,14 @@ void RendererSaveCaches()
 void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash)
 {
     std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
+    uint64_t& current = type == 0 ? C().vsHash : C().psHash;
+    // Titles reload the bound shader before most draws: the same hash is the same used microcode, so
+    // the copy is already there (FH1: ~2% of the draw thread on an FX-8350). REGPU_NO_SAME_SHADER_SKIP=1: copy anyway.
+    static LiveSwitch noSkip("REGPU_NO_SAME_SHADER_SKIP");
+    if (current == hash && code.size() == usedDwords && !noSkip)
+        return;
     code.assign(microcodeBE, microcodeBE + usedDwords);
-    (type == 0 ? C().vsHash : C().psHash) = hash;
+    current = hash;
 }
 
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
@@ -6892,8 +7250,52 @@ void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t d
 
 namespace
 {
+// REGPU_LOG_SKIPS=1: every frame that dropped draws logs how many and why (first 600 such frames), with the
+// shaders of the first few: tells whether a glitch at load (a half-drawn minimap) is missing draws.
+LiveSwitch g_sw_REGPU_LOG_SKIPS("REGPU_LOG_SKIPS");
+struct SkipLog
+{
+    std::mutex mutex;
+    uint64_t frame = ~0ull;
+    std::map<std::string, uint32_t> reasons;
+    std::vector<std::string> samples;
+    uint32_t frames = 0;
+    void Flush()
+    {
+        if (reasons.empty())
+            return;
+        if (frames++ < 600)
+        {
+            std::string line;
+            for (const auto& [why, n] : reasons)
+                line += why + " x" + std::to_string(n) + "; ";
+            for (const auto& s : samples)
+                line += s + "; ";
+            Log("skips: frame %llu: %s", (unsigned long long)frame, line.c_str());
+        }
+        reasons.clear();
+        samples.clear();
+    }
+} g_skipLog;
+
 void TraceSkip(const char* why, uint32_t initiator)
 {
+    if (g_sw_REGPU_LOG_SKIPS)
+    {
+        std::lock_guard lock(g_skipLog.mutex);
+        if (g_skipLog.frame != g_r.frame)
+        {
+            g_skipLog.Flush();
+            g_skipLog.frame = g_r.frame;
+        }
+        g_skipLog.reasons[why]++;
+        if (g_skipLog.samples.size() < 4)
+        {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "%s vs %08llx ps %08llx", why, (unsigned long long)(C().vsHash >> 32), (unsigned long long)(C().psHash >> 32));
+            g_skipLog.samples.push_back(buf);
+        }
+    }
     const uint64_t traceFrame = TraceFrame();
     if (traceFrame && g_r.frame + 1 == traceFrame)
         Log("skip draw (%s): prim %u count %u mode %u vs %016llx ps %016llx", why, initiator & 0x3F, initiator >> 16,
@@ -6947,7 +7349,7 @@ ID3D12GraphicsCommandList* AcquireList()
 void ListPrologue(RecordedList& list)
 {
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
-    list.SetDescriptorHeaps(2, heaps);
+    list.SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
     list.SetGraphicsRootSignature(g_r.rootSignature.Get());
     list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
@@ -7134,9 +7536,16 @@ void WriteResolvePixels(const uint8_t* pixels, UINT pitch, DXGI_FORMAT hostForma
                         const uint8_t* px = pixels + size_t(hy) * pitch + size_t(hx) * hostBpp;
                         for (int k = 0; k < 4; k++)
                         {
-                            uint16_t h;
-                            memcpy(&h, px + k * 2, 2);
-                            c[k] += hostBpp == 8 ? regpu::resolve::HalfToFloat(h) : float(px[k]) / 255.0f;
+                            // (Halves only from an 8-byte texel: read from an RGBA8 one, the last texel's
+                            // read ran 4 bytes past the buffer, a fault where it ends on a page: the FX's GTX 970.)
+                            if (hostBpp == 8)
+                            {
+                                uint16_t h;
+                                memcpy(&h, px + k * 2, 2);
+                                c[k] += regpu::resolve::HalfToFloat(h);
+                            }
+                            else
+                                c[k] += float(px[k]) / 255.0f;
                         }
                     }
                 const float n = float((hx1 - hx0) * (hy1 - hy0));
@@ -8075,6 +8484,24 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         return;
     }
     // Colour+depth (4) and depth-only (5) passes draw.
+    // REGPU_SKIP_SHADERS=<hex hash>[,...]: draws whose vertex or pixel shader is listed are dropped
+    // (debug: which draw makes an artefact). Read per draw, so the debug server's "env" sets it live.
+    thread_local FrameEnv skipEnv{ "REGPU_SKIP_SHADERS" };
+    if (const char* skip = skipEnv.Get())
+        for (const char* p = skip; *p;)
+        {
+            char* end = nullptr;
+            const uint64_t h = strtoull(p, &end, 16);
+            if (end == p)
+                break;
+            if (h == C().vsHash || h == C().psHash)
+            {
+                TraceSkip("REGPU_SKIP_SHADERS", initiator);
+                g_r.skippedThisFrame++;
+                return;
+            }
+            p = *end ? end + 1 : end;
+        }
     if ((edramMode != 4 && edramMode != 5) || C().vsCode.empty() || C().psCode.empty())
     {
         TraceSkip("edram mode", initiator);
@@ -8234,6 +8661,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // shaders' motion variants, once compiled; until then the draw has no motion).
     const bool cullable = (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1;
     const bool wantMotion = g_temporal && g_scenePhase && edramMode == 4 && WidePass();
+    g_plainRectDraw = (initiator & 0x3F) == 8 && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots;
     const CompiledShader* mvs = wantMotion ? MotionShader(vs) : nullptr;
     const CompiledShader* mps = wantMotion ? MotionShader(ps) : nullptr;
     bool motion = mvs && mps && mvs->IsReady() && mps->IsReady();
@@ -8563,6 +8991,21 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vte[0] |= 1u << 29;
     if (!noRectSnap && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots && (ScaleX() != 1.0f || ScaleY() != 1.0f))
         vc->vte[0] |= 1u << 30;
+    // The same snap for a texture-less rectangle through another MSAA view (vscale.w, voffset.w > 1):
+    // the half-pixel shift added after the view scale put the far edge of FH1's 4x clear of its
+    // 1024x1024 shadow maps on the last row's centres, so row 1023 kept 0 (always shadowed) and drew
+    // a thin dark line on the ground where the car's shadow box ends. Snapped, the rectangle covers
+    // the view pixels whose centres it covers. REGPU_NO_VIEW_RECT_SNAP=1: shifted as before (A/B).
+    if (static LiveSwitch noViewRectSnap("REGPU_NO_VIEW_RECT_SNAP"); !noViewRectSnap && !oldClearShift && !ps.info.usedTextureSlots &&
+        !vs.info.usedTextureSlots && vc->vscale[3] >= 1.0f && vc->voffset[3] >= 1.0f && (vc->vscale[3] > 1.0f || vc->voffset[3] > 1.0f))
+        vc->vte[0] |= 1u << 30;
+    // Viewport-transformed draws with D3D9 pixel centres (PA_SU_VTX_CNTL bit 0 clear) are shifted half a
+    // pixel, as the screen-space ones are (hlsl.cpp, bit 28). Unshifted, FH1's image sat 0.6-0.7 px off
+    // stock's (HUD, banners) and its screen-space shadow lookups landed between mask texels: the shadows
+    // shimmered with the idle camera (FX, real-time capture: 22-30 changes a second at the user's
+    // example against 12.7 shifted and stock's 16). REGPU_NO_3D_HALF_PIXEL=1: unshifted (A/B).
+    if (static LiveSwitch no3dHalfPixel("REGPU_NO_3D_HALF_PIXEL"); !no3dHalfPixel && !(gpureg::Get(0x2302 /* PA_SU_VTX_CNTL */) & 1))
+        vc->vte[0] |= 1u << 28;
     Sub(3); // viewport, MSAA scale
     // Triangle lists and restart-free strips from an index buffer: a real indexed draw.
     LiveSwitch &noIndexed = g_sw_REGPU_NO_INDEXED;
@@ -8769,14 +9212,18 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         if (!clamp && !oldClamp)
             ti[0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
+        // Anisotropy the fetch asks for (dword 3 bits 25-27: 2 = 2x .. 5 = 16x), for the linear wrapping
+        // sampler: bits 20-22 pick s4-s7 (hlsl.cpp). Only with REGPU_ANISO_FROM_FETCH (else s0 is 16x).
+        if (const uint32_t aniso = (fetch.dwords[3] >> 25) & 7; AnisoFromFetch() && !point && !clamp && aniso >= 2 && aniso <= 5)
+            ti[0] |= (aniso - 1) << 20;
         // Mirrored modes (1 mirrored repeat; 3, 5, 7 mirror once, then clamp): the shader folds the
-        // coordinate first (bits 20, 21 repeat; 22, 23 once), and the axis is still clamped after the
+        // coordinate first (bits 28, 29 repeat; 30, 31 once), and the axis is still clamped after the
         // fold (wrapped, the filter blends the opposite edge in). Clamped alone, a mirrored half
         // smeared the edge column across (FM2 port: the telemetry's car diagram, as Xenia shows it).
         static LiveSwitch noMirror("REGPU_NO_TEXTURE_MIRROR"); // A/B: mirrored modes clamped only
         if (!oldClamp && !noMirror)
-            ti[0] |= (clampX == 1 ? 1u << 20 : 0u) | (clampY == 1 ? 1u << 21 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 22 : 0u) |
-                (clampY >= 3 && (clampY & 1) ? 1u << 23 : 0u);
+            ti[0] |= (clampX == 1 ? 1u << 28 : 0u) | (clampY == 1 ? 1u << 29 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 30 : 0u) |
+                (clampY >= 3 && (clampY & 1) ? 1u << 31 : 0u);
         // Clamp to border on both axes (modes 6, 7): the shader returns the border colour
         // outside the image (dword 5 bits 0-1: 1 white, else black).
         if (clampX >= 6 && clampY >= 6)
@@ -9100,19 +9547,24 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     C().list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     C().list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
     if (motion)
-        C().list->SetGraphicsRootConstantBufferView(5, motionPrevious);
+        C().list->SetGraphicsRootConstantBufferView(LeanFetch() ? 5 : 4, motionPrevious);
     if (const D3D12_GPU_DESCRIPTOR_HANDLE t2 = Gpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride); t2.ptr != ds.table2.ptr)
     {
         ds.table2 = t2;
         C().list->SetGraphicsRootDescriptorTable(2, t2);
-        // (Set with table 2: it is reset whenever the root signature or the heaps change.)
-        C().list->SetGraphicsRootDescriptorTable(4, g_r.samplerHeap->GetGPUDescriptorHandleForHeapStart());
     }
     if (const D3D12_GPU_DESCRIPTOR_HANDLE t3 = Gpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride); t3.ptr != ds.table3.ptr)
     {
         ds.table3 = t3;
         C().list->SetGraphicsRootDescriptorTable(3, t3);
+        ds.samplers = {}; // set again with it (after a root signature switch)
     }
+    if (g_r.samplerHeap)
+        if (const D3D12_GPU_DESCRIPTOR_HANDLE s = SamplerTable(); s.ptr != ds.samplers.ptr)
+        {
+            ds.samplers = s;
+            C().list->SetGraphicsRootDescriptorTable(4, s);
+        }
     // REGPU_CAPTURE_COMPOSITE=<n>: trace (as F12) the n-th frame that draws into the 2048-wide
     // surface (pitch field 0x820: a 2048-wide composite), from its first such draw on.
     if (static const int compositeN = getenv("REGPU_CAPTURE_COMPOSITE") ? atoi(getenv("REGPU_CAPTURE_COMPOSITE")) : 0;
@@ -9494,6 +9946,54 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         g_gpuFrames = 0;
         if (perf && g_perf.frames)
             Log("perf:   descriptor tables built %.0f, reused %.0f per frame", double(g_perf.tablesBuilt) / g_perf.frames, double(g_perf.tablesReused) / g_perf.frames);
+        if (perf && g_perf.frames)
+            Log("perf:   uploads: %.1f MB hashed, %.1f MB copied (%.0f copies, %.0f reused, %.0f of them by samples) per frame",
+                double(g_uploadStats.hashed.exchange(0)) / g_perf.frames / 1048576.0, double(g_uploadStats.copied.exchange(0)) / g_perf.frames / 1048576.0,
+                double(g_uploadStats.copies.exchange(0)) / g_perf.frames, double(g_uploadStats.hits.exchange(0)) / g_perf.frames,
+                double(g_uploadStats.sampledHits.exchange(0)) / g_perf.frames);
+        if (perf && g_perf.frames)
+        {
+            // Order of RecordedList::Op.
+            static const char* const names[] = { "barrier", "copy", "rootsig", "table", "cbv", "root32", "targets", "pipeline", "viewport",
+                "scissor", "stencilref", "blendfactor", "topology", "heaps", "draw", "endquery", "resolvequery", "clearrtv", "cleardsv",
+                "creatertv", "createdsv", "drawindexed", "indexbuffer", "copybuffer", "csrootsig", "cstable", "csroot32", "dispatch", "beginquery" };
+            std::string s;
+            for (size_t i = 0; i < std::size(names); i++)
+                if (const uint64_t n = g_recordedOps[i].exchange(0); n >= g_perf.frames)
+                    s += " " + std::string(names[i]) + " " + std::to_string(n / g_perf.frames);
+            Log("perf:   recorded per frame:%s | %llu barriers", s.c_str(), (unsigned long long)(g_recordedBarriers.exchange(0) / g_perf.frames));
+            // REGPU_TRACE_BARRIERS=1: barriers per frame by call site (module offset, for llvm-symbolizer) and
+            // transition (before -> after state, or UAV/aliasing).
+            static const bool traceBarriers = getenv("REGPU_TRACE_BARRIERS") != nullptr;
+            static std::mutex barrierMutex;
+            static std::map<std::tuple<uintptr_t, uint32_t, uint32_t>, uint64_t> barrierSites;
+            if (traceBarriers && !g_barrierSites)
+                g_barrierSites = [](void* caller, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+                    HMODULE self = nullptr;
+                    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        reinterpret_cast<LPCWSTR>(&InitDepthBlit), &self);
+                    const uintptr_t at = uintptr_t(caller) - uintptr_t(self);
+                    std::lock_guard lock(barrierMutex);
+                    for (UINT i = 0; i < n; i++)
+                    {
+                        const bool transition = b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                        barrierSites[{ at, transition ? uint32_t(b[i].Transition.StateBefore) : 0xFFFF0000u | b[i].Type,
+                            transition ? uint32_t(b[i].Transition.StateAfter) : 0 }]++;
+                    }
+                };
+            if (traceBarriers)
+            {
+                std::lock_guard lock(barrierMutex);
+                std::vector<std::pair<uint64_t, std::tuple<uintptr_t, uint32_t, uint32_t>>> v;
+                for (auto& [k, n] : barrierSites)
+                    v.push_back({ n, k });
+                std::sort(v.rbegin(), v.rend());
+                for (size_t i = 0; i < v.size() && i < 12; i++)
+                    Log("perf:   barriers %llu/frame at +%llx: %x -> %x", (unsigned long long)(v[i].first / g_perf.frames),
+                        (unsigned long long)std::get<0>(v[i].second), std::get<1>(v[i].second), std::get<2>(v[i].second));
+                barrierSites.clear();
+            }
+        }
         if (perf && !g_created.empty())
         {
             std::string s;
@@ -9588,9 +10088,11 @@ void PrecompileAll()
                 if (!ps && Manifest::LoadShader(true, key.ps, code))
                     ps = &GetShader(key.ps, code, true);
             }
-            if (!vs || !ps || vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending)
+            // A shader not stored (a static one from Host::staticShaders, installed after this): skip the
+            // pipeline. Waiting for it, as before, waited for good (FH1 on the FX: a black screen).
+            if (vs && ps && (vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending))
                 break; // wait for this one to finish compiling before going on
-            if (vs->state.load() == CompiledShader::Ready && ps->state.load() == CompiledShader::Ready)
+            if (vs && ps && vs->state.load() == CompiledShader::Ready && ps->state.load() == CompiledShader::Ready)
             {
                 if (!g_r.pipelines.count(key))
                 {
@@ -9613,8 +10115,19 @@ void PrecompileAll()
         if (now - lastPresent > std::chrono::milliseconds(33))
         {
             lastPresent = now;
-            g_hold.active = true;
-            HoldPresent();
+            // Past a moment the stored set's shaders are compiling (a first boot after a translator
+            // change rebuilds them all, minutes on a large cache): the host's boot screen with this
+            // phase's progress, not a held black frame.
+            const regpu::Host& host = regpu::GetHost();
+            std::vector<uint8_t> frame;
+            if (now - start > std::chrono::seconds(2) && host.bootScreen &&
+                host.bootScreen(L"COMPILING SHADERS", uint32_t(nextKey), uint32_t(keys.size()), frame))
+                BootPresent(frame);
+            else
+            {
+                g_hold.active = true;
+                HoldPresent();
+            }
         }
         Sleep(1);
     }

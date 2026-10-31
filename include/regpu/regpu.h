@@ -159,4 +159,11 @@ void LogState();
 void SetGameWidescreen(bool on);
 // Call when the game has stopped drawing (the window is closing): flushes the shader and pipeline caches.
 void SaveCaches();
+// Changes the frame cap and vsync while the game runs (a host's options screen); Config's maxFps
+// and vsync are the starting values.
+void SetFrameLimit(uint32_t maxFps, bool vsync);
+// Texture filtering while the game runs: -1 the fetch's own anisotropy (the default), 0 none, else
+// that many samples at most (2-16) for every wrapping linear fetch. Applies to the 2D pixel fetches of
+// REGPU_LEAN_FETCH (its sampler table); others keep their samplers.
+void SetAnisotropy(int maxAnisotropy);
 } // namespace regpu
