@@ -521,6 +521,7 @@ namespace
 // Shared caches used by draws on several threads (see DrawContext).
 std::recursive_mutex g_shaderMutex;  // shaders, pipelines, the compiler's maps
 std::recursive_mutex g_textureMutex; // textures, cubes, mip chains, bindless, texture memory, index arena
+uint32_t g_zeroedEdramBase = ~0u; // EDRAM base a depth clear to zero has just emptied (BindSurfaces)
 std::mutex g_surfaceMutex;           // EDRAM surfaces
 // Parallel segments: texture uploads and copies a worker makes go to this list, executed
 // before the segment's draws (another worker's earlier draws may use the same texture).
@@ -1792,6 +1793,12 @@ void SelectSurfaces(bool force)
     C().depthBase = depthBase;
     PassMark("pass colour %03X depth %03X", colorBase, depthBase);
     TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (g_zeroedEdramBase == (colorBase & 0xFFF)) // a depth clear zeroed these tiles (see the resolve)
+    {
+        g_zeroedEdramBase = ~0u;
+        const float zero[4]{};
+        C().list->ClearRenderTargetView(C().rtv, zero, 0, nullptr);
+    }
     C().list->OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv);
     g_drawState.motionTargets = false;
 }
@@ -6176,6 +6183,15 @@ void Resolve()
         }
         const D3D12_RECT hostClear = ToHost(clearRect);
         C().list->ClearDepthStencilView(C().dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(v & 0xFF), 1, &hostClear);
+        // The EDRAM is one memory: a colour surface at the depth buffer's base is the same tiles, and a
+        // whole-surface clear to zero leaves them zero (transparent black). The next colour surface
+        // bound at that base starts cleared (BindSurfaces). PGR4's minimap is drawn at its
+        // post-processing depth buffer's base without a clear of its own: the frame's last depth clear
+        // is what empties it, and without that its old route lines piled up (a red bar).
+        // REGPU_NO_ALIASED_DEPTH_CLEAR=1: colour surfaces keep their contents (A/B).
+        static LiveSwitch noAliasedClear("REGPU_NO_ALIASED_DEPTH_CLEAR");
+        if (v == 0 && !noAliasedClear && clearRect.left == 0 && clearRect.top == 0 && clearRect.bottom >= LONG(PassHeight()))
+            g_zeroedEdramBase = C().depthBase;
     }
 }
 }
