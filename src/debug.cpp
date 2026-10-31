@@ -278,6 +278,17 @@ std::string Handle(const std::string& line)
         }
         return Ok("\"frames\":" + std::to_string(n));
     }
+    // output W H: the drawing resolution while the game runs (regpu::SetOutputSize)
+    if (cmd == "output")
+    {
+        uint32_t w = 0, h = 0;
+        in >> w >> h;
+        if (!w || !h)
+            return Error("output WIDTH HEIGHT");
+        regpu::SetOutputSize(w, h);
+        WaitFrames(3, 5);
+        return Ok("\"output\":\"" + std::to_string(w) + "x" + std::to_string(h) + "\"");
+    }
     // rdcapture: a RenderDoc capture of the next frame (the game started under RenderDoc, e.g. with
     // regpuctl's REGPU_WRAP). From the FM2 port.
     if (cmd == "rdcapture")

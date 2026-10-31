@@ -72,15 +72,26 @@ constexpr UINT kWidth = 1280, kHeight = 720;
 // ultrawide; every other pass (reflection faces, shadow maps, reduced-size post passes)
 // scales uniformly, so square targets stay square. Draws, clears and resolves of a pass
 // all read the same pitch, so they agree.
+// (Changed while the game runs by regpu::SetOutputSize, applied between frames: ApplyOutputSize.)
+std::atomic<uint32_t> g_outputWidth{ 0 }, g_outputHeight{ 0 };
+void LoadOutputSize()
+{
+    uint32_t w, h;
+    RenderSize(w, h);
+    g_outputWidth = w;
+    g_outputHeight = h;
+}
 uint32_t OutputWidth()
 {
-    static const uint32_t w = [] { uint32_t w, h; RenderSize(w, h); return w; }();
-    return w;
+    if (!g_outputWidth.load(std::memory_order_relaxed))
+        LoadOutputSize();
+    return g_outputWidth.load(std::memory_order_relaxed);
 }
 uint32_t OutputHeight()
 {
-    static const uint32_t h = [] { uint32_t w, h; RenderSize(w, h); return h; }();
-    return h;
+    if (!g_outputHeight.load(std::memory_order_relaxed))
+        LoadOutputSize();
+    return g_outputHeight.load(std::memory_order_relaxed);
 }
 // Upscaling: the 3D scene of a frame renders at this fraction of the output (1 otherwise);
 // after the scene is upscaled (UpscaleScene), the rest of the frame renders at full size.
@@ -566,11 +577,19 @@ D3D12_GPU_DESCRIPTOR_HANDLE SamplerTable()
     h.ptr += uint64_t(g_samplerBank.load()) * 8 * g_samplerStride;
     return h;
 }
+
+std::atomic<uint64_t> g_outputRequest{ 0 }; // regpu::SetOutputSize: width << 32 | height, 0 none (ApplyOutputSize)
 }
 
 void regpu::SetAnisotropy(int maxAnisotropy)
 {
     g_anisoRequest.store(maxAnisotropy, std::memory_order_relaxed);
+}
+
+void regpu::SetOutputSize(uint32_t width, uint32_t height)
+{
+    if (width && height)
+        g_outputRequest.store(uint64_t(width) << 32 | height, std::memory_order_relaxed);
 }
 uint32_t RendererLastFrameDraws() { return g_lastFrameDraws.load(std::memory_order_relaxed); }
 namespace
@@ -1821,6 +1840,52 @@ double g_gpuWaitSeconds = 0; // CP thread blocked on the host GPU (frame resourc
 
 FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
 
+// A new output resolution (regpu::SetOutputSize), taken at the start of a frame with the host GPU idle:
+// the EDRAM surfaces (made at the output size on first use) are dropped and come back at the new size,
+// as do the frame readback, the upscaler's images and the swap chain. Resolved images take their new
+// size at their next resolve. The guest redraws every surface it uses each frame.
+void ApplyOutputSize()
+{
+    const uint64_t request = g_outputRequest.exchange(0);
+    if (!request || !g_r.ok)
+        return;
+    Settings& st = GetSettings();
+    const uint32_t w = uint32_t(request >> 32), h = uint32_t(request);
+    if (w == st.width && h == st.height)
+        return;
+    // Every frame in flight may still use the old surfaces.
+    if (const UINT64 last = g_r.nextFence - 1; g_r.fence->GetCompletedValue() < last)
+    {
+        g_r.fence->SetEventOnCompletion(last, g_r.fenceEvent);
+        WaitForSingleObject(g_r.fenceEvent, INFINITE);
+    }
+    st.width = w;
+    st.height = h;
+    LoadOutputSize();
+    {
+        // Released with this frame, not now: until the frame start rebinds (SelectSurfaces), commands
+        // still name the old surfaces' views (releasing them here crashed the replay thread).
+        std::lock_guard surfaceLock(g_surfaceMutex);
+        for (auto* map : { &g_r.colorSurfaces, &g_r.depthSurfaces })
+        {
+            for (auto& [base, s] : *map)
+                Frame().garbage.push_back(std::move(s.resource));
+            map->clear();
+        }
+    }
+    C().colorBase = C().depthBase = ~0u; // nothing bound: the frame start selects the new surfaces
+    C().color.Reset();
+    C().depth.Reset();
+    g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    g_upscale.depth.Reset();
+    g_upscale.motion.Reset();
+    g_upscale.dlaaOut.Reset();
+    g_upscale.renderWidth = g_upscale.renderHeight = 0;
+    g_upscale.reset = true;
+    PresenterResize(OutputWidth(), OutputHeight());
+    Log("renderer: output %ux%u (live)", OutputWidth(), OutputHeight());
+}
+
 void TransitionColor(D3D12_RESOURCE_STATES to);
 
 // Gets (creating on first use) the host surface for an EDRAM base.
@@ -1917,7 +1982,8 @@ void SelectSurfaces(bool force)
     if (!force && colorBase == C().colorBase && depthBase == C().depthBase)
         return;
     if (C().colorBase != ~0u && !C().worker) // (workers leave surfaces as render targets)
-        g_r.colorSurfaces[C().colorBase].state = C().colorState;
+        if (auto it = g_r.colorSurfaces.find(C().colorBase); it != g_r.colorSurfaces.end()) // (not a new empty one)
+            it->second.state = C().colorState;
     Renderer::Surface& c = GetSurface(false, colorBase);
     Renderer::Surface& z = GetSurface(true, depthBase);
     C().color = c.resource;
@@ -2063,6 +2129,7 @@ void BeginFrameIfNeeded()
         g_gpuWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
     }
     f.garbage.clear();
+    ApplyOutputSize(); // (a new resolution: between frames)
     void FinishDeferredWritebacks(UINT frameIndex);
     FinishDeferredWritebacks(UINT(&f - g_r.frames)); // this slot's previous frame has completed
     static LiveSwitch perf("REGPU_PERF");

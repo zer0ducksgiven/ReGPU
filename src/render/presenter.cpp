@@ -384,6 +384,28 @@ bool PresenterHasFocus()
     return !g_p.window || GetForegroundWindow() == g_p.window;
 }
 
+// The swap chain to a new output size (the renderer's ApplyOutputSize, the host GPU idle).
+void PresenterResize(uint32_t width, uint32_t height)
+{
+    if (!g_p.swapChain)
+        return;
+    for (auto& b : g_p.backBuffers)
+        b.Reset();
+    if (FAILED(g_p.swapChain->ResizeBuffers(kBuffers, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
+    {
+        Log("presenter: swap chain resize to %ux%u failed", width, height);
+        return;
+    }
+    for (UINT i = 0; i < kBuffers; i++)
+    {
+        Check(g_p.swapChain->GetBuffer(i, IID_PPV_ARGS(&g_p.backBuffers[i])), "GetBuffer");
+        D3D12_CPU_DESCRIPTOR_HANDLE h = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += SIZE_T(i) * g_p.rtvStride;
+        g_p.device->CreateRenderTargetView(g_p.backBuffers[i].Get(), nullptr, h);
+    }
+    Log("presenter: swap chain %ux%u", width, height);
+}
+
 void regpu::SetWindowSize(uint32_t width, uint32_t height)
 {
     SizeWindow(g_p.window, width, height);
