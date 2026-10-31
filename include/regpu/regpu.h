@@ -104,6 +104,12 @@ struct Host
     std::vector<ScannedShader> (*staticShaders)() = nullptr;
     // Optional: whether staticShaders' list is already saved (a fast call: no search).
     bool (*staticShadersSaved)() = nullptr;
+    // Optional: the title's shipped pipeline list, as pipelines.manifest text ("P vs ps blend depth
+    // stencilMaskMode flags [biasScale biasOffset]" in hex, one a line: hashes and render state, no game
+    // data), typically merged from players' manifests. Those not built yet are built once, after the static
+    // shaders, with the boot screen up; those needing a shader the game makes at run time are built in the
+    // background once it exists. Built ones join pipelines.manifest. REGPU_NO_SEED_PIPELINES=1 skips it.
+    const char* (*pipelineSeed)() = nullptr;
     // Optional: a 1280x720 RGBA8 screen for the first-boot shader compile (title, progress done/total;
     // total 0 while searching). False: ReGPU's plain progress overlay is shown instead.
     bool (*bootScreen)(const wchar_t* title, uint32_t done, uint32_t total, std::vector<uint8_t>& rgba) = nullptr;

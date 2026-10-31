@@ -6854,11 +6854,37 @@ void PredictBeginImpl()
     g_predPsDwords = uint32_t(C().psCode.size());
 }
 
+std::vector<PipelineKey> g_seedLater; // seed pipelines waiting for a shader the game makes at run time
+
+// Seed pipelines (Host::pipelineSeed) whose shaders the game has made since the boot: started in the
+// background, checked about once a second.
+void SeedStep()
+{
+    static auto last = std::chrono::steady_clock::time_point{};
+    if (g_seedLater.empty() || std::chrono::steady_clock::now() - last < std::chrono::seconds(1))
+        return;
+    last = std::chrono::steady_clock::now();
+    size_t started = 0;
+    std::erase_if(g_seedLater, [&](const PipelineKey& key) {
+        if (g_r.pipelines.count(key))
+            return true;
+        const auto vs = g_r.shaders.find(key.vs), ps = g_r.shaders.find(key.ps);
+        if (vs == g_r.shaders.end() || ps == g_r.shaders.end() || !vs->second->IsReady() || !ps->second->IsReady())
+            return false;
+        EnsurePipeline(*vs->second, *ps->second, key);
+        started++;
+        return true;
+    });
+    if (started)
+        Log("seed pipelines: %zu started now their shaders exist (%zu still waiting)", started, g_seedLater.size());
+}
+
 // ---- Warm-up: rebuilds every shader/pipeline recorded in the manifest in the
 // background (on this thread a few ms per frame) while the game boots and sits in menus.
 void WarmupStep()
 {
     DrainScan(3.0);
+    SeedStep();
     static LiveSwitch off("REGPU_NO_WARMUP");
     if (off || g_manifest.next >= g_manifest.pending.size())
         return;
@@ -10108,6 +10134,95 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
 // been played, the more is covered. REGPU_NO_PRECOMPILE=1 turns it off.
 bool g_precompileDone = false;
 
+// The title's shipped pipeline list (Host::pipelineSeed): those not built yet are built once, on the
+// first boot after the static shaders, so a first race doesn't stop for each new one. Only those whose
+// shaders are compiled by then can be; the rest wait in g_seedLater for the game to make their shader.
+void BuildSeedPipelines()
+{
+    const regpu::Host& host = regpu::GetHost();
+    if (!host.pipelineSeed || getenv("REGPU_NO_SEED_PIPELINES"))
+        return;
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<std::pair<PipelineKey, std::pair<const CompiledShader*, const CompiledShader*>>> todo;
+    size_t listed = 0, known = 0, missing = 0;
+    std::unordered_set<uint64_t> missingShaders, seen;
+    for (const char* p = host.pipelineSeed(); p && *p;)
+    {
+        const char* end = strchr(p, '\n');
+        const std::string line(p, end ? end : p + strlen(p));
+        p = end ? end + 1 : p + line.size();
+        PipelineKey key{};
+        unsigned long long vs, ps;
+        if (sscanf(line.c_str(), "P %llx %llx %x %x %x %x %x %x", &vs, &ps, &key.blend, &key.depth, &key.stencilMaskMode, &key.flags,
+                   &key.biasScale, &key.biasOffset) < 6)
+            continue;
+        key.vs = vs;
+        key.ps = ps;
+        key.biasOffset = RoundedBias(key.biasOffset);
+        if (!seen.insert(PipelineKeyHash{}(key)).second)
+            continue;
+        listed++;
+        if (g_manifest.known.count(key) || g_r.pipelines.count(key))
+        {
+            known++;
+            continue;
+        }
+        const auto vsIt = g_r.shaders.find(key.vs), psIt = g_r.shaders.find(key.ps);
+        if (vsIt == g_r.shaders.end() || psIt == g_r.shaders.end())
+        {
+            missing++;
+            missingShaders.insert(vsIt == g_r.shaders.end() ? key.vs : key.ps);
+            g_seedLater.push_back(key);
+            continue;
+        }
+        todo.push_back({ key, { vsIt->second.get(), psIt->second.get() } });
+    }
+    Log("seed pipelines: %zu listed, %zu already built, %zu to build, %zu need %zu shaders the game makes at run time", listed, known,
+        todo.size(), missing, missingShaders.size());
+    if (todo.empty())
+        return;
+    std::vector<std::shared_ptr<PipelineEntry>> building;
+    std::vector<uint8_t> frame;
+    size_t next = 0, failed = 0;
+    auto lastShown = std::chrono::steady_clock::time_point{};
+    for (;;)
+    {
+        // A few at a time: the pool works through them while the screen updates.
+        while (next < todo.size() &&
+               building.size() - size_t(std::count_if(building.begin(), building.end(), [](const auto& e) { return e->state.load() != 0; })) < 32)
+        {
+            const auto& [key, shaders] = todo[next++];
+            const auto [vs, ps] = shaders;
+            while (vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending)
+                Sleep(1);
+            if (vs->IsReady() && ps->IsReady())
+                building.push_back(EnsurePipeline(*vs, *ps, key));
+            else
+                failed++;
+        }
+        const size_t done = size_t(std::count_if(building.begin(), building.end(), [](const auto& e) { return e->state.load() != 0; }));
+        if (next >= todo.size() && done == building.size())
+            break;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastShown > std::chrono::milliseconds(100))
+        {
+            lastShown = now;
+            if (host.bootScreen && host.bootScreen(L"BUILDING PIPELINES", uint32_t(done + failed), uint32_t(todo.size()), frame))
+                BootPresent(frame);
+            else
+            {
+                g_hold.active = true;
+                HoldPresent();
+            }
+        }
+        Sleep(5);
+    }
+    g_hold.active = false;
+    g_lastLongHold = std::chrono::steady_clock::now();
+    Log("seed pipelines: %zu built in %.1f s (%zu skipped: a shader didn't compile)", building.size(),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), failed);
+}
+
 void PrecompileAll()
 {
     if (g_precompileDone)
@@ -10222,6 +10337,11 @@ void PrecompileAll()
         g_lastLongHold = std::chrono::steady_clock::now();
     Log("precompile: done in %.1f s (%zu shaders loaded, %zu pipelines started)",
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), shadersInstalled, pipelinesStarted);
+    // The shipped pipeline list last, once the static shaders below are compiled (whichever way this returns).
+    struct SeedAfter
+    {
+        ~SeedAfter() { BuildSeedPipelines(); }
+    } seedAfter;
 
     // Every shader in the game data (Host::staticShaders) goes to the compile queue as well. Compiles
     // run on the background workers and the game doesn't wait for them; cached bytecode loads
