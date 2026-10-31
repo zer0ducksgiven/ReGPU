@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -60,6 +61,8 @@ std::vector<Timed> g_timed;
 std::atomic<bool> g_inputActive{ false };
 
 std::string g_shotPath;
+std::string g_burstDir, g_burstExt = ".png"; // shots N DIR [raw]
+uint32_t g_burstLeft = 0, g_burstTotal = 0;
 uint64_t g_shotsDone = 0;
 
 const struct { const char* name; uint16_t bit; } kButtons[] = {
@@ -242,6 +245,49 @@ std::string Handle(const std::string& line)
             return Error("no frame came (the game may be loading or paused)");
         }
         return Ok("\"path\":\"" + Escape(path) + "\",\"frame\":" + std::to_string(g_frame));
+    }
+    // shots N DIR [raw]: N consecutive frames as DIR/s0.png ... (flicker between frames); raw: small .raw
+    if (cmd == "shots")
+    {
+        uint32_t n = 0;
+        std::string dir;
+        in >> n;
+        std::getline(in, dir);
+        dir.erase(0, dir.find_first_not_of(' '));
+        // "raw" after the directory: 640x360 RGBA files that barely slow the game (renderer.cpp).
+        const bool raw = dir.size() > 4 && dir.compare(dir.size() - 4, 4, " raw") == 0;
+        if (raw)
+            dir.resize(dir.size() - 4);
+        if (!n || n > 120 || dir.empty())
+            return Error("shots N DIR [raw] (N up to 120)");
+        std::error_code ec; // (the throwing overload, uncaught on this thread, ended the game)
+        std::filesystem::create_directories(dir, ec);
+        if (ec)
+            return Error("can't make " + dir + ": " + ec.message());
+        std::unique_lock lock(g_mutex);
+        const uint64_t before = g_shotsDone;
+        g_burstDir = dir;
+        g_burstExt = raw ? ".raw" : ".png";
+        g_burstTotal = g_burstLeft = n;
+        g_shotPath = dir + "/s0" + g_burstExt;
+        if (!g_swapped.wait_for(lock, std::chrono::seconds(60), [&] { return g_shotsDone - before >= n; }))
+        {
+            g_shotPath.clear();
+            g_burstLeft = 0;
+            return Error("not all frames came");
+        }
+        return Ok("\"frames\":" + std::to_string(n));
+    }
+    // output W H: the drawing resolution while the game runs (regpu::SetOutputSize)
+    if (cmd == "output")
+    {
+        uint32_t w = 0, h = 0;
+        in >> w >> h;
+        if (!w || !h)
+            return Error("output WIDTH HEIGHT");
+        regpu::SetOutputSize(w, h);
+        WaitFrames(3, 5);
+        return Ok("\"output\":\"" + std::to_string(w) + "x" + std::to_string(h) + "\"");
     }
     // rdcapture: a RenderDoc capture of the next frame (the game started under RenderDoc, e.g. with
     // regpuctl's REGPU_WRAP). From the FM2 port.
@@ -558,7 +604,12 @@ void DebugShotDone(const std::string& path)
     {
         std::lock_guard lock(g_mutex);
         if (g_shotPath == path)
+        {
             g_shotPath.clear();
+            // shots N DIR: the next frame's file, until N are written.
+            if (g_burstLeft && --g_burstLeft)
+                g_shotPath = g_burstDir + "/s" + std::to_string(g_burstTotal - g_burstLeft) + g_burstExt;
+        }
         g_shotsDone++;
     }
     g_swapped.notify_all();

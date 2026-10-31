@@ -72,15 +72,26 @@ constexpr UINT kWidth = 1280, kHeight = 720;
 // ultrawide; every other pass (reflection faces, shadow maps, reduced-size post passes)
 // scales uniformly, so square targets stay square. Draws, clears and resolves of a pass
 // all read the same pitch, so they agree.
+// (Changed while the game runs by regpu::SetOutputSize, applied between frames: ApplyOutputSize.)
+std::atomic<uint32_t> g_outputWidth{ 0 }, g_outputHeight{ 0 };
+void LoadOutputSize()
+{
+    uint32_t w, h;
+    RenderSize(w, h);
+    g_outputWidth = w;
+    g_outputHeight = h;
+}
 uint32_t OutputWidth()
 {
-    static const uint32_t w = [] { uint32_t w, h; RenderSize(w, h); return w; }();
-    return w;
+    if (!g_outputWidth.load(std::memory_order_relaxed))
+        LoadOutputSize();
+    return g_outputWidth.load(std::memory_order_relaxed);
 }
 uint32_t OutputHeight()
 {
-    static const uint32_t h = [] { uint32_t w, h; RenderSize(w, h); return h; }();
-    return h;
+    if (!g_outputHeight.load(std::memory_order_relaxed))
+        LoadOutputSize();
+    return g_outputHeight.load(std::memory_order_relaxed);
 }
 // Upscaling: the 3D scene of a frame renders at this fraction of the output (1 otherwise);
 // after the scene is upscaled (UpscaleScene), the rest of the frame renders at full size.
@@ -576,11 +587,19 @@ D3D12_GPU_DESCRIPTOR_HANDLE SamplerTable()
     h.ptr += uint64_t(g_samplerBank.load()) * 8 * g_samplerStride;
     return h;
 }
+
+std::atomic<uint64_t> g_outputRequest{ 0 }; // regpu::SetOutputSize: width << 32 | height, 0 none (ApplyOutputSize)
 }
 
 void regpu::SetAnisotropy(int maxAnisotropy)
 {
     g_anisoRequest.store(maxAnisotropy, std::memory_order_relaxed);
+}
+
+void regpu::SetOutputSize(uint32_t width, uint32_t height)
+{
+    if (width && height)
+        g_outputRequest.store(uint64_t(width) << 32 | height, std::memory_order_relaxed);
 }
 uint32_t RendererLastFrameDraws() { return g_lastFrameDraws.load(std::memory_order_relaxed); }
 namespace
@@ -1841,6 +1860,52 @@ double g_gpuWaitSeconds = 0; // CP thread blocked on the host GPU (frame resourc
 
 FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
 
+// A new output resolution (regpu::SetOutputSize), taken at the start of a frame with the host GPU idle:
+// the EDRAM surfaces (made at the output size on first use) are dropped and come back at the new size,
+// as do the frame readback, the upscaler's images and the swap chain. Resolved images take their new
+// size at their next resolve. The guest redraws every surface it uses each frame.
+void ApplyOutputSize()
+{
+    const uint64_t request = g_outputRequest.exchange(0);
+    if (!request || !g_r.ok)
+        return;
+    Settings& st = GetSettings();
+    const uint32_t w = uint32_t(request >> 32), h = uint32_t(request);
+    if (w == st.width && h == st.height)
+        return;
+    // Every frame in flight may still use the old surfaces.
+    if (const UINT64 last = g_r.nextFence - 1; g_r.fence->GetCompletedValue() < last)
+    {
+        g_r.fence->SetEventOnCompletion(last, g_r.fenceEvent);
+        WaitForSingleObject(g_r.fenceEvent, INFINITE);
+    }
+    st.width = w;
+    st.height = h;
+    LoadOutputSize();
+    {
+        // Released with this frame, not now: until the frame start rebinds (SelectSurfaces), commands
+        // still name the old surfaces' views (releasing them here crashed the replay thread).
+        std::lock_guard surfaceLock(g_surfaceMutex);
+        for (auto* map : { &g_r.colorSurfaces, &g_r.depthSurfaces })
+        {
+            for (auto& [base, s] : *map)
+                Frame().garbage.push_back(std::move(s.resource));
+            map->clear();
+        }
+    }
+    C().colorBase = C().depthBase = ~0u; // nothing bound: the frame start selects the new surfaces
+    C().color.Reset();
+    C().depth.Reset();
+    g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    g_upscale.depth.Reset();
+    g_upscale.motion.Reset();
+    g_upscale.dlaaOut.Reset();
+    g_upscale.renderWidth = g_upscale.renderHeight = 0;
+    g_upscale.reset = true;
+    PresenterResize(OutputWidth(), OutputHeight());
+    Log("renderer: output %ux%u (live)", OutputWidth(), OutputHeight());
+}
+
 void TransitionColor(D3D12_RESOURCE_STATES to);
 
 // Gets (creating on first use) the host surface for an EDRAM base.
@@ -1937,7 +2002,8 @@ void SelectSurfaces(bool force)
     if (!force && colorBase == C().colorBase && depthBase == C().depthBase)
         return;
     if (C().colorBase != ~0u && !C().worker) // (workers leave surfaces as render targets)
-        g_r.colorSurfaces[C().colorBase].state = C().colorState;
+        if (auto it = g_r.colorSurfaces.find(C().colorBase); it != g_r.colorSurfaces.end()) // (not a new empty one)
+            it->second.state = C().colorState;
     Renderer::Surface& c = GetSurface(false, colorBase);
     Renderer::Surface& z = GetSurface(true, depthBase);
     C().color = c.resource;
@@ -2090,6 +2156,7 @@ void BeginFrameIfNeeded()
         g_gpuWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
     }
     f.garbage.clear();
+    ApplyOutputSize(); // (a new resolution: between frames)
     void FinishDeferredWritebacks(UINT frameIndex);
     FinishDeferredWritebacks(UINT(&f - g_r.frames)); // this slot's previous frame has completed
     static LiveSwitch perf("REGPU_PERF");
@@ -5474,6 +5541,9 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     ResolvedTexture& dest = g_r.resolved[base];
     const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
     EnsureResolved(dest, width, height, hostWidth, hostHeight, format);
+    if (RendererTracing())
+        Log("resolve: -> %08X %ux%u as %ux%u host (scale %.3f x %.3f, texture %ux%u)", base, width, height, hostWidth, hostHeight, ScaleX(), ScaleY(),
+            dest.hostWidth, dest.hostHeight);
     // What memory holds under the image, for the stale check (ResolveCurrent): once per frame, as tiles
     // land in the same image. An image resolved every frame (shadow maps, bloom) only needs it every
     // 8th: the check waits until a resolve has not been repeated for 8 frames, so its baseline is
@@ -8592,8 +8662,22 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // (Rect lists only: triangle lists and strips read their indices through the index arena, which
     // copies them; refusing those sent every draw of a rewritten index buffer to the CPU's index
     // expansion, 7 ms a frame in FH1 TU4.)
-    const bool indexRewritten = RendererEarlyFences() && indexSource == 0 && prim == 13 &&
-        DynamicBuffer(dmaBase & 0x1FFFFFFF, (dmaSize & 0xFFFFFF) * (((initiator >> 11) & 1) ? 4u : 2u));
+    // Small index buffers are always copied, whatever the primitive: direct indices are read by the
+    // vertex shader when the host GPU runs, frames after the command processor saw them. FH1 writes the
+    // same 36 indices of each shadow cascade box (a rect list) every frame, clearing and refilling the
+    // memory in place; a content check sees nothing change (and called it rewritten on some frames, not
+    // others), and whenever the GPU ran a few frames behind (2560x1440 and up, another game on the GPU) it
+    // read the cleared indices: every other frame the cascade drew degenerate triangles and the sun
+    // shadows flickered (RenderDoc, two frames: same vertices, indices all zero). Copying a few hundred
+    // bytes costs nothing; large ones (static meshes) stay in place unless seen changing.
+    // REGPU_DIRECT_DYNAMIC_INDICES=1: as before, in place unless an early-fence rect list changed (A/B).
+    static LiveSwitch directDynamicIndices("REGPU_DIRECT_DYNAMIC_INDICES");
+    const uint32_t indexBytes = (dmaSize & 0xFFFFFF) * (((initiator >> 11) & 1) ? 4u : 2u);
+    constexpr uint32_t kCopiedIndexBytes = 16u << 10;
+    const bool indexRewritten = indexSource == 0 &&
+        (directDynamicIndices ? prim == 13 && RendererEarlyFences() && DynamicBuffer(dmaBase & 0x1FFFFFFF, indexBytes)
+                              : (prim == 4 || prim == 6 || prim == 13) &&
+                                    (indexBytes < kCopiedIndexBytes || ((prim != 13 || RendererEarlyFences()) && DynamicBuffer(dmaBase & 0x1FFFFFFF, indexBytes))));
     // A strip from a 16-bit index buffer restarting at 0xFFFF is drawn indexed, the GPU restarting it
     // (the pipeline's strip cut value), as Xenia does. Expanded on the CPU, these were copied into the
     // ring every frame: 7 MB a frame in PGR4's races (4% of the command processor on an FX-8350).
@@ -10569,7 +10653,22 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             std::error_code ec;
             if (const auto dir = std::filesystem::path(shotPath).parent_path(); !dir.empty())
                 std::filesystem::create_directories(dir, ec);
-            WritePng(shotPath.c_str(), dw, dh, full);
+            // A ".raw" path (debug "shots ... raw"): 640x360 RGBA, nearest, no encoding, so a burst
+            // barely slows the game.
+            if (shotPath.size() > 4 && shotPath.compare(shotPath.size() - 4, 4, ".raw") == 0)
+            {
+                std::vector<uint8_t> thumb(640 * 360 * 4);
+                for (uint32_t y = 0; y < 360; y++)
+                    for (uint32_t x = 0; x < 640; x++)
+                        memcpy(&thumb[(size_t(y) * 640 + x) * 4], &full[(size_t(y) * dh / 360 * dw + size_t(x) * dw / 640) * 4], 4);
+                if (FILE* fp = fopen(shotPath.c_str(), "wb"))
+                {
+                    fwrite(thumb.data(), 1, thumb.size(), fp);
+                    fclose(fp);
+                }
+            }
+            else
+                WritePng(shotPath.c_str(), dw, dh, full);
             DebugShotDone(shotPath);
         }
         else

@@ -15,6 +15,8 @@ Commands (sent as typed):
   shot [path]                        the next frame as a PNG (default out/live.png)
   capture                            what F12 does (trace the next frame into out/capture)
   rdcapture                          a RenderDoc capture of the next frame (started under RenderDoc: REGPU_WRAP)
+  shots N DIR                        N consecutive frames as DIR/s0.png ... (flicker between frames)
+  output W H                         the drawing resolution while the game runs
   log [n]                            the last n lines of the log
   peek ADDR [bytes] | poke ADDR HEX  guest memory (hex addresses, big-endian bytes)
   ps HASH EXPR | ps HASH tint R,G,B  that pixel shader returns EXPR (HLSL over r[], input.o[], ...) or a flat

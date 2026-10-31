@@ -159,6 +159,15 @@ void LogState();
 void SetGameWidescreen(bool on);
 // Call when the game has stopped drawing (the window is closing): flushes the shader and pipeline caches.
 void SaveCaches();
+// The output (drawing) resolution while the game runs: Config's width and height at start. Taken at
+// the start of the next frame (the host GPU idle; surfaces, upscaler and swap chain rebuilt). The
+// upscaler and its quality (Config::upscaler, quality) are read every frame and change without it.
+void SetOutputSize(uint32_t width, uint32_t height);
+// Windowed: the game window's client area to exactly width x height pixels (a resolution change
+// from a host's options screen; ReGPU's own window opens at Config's width and height this way).
+// Not shrunk to fit the screen; kept with its title bar on it. Maximised or fullscreen: unchanged.
+// Works on Config::hostWindow too.
+void SetWindowSize(uint32_t width, uint32_t height);
 // Changes the frame cap and vsync while the game runs (a host's options screen); Config's maxFps
 // and vsync are the starting values.
 void SetFrameLimit(uint32_t maxFps, bool vsync);
