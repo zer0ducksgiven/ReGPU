@@ -132,8 +132,39 @@ void EnsureDevice()
     Check(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue)), "CreateCommandQueue");
 }
 
+// A windowed game's client area at exactly `width` x `height` pixels (the output resolution), as a
+// game's windowed mode does: not shrunk to fit the screen (the shrink gave 2369x1333 for 2560x1440
+// on a 1440-row display, so the picture was never the size chosen). When it is bigger than the work
+// area the window is placed at its top left, title bar on screen. Pixels are physical: the process is
+// made per-monitor DPI aware before ReGPU opens a window (a host's window has its own awareness).
+// Maximised or borderless (fullscreen) windows are left alone. Asynchronous: safe off the window's thread.
+void SizeWindow(HWND hwnd, uint32_t width, uint32_t height)
+{
+    if (!hwnd || !width || !height || IsZoomed(hwnd))
+        return;
+    const DWORD style = DWORD(GetWindowLongW(hwnd, GWL_STYLE)), exStyle = DWORD(GetWindowLongW(hwnd, GWL_EXSTYLE));
+    if (!(style & WS_CAPTION))
+        return;
+    RECT r{ 0, 0, LONG(width), LONG(height) };
+    AdjustWindowRectExForDpi(&r, style, FALSE, exStyle, GetDpiForWindow(hwnd));
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT now{};
+    GetWindowRect(hwnd, &now);
+    // Kept on the work area as far as it fits; its top left (the title bar) always is.
+    const int x = std::max<int>(mi.rcWork.left, std::min<int>(now.left, mi.rcWork.right - w));
+    const int y = std::max<int>(mi.rcWork.top, std::min<int>(now.top, mi.rcWork.bottom - h));
+    const bool own = GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId();
+    SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | (own ? 0u : UINT(SWP_ASYNCWINDOWPOS)));
+    Log("presenter: window client %ux%u", width, height);
+}
+
 void CreateWindowAndDevice()
 {
+    // Physical pixels for the window ReGPU opens (an unaware window at 125% scaling would be stretched).
+    if (!GetSettings().hostWindow)
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     WNDCLASSW wc{};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = GetModuleHandleW(nullptr);
@@ -143,9 +174,9 @@ void CreateWindowAndDevice()
     wc.hIcon = HICON(LoadImageW(wc.hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
     RegisterClassW(&wc);
     // The swap chain is the chosen resolution (the game's image is centred in it with black
-    // bars when an aspect ratio is forced). Windowed: the client area starts at that size,
-    // shrunk (aspect kept) to fit the screen. Fullscreen: a borderless window over the
-    // primary display. Either way the swap chain stretches to the window.
+    // bars when an aspect ratio is forced). Windowed: the client area is exactly that size
+    // (SizeWindow). Fullscreen: a borderless window over the primary display. Either way the
+    // swap chain stretches to the window.
     const Settings& settings = GetSettings();
     const uint32_t outW = settings.width, outH = settings.height;
     HWND surface = nullptr;
@@ -173,20 +204,11 @@ void CreateWindowAndDevice()
     }
     else
     {
-        RECT work{};
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-        LONG cw = LONG(outW), ch = LONG(outH);
-        const LONG maxW = (work.right - work.left) * 9 / 10, maxH = (work.bottom - work.top) * 9 / 10;
-        if (cw > maxW || ch > maxH)
-        {
-            const double f = std::min(double(maxW) / cw, double(maxH) / ch);
-            cw = LONG(cw * f);
-            ch = LONG(ch * f);
-        }
-        RECT r{ 0, 0, cw, ch };
-        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-        g_p.window = CreateWindowW(L"regpu", GetSettings().windowTitle.c_str(), WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
-            r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+        g_p.window = CreateWindowW(L"regpu", GetSettings().windowTitle.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+            CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr, wc.hInstance, nullptr);
+        SetWindowPos(g_p.window, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER); // (sized from the work area's corner)
+        SizeWindow(g_p.window, outW, outH);
+        ShowWindow(g_p.window, SW_SHOW);
     }
 
     ComPtr<IDXGIFactory4> factory;
@@ -360,6 +382,11 @@ void PresenterSubmitFrame(uint64_t frame)
 bool PresenterHasFocus()
 {
     return !g_p.window || GetForegroundWindow() == g_p.window;
+}
+
+void regpu::SetWindowSize(uint32_t width, uint32_t height)
+{
+    SizeWindow(g_p.window, width, height);
 }
 
 void PresenterSubmitImage(uint32_t width, uint32_t height, std::vector<uint8_t> rgba)
