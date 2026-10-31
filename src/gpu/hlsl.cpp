@@ -1364,7 +1364,7 @@ TranslatedShader TranslateShader(const Shader& shader)
             decl += "    float4 r" + std::to_string(n) + (n < 16 ? " = input.o[" + std::to_string(n) + "];\n" : " = 0;\n");
         for (uint32_t n : regs)
             if (n < 16)
-                inputs += "    if (pinfo.y == " + std::to_string(n) + "u) r" + std::to_string(n) + " = float4(input.pos.xy * pinfo2.yz, input.pcoord);\n";
+                inputs += "    if (pinfo.y == " + std::to_string(n) + "u) r" + std::to_string(n) + " = float4(((pinfo.z & 65536u) ? floor(input.pos.xy) : input.pos.xy) * pinfo2.yz, input.pcoord);\n";
         h += decl +
              "    float4 oC[4]; [unroll] for (int k = 0; k < 4; k++) oC[k] = 0;\n"
              "    float ps = 0; bool p = false; int a0 = 0, aL = 0;\n" + inputs;

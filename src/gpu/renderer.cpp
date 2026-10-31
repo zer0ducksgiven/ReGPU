@@ -10029,6 +10029,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // tyre smoke came out as hard-edged grey shapes. REGPU_NO_ALPHA_DITHER=1: D3D's coverage.
     if (static LiveSwitch noAlphaDither("REGPU_NO_ALPHA_DITHER"); !noAlphaDither && g_msaa == 1 && edramMode != 5 && (colorControl >> 4) & 1)
         pc->info[2] |= 64u | (colorControl >> 24) << 8;
+    // The pixel position register (PsParamGen) holds the pixel's integer position, D3D9's convention
+    // (Xenia: the host pixel rounded down, then the render scale undone); the host pixel's centre was
+    // half a host pixel past it. Screen-space lookups that add half a texel then read past the pixel's
+    // own texel (at 1.5, FH1's shadow passes' depth fetches one row apart could fall on one host row).
+    // Bit 16 (bit 6 is the alpha dither). REGPU_OLD_PIXEL_POS=1: the centre (A/B).
+    if (static LiveSwitch oldPixelPos("REGPU_OLD_PIXEL_POS"); !oldPixelPos)
+        pc->info[2] |= 1u << 16;
     // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
     // and must keep spanning the width (squeezing them warped the image outside 16:9).
     vc->vwide[3] = g_drawSamplesResolve ? 0.0f : 1.0f;
