@@ -7,7 +7,7 @@ ReGPU takes the GPU's half of a port off your hands. The recompiled game talks t
 talked to the console: it writes command packets into a ring buffer and calls the kernel's `Vd*` video
 functions. ReGPU runs the command processor, translates the Xenos shader microcode to HLSL, emulates
 EDRAM, resolves, MSAA and the texture formats, presents the frames, and can upscale them (FSR 1,
-optionally FSR 3 and DLSS).
+optionally FSR 3, FSR 4 and DLSS).
 
 It came out of a working port, Forza Motorsport 2, where it renders the whole game. Everything
 specific to that game has been removed; what remains is the console's behaviour, plus hooks for the

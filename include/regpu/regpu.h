@@ -24,8 +24,10 @@ struct Config
     bool enhance = false;                // enhanced lighting post pass (experimental)
     uint32_t msaa = 1;                   // samples per pixel: 1 (off), 2, 4 or 8
     // Upscaling: the 3D scene renders smaller and is upscaled before post-processing and the
-    // HUD, which stay at full resolution. Fsr3 and Dlss need REGPU_FSR3 / REGPU_DLSS builds.
-    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss };
+    // HUD, which stay at full resolution. Fsr3, Fsr4 and Dlss need REGPU_FSR3 / REGPU_DLSS builds.
+    // Fsr4 is AMD's ML upscaler: it needs a supporting AMD GPU (RDNA 2 or newer, see the FidelityFX
+    // SDK notes) and falls back to FSR 3 elsewhere.
+    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss, Fsr4 };
     Upscaler upscaler = Upscaler::Off;
     uint32_t quality = 1;   // 0 native (anti-aliasing only), 1 quality, 2 balanced, 3 performance, 4 ultra performance
     float sharpness = 0.5f; // 0-1

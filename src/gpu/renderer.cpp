@@ -2185,7 +2185,8 @@ void BeginFrameIfNeeded()
     // This frame's scene phase and scale (see UpscaleScene).
     {
         const Settings& st = GetSettings();
-        const bool temporalUpscaler = st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3;
+        const bool temporalUpscaler = st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3 ||
+            st.upscaler == Settings::Upscaler::Fsr4;
         const float scale = st.SceneScale();
         g_upscale.switchedThisFrame = false;
         g_scenePhase = st.upscaler != Settings::Upscaler::Off && (temporalUpscaler || scale < 1.0f) && g_r.frame >= g_upscale.retryFrame &&
@@ -5756,7 +5757,8 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     barrier(in.output, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NGX records into the real command list (after everything recorded so far).
     const bool ok = dlss ? DlssEvaluate(C().list->Real(), setup, in)
-                         : Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
+                         : GetSettings().upscaler == Settings::Upscaler::Fsr4 ? Fsr4Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness)
+                                                             : Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
     barrier(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     if (dlaa && ok)
     {
@@ -9676,9 +9678,9 @@ void BenchmarkWriteReport(const char* path)
         }
     }
     const Settings& st = GetSettings();
-    static const char* upscalers[] = { "off", "FSR 1", "FSR 3", "DLSS" };
+    static const char* upscalers[] = { "off", "FSR 1", "FSR 3", "DLSS", "FSR 4" };
     static const char* qualities[] = { "native (AA)", "quality", "balanced", "performance", "ultra performance" };
-    std::string upscaler = upscalers[std::min<uint32_t>(uint32_t(st.upscaler), 3)];
+    std::string upscaler = upscalers[std::min<uint32_t>(uint32_t(st.upscaler), 4)];
     if (st.upscaler != Settings::Upscaler::Off)
         upscaler += std::string(", ") + qualities[std::min<uint32_t>(st.quality, 4)];
 
