@@ -28,6 +28,9 @@ cbuffer VSConstants : register(b0)
     // The game's own constants for the shaders it rewrote (Host::rewriteShader, set per draw in
     // Host::onDraw); zero unless it sets them.
     float4 vuser[4];
+    // x: the polygon offset's constant part (PA_SU_POLY_OFFSET_*_OFFSET), added to depth: the console
+    // adds it as an absolute amount, D3D12's depth bias scales it by each primitive's depth.
+    float4 vdepth;
     // xy: clip-space factors for perspective geometry in a wide pass (outputs wider than
     // 16:9; 1 otherwise): x narrows the view to the wider screen (Hor+), y zooms in when
     // REGPU_WIDE_FOV limits how far the view widens; z keeps 2D (HUD, menus) at 16:9; w is 0
@@ -1339,6 +1342,8 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    float zc = p.z * w;\n"
              "    if (!(vte.x & (1u << 9)) && !(vte.x & (1u << 8)) && !(vte.x & (1u << 29)))\n"
              "        zc = r.pos.z * ((vte.x & 16u) ? vscale.z : 1.0) + ((vte.x & 32u) ? voffset.z : 0.0) * w;\n"
+             "    // The polygon offset's constant part (vdepth.x, renderer.cpp PolygonOffsetDepth).\n"
+             "    zc += vdepth.x * w;\n"
              "    r.pos = float4(ndc * w, zc, w);\n"
              "    return r;\n}\n";
     }

@@ -963,7 +963,7 @@ uint32_t ExecutePacket(uint32_t ptr)
         uint32_t samples = 1000, total = 1000;
         if (real && !end)
             RendererOcclusionBegin();
-        else if (real && !RendererOcclusionEnd(samples, total))
+        else if (real && !RendererOcclusionEnd(samples, total, counts))
             samples = total = 1000; // no result yet (the first frames): fully visible
         memset(c, 0, 8 * 4);
         if (end)

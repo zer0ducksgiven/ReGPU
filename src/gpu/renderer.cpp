@@ -429,6 +429,26 @@ uint32_t RoundedBias(uint32_t bits)
     return exact || (bits & 0x7F800000) == 0x7F800000 ? bits : (bits + (1u << 18)) & ~((1u << 19) - 1);
 }
 
+// The polygon offset's constant part as the console applies it: an absolute amount added to depth
+// (Xenia's shader-depth route, halved for D24FS8 as Xenia does), from the vertex shader. D3D12's depth
+// bias on a float depth buffer is relative instead (scaled by 2^(exponent of the primitive's depth -
+// 23)): at the small reverse-Z depths of a car a few metres away it came out ~64 times too small, and
+// PGR4's headlight flare occlusion quads (offset toward the camera, GEQUAL against the restored scene
+// depth) never passed, so the flare stayed off and flashed on only when a query had no result yet.
+// 0 without polygon offset, or with REGPU_NO_POLY_OFFSET / REGPU_FIXED_POLY_OFFSET (A/B).
+float PolygonOffsetDepth()
+{
+    static LiveSwitch noPolyOffset("REGPU_NO_POLY_OFFSET");
+    static LiveSwitch fixedOffset("REGPU_FIXED_POLY_OFFSET");
+    const uint32_t sc = gpureg::Get(PA_SU_SC_MODE_CNTL);
+    if (noPolyOffset || fixedOffset || !((gpureg::Get(RB_DEPTHCONTROL) >> 1) & 1) || !((sc >> 11) & 3))
+        return 0.0f;
+    float offset = RegFloat((sc >> 11) & 1 ? 0x2381 : 0x2383);
+    if ((gpureg::Get(RB_DEPTH_INFO) >> 16) & 1) // D24FS8
+        offset *= 0.5f;
+    return offset;
+}
+
 struct PipelineKeyHash
 {
     size_t operator()(const PipelineKey& k) const
@@ -761,10 +781,19 @@ struct OcclusionParts
 {
     UINT order = 0;
     std::vector<UINT> main, coverage;
+    // Which query it is: the guest memory its counts go to (RB_SAMPLE_COUNT_ADDR at its end: the game's
+    // query object), and its place among this frame's queries there. A guest query gets the result of the
+    // last finished one with the same address, not the same place in the frame: PGR4 queries its light
+    // flares in alternating sets, and results come from whichever frame finished last (1-3 back), so by
+    // order a headlight's query was answered with another lamp's result (the flare flickered at random).
+    uint64_t kind = 0;
+    UINT kindOrder = 0;
 };
 std::vector<OcclusionParts> g_occlusionPending[3];  // per frame slot
 std::vector<int64_t> g_occlusionResult;              // by order in the frame: host samples, -1 none yet
 std::vector<int64_t> g_occlusionCoverage;            // by order in the frame: host samples covered, -1 none
+std::map<std::pair<uint64_t, UINT>, std::pair<int64_t, int64_t>> g_occlusionByKind; // address, place: passed, covered (-1 none)
+std::unordered_map<uint64_t, UINT> g_occlusionKindCount; // this frame's queries so far, by address
 OcclusionParts g_occlusionCurrent;
 uint64_t g_occlusionFrame = ~0ull;
 UINT g_occlusionCount = 0, g_occlusionIndex = 0, g_occlusionOrder = 0, g_occlusionOrders = 0; // D3D queries used, open one, guest order, guest queries
@@ -2182,6 +2211,7 @@ void BeginFrameIfNeeded()
                     covered += int64_t(counts[i]);
                 g_occlusionResult[q.order] = passed;
                 g_occlusionCoverage[q.order] = q.coverage.empty() ? -1 : covered;
+                g_occlusionByKind[{ q.kind, q.kindOrder }] = { passed, q.coverage.empty() ? -1 : covered };
             }
             const D3D12_RANGE none{ 0, 0 };
             g_occlusionReadback->Unmap(0, &none);
@@ -4101,7 +4131,9 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
     const uint32_t sc = gpureg::Get(PA_SU_SC_MODE_CNTL);
     const bool polyOffset = !noPolyOffset && ((depth >> 1) & 1) && ((sc >> 11) & 3);
     const uint32_t biasScale = polyOffset ? gpureg::Get((sc >> 11) & 1 ? 0x2380 : 0x2382) : 0;
-    uint32_t biasOffset = polyOffset ? RoundedBias(gpureg::Get((sc >> 11) & 1 ? 0x2381 : 0x2383)) : 0;
+    // The constant part goes to the vertex shader (PolygonOffsetDepth), unless REGPU_FIXED_POLY_OFFSET=1.
+    static LiveSwitch fixedOffset("REGPU_FIXED_POLY_OFFSET");
+    uint32_t biasOffset = polyOffset && fixedOffset ? RoundedBias(gpureg::Get((sc >> 11) & 1 ? 0x2381 : 0x2383)) : 0;
     // REGPU_POLY_OFFSET_SCALE=<f>: the constant offset times f (debug; read per draw, part of the key).
     thread_local FrameEnv scaleEnv{ "REGPU_POLY_OFFSET_SCALE" };
     if (const char* m = scaleEnv.Get(); m && biasOffset)
@@ -7484,9 +7516,12 @@ void EndOcclusionPart();
 
 void SplitMainList()
 {
-    // A query must end in the list it began in.
-    if (g_occlusionOpen)
-        EndOcclusionQuery();
+    // A D3D query must end in the list it began in: an open guest query ends its part here and goes on
+    // in the new list. (Ending the guest query, as before, left the guest's own end without a result:
+    // answered as fully visible, with the periodic submits a query here and there every frame.)
+    const bool queryOpen = g_occlusionOpen;
+    if (queryOpen)
+        EndOcclusionPart();
     ID3D12GraphicsCommandList* done = g_r.recorder.Real();
     done->Close();
     ID3D12CommandList* lists[] = { done };
@@ -7495,6 +7530,20 @@ void SplitMainList()
     ListPrologue(g_r.recorder);
     g_drawState.Invalidate();
     SelectSurfaces(true);
+    if (queryOpen)
+    {
+        if (g_occlusionCount + 1 <= kOcclusionPerFrame)
+        {
+            g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
+            g_occlusionCurrent.main.push_back(g_occlusionIndex);
+            C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+        }
+        else
+        {
+            g_occlusionOpen = false; // out of D3D queries: what was counted so far is its result
+            g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent);
+        }
+    }
 }
 
 // Waits until everything submitted to the queue so far has finished.
@@ -8167,6 +8216,7 @@ void RendererOcclusionBegin()
         g_occlusionFrame = g_r.frame;
         g_occlusionCount = 0;
         g_occlusionOrders = 0;
+        g_occlusionKindCount.clear();
     }
     if (g_occlusionOpen || g_occlusionCount + 4 > kOcclusionPerFrame)
         return;
@@ -8187,9 +8237,11 @@ void RendererOcclusionBegin()
     g_occlusionCurrent.main.push_back(g_occlusionIndex);
     C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
     g_occlusionOpen = true;
+    if (const uint64_t t = TraceFrame(); t && g_r.frame + 1 == t)
+        Log("occlusion query %u begins (draw #%u next)", g_occlusionOrder, g_r.drawsThisFrame.load() + 1);
 }
 
-bool OcclusionEndImpl(uint32_t& samples, uint32_t& total);
+bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address);
 namespace
 {
 namespace Unstable
@@ -8201,11 +8253,11 @@ extern uint32_t g_logged;
 
 // REGPU_TRACE_UNSTABLE: a query's answer that turns from hidden to visible or back between frames
 // (no result yet counts as visible: the caller answers 1000 samples).
-bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total)
+bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address)
 {
     const UINT order = g_occlusionOrder;
     const bool open = g_occlusionOpen;
-    const bool known = OcclusionEndImpl(samples, total);
+    const bool known = OcclusionEndImpl(samples, total, address);
     if (open && Unstable::On())
     {
         // By order in the frame and frame parity: -1 no result yet, 0 hidden, 1 visible.
@@ -8232,22 +8284,37 @@ bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total)
     return known;
 }
 
-bool OcclusionEndImpl(uint32_t& samples, uint32_t& total)
+bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address)
 {
     if (!g_occlusionOpen)
         return false;
     const UINT order = g_occlusionOrder;
+    g_occlusionCurrent.kind = uint64_t(address) << 1 | 1;
+    g_occlusionCurrent.kindOrder = g_occlusionKindCount[g_occlusionCurrent.kind]++;
+    const std::pair<uint64_t, UINT> kind{ g_occlusionCurrent.kind, g_occlusionCurrent.kindOrder };
     EndOcclusionQuery();
-    if (order >= g_occlusionResult.size() || g_occlusionResult[order] < 0)
+    // REGPU_OCCLUSION_BY_ORDER=1: answered by order in the frame, as before (A/B).
+    static LiveSwitch byOrder("REGPU_OCCLUSION_BY_ORDER");
+    int64_t passed = -1, covered = -1;
+    if (byOrder)
+    {
+        if (order < g_occlusionResult.size())
+            passed = g_occlusionResult[order], covered = g_occlusionCoverage[order];
+    }
+    else if (auto it = g_occlusionByKind.find(kind); it != g_occlusionByKind.end())
+        std::tie(passed, covered) = it->second;
+    if (const uint64_t t = TraceFrame(); t && g_r.frame + 1 == t)
+        Log("occlusion query %u ends: kind %016llx #%u, answer passed %lld covered %lld (host samples)", order, (unsigned long long)kind.first,
+            kind.second, (long long)passed, (long long)covered);
+    if (passed < 0)
         return false;
     // Host samples to the console's: the output is ScaleX x ScaleY host pixels per game pixel
     // with g_msaa samples each; the guest surface has 1, 2 or 4 samples per pixel.
     const uint32_t guestMsaa = (gpureg::Get(RB_SURFACE_INFO) >> 16) & 3;
     const double perHost = double(1u << guestMsaa) / (double(ScaleX()) * double(ScaleY()) * double(g_msaa));
-    samples = uint32_t(std::min(double(g_occlusionResult[order]) * perHost + 0.5, 4294967295.0));
+    samples = uint32_t(std::min(double(passed) * perHost + 0.5, 4294967295.0));
     // Total: the samples the query's draws covered, depth test aside (their coverage draws); without
     // one (REGPU_NO_OCCLUSION_COVERAGE, or none yet), the passed count as before.
-    const int64_t covered = order < g_occlusionCoverage.size() ? g_occlusionCoverage[order] : -1;
     total = covered >= 0 ? std::max(samples, uint32_t(std::min(double(covered) * perHost + 0.5, 4294967295.0))) : samples;
     return true;
 }
@@ -8837,6 +8904,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         uint32_t vte[4];
         uint32_t vfl[32][4]; // vertex fetch layout of the bound shader
         float vuser[4][4];   // the game's per-draw constants (Host::onDraw; hlsl.cpp vuser), zero by default
+        float vdepth[4];     // x: the polygon offset's constant part (hlsl.cpp vdepth)
         float vwide[4];      // x: Hor+ factor (see hlsl.cpp)
         float vjitter[4];     // motion-vector variants: this frame's jitter (NDC)
     };
@@ -9023,6 +9091,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         memcpy(vc->vfl, vs.info.vertexFetchLayout.data(), vs.info.vertexFetchLayout.size() * sizeof(vc->vfl[0]));
     vc->info[0] = uint32_t(listOffset);
     vc->info[1] = (initiator & 0x3F) == 1 ? 2 : 0;
+    vc->vdepth[0] = PolygonOffsetDepth();
+    vc->vdepth[1] = vc->vdepth[2] = vc->vdepth[3] = 0;
     // Viewport transform in the vertex shader (see hlsl.cpp).
     vc->vscale[0] = RegFloat(PA_CL_VPORT_XSCALE);
     vc->vscale[1] = RegFloat(PA_CL_VPORT_YSCALE);
@@ -9706,10 +9776,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         Log("    indices (initiator %08X dma %08X offset %u): %u %u %u %u %u %u ... %u", initiator, dmaBase, gpureg::Get(VGT_INDX_OFFSET),
             list.size() > 0 ? list[0] : 0, list.size() > 1 ? list[1] : 0, list.size() > 2 ? list[2] : 0, list.size() > 3 ? list[3] : 0,
             list.size() > 4 ? list[4] : 0, list.size() > 5 ? list[5] : 0, list.empty() ? 0 : list.back());
-        Log("draw #%u vs %016llx ps %016llx prim %u n %zu blend %08X mask %X scissor %ld,%ld-%ld,%ld vte %03X wide %d layer %d pitch %u%s", g_r.drawsThisFrame.load(),
+        Log("draw #%u vs %016llx ps %016llx prim %u n %zu blend %08X mask %X scissor %ld,%ld-%ld,%ld vte %03X wide %d layer %d pitch %u%s%s", g_r.drawsThisFrame.load(),
             (unsigned long long)C().vsHash, (unsigned long long)C().psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
             gpureg::Get(RB_COLOR_MASK) & 15, scissor.left, scissor.top, scissor.right, scissor.bottom, gpureg::Get(PA_CL_VTE_CNTL) & 0x3FF,
-            int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF, tex.c_str());
+            int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF, g_occlusionOpen ? " [in occlusion query]" : "", tex.c_str());
         Log("    host: scissor %ld,%ld-%ld,%ld viewport %g,%g %gx%g depth %p colour %p (bases %03X %03X)", hostScissor.left, hostScissor.top,
             hostScissor.right, hostScissor.bottom, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, static_cast<void*>(C().depth.Get()),
             static_cast<void*>(C().color.Get()), C().depthBase, C().colorBase);

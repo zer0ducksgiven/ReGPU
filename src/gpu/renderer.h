@@ -67,8 +67,9 @@ bool RendererTileReplay(uint32_t surface, const int32_t first[4], const int32_t 
 // `replay`: the draw is in a buffer the command processor found to be a later tile's replay.
 bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uint32_t initiator, bool replay, uint32_t dmaBase, uint32_t dmaSize);
 void RendererOcclusionBegin();
-// The query's samples that passed and, as the console's Total, the samples its draws covered.
-bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total);
+// The query's samples that passed and, as the console's Total, the samples its draws covered, as
+// counted for the last finished query that wrote its counts to `address` (RB_SAMPLE_COUNT_ADDR).
+bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address);
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.
 void RendererTrackTile(RendererTile& tile);
 void RendererSetTile(const RendererTile& tile);
