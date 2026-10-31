@@ -233,17 +233,46 @@ uint32_t SurfaceRows()
     }();
     return rows;
 }
-uint32_t SurfaceHeight() { return uint32_t((uint64_t(OutputHeight()) * SurfaceRows() + kHeight - 1) / kHeight); }
+// The whole-number scale a tall pass is drawn at (IntegerTallScale): the output's scale rounded up.
+// The host surfaces are made large enough for it (at 1080p, 2x: as large as 1440p's).
+uint32_t TallScaleRoom() { return std::max<uint32_t>(1, (OutputHeight() + kHeight - 1) / kHeight); }
+uint32_t SurfaceWidth() { return std::max(OutputWidth(), TallScaleRoom() * kWidth); }
+uint32_t SurfaceHeight()
+{
+    return std::max(uint32_t((uint64_t(OutputHeight()) * SurfaceRows() + kHeight - 1) / kHeight), TallScaleRoom() * SurfaceRows());
+}
+
+// A tall pass (a shadow atlas) is drawn at a whole number of host texels per guest texel: titles move
+// a shadow projection in steps of one guest texel to hold it still, and at a fractional scale (1.5 at
+// 1080p) each step put the host texel grid at another phase, so alpha-tested edges (FH1's tree
+// leaves) rasterised differently every frame and their shadows shimmered, more while moving. Rounded
+// up when the surfaces hold it (rounded down to 1x at 1080p the near shadows still shimmered a little
+// and distant ones more, at the console's own resolution), else down.
+// REGPU_FRACTIONAL_TALL_SCALE=1: the output's scale as before (A/B).
+float IntegerTallScale(float passScale)
+{
+    static LiveSwitch fractional("REGPU_FRACTIONAL_TALL_SCALE");
+    if (fractional || BigPassSize() || PassHeight() <= kHeight)
+        return passScale;
+    const float total = float(OutputHeight()) / float(kHeight) * g_sceneScale * passScale;
+    if (total <= 1.0f)
+        return passScale;
+    const uint32_t pitch = gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF;
+    const float up = std::ceil(total - 1e-3f);
+    const bool fits = up * float(PassHeight()) <= float(SurfaceHeight()) && up * float(pitch) <= float(SurfaceWidth());
+    return passScale * (fits ? up : std::floor(total + 1e-3f)) / total;
+}
 
 float PassScale()
 {
     // (Asked for every scaled coordinate: memoised on what it depends on.)
-    struct Memo { uint32_t surface = ~0u, color = ~0u, generation = ~0u, tallInfo = ~0u, tallHeight = ~0u; float result = 1; };
+    struct Memo { uint32_t surface = ~0u, color = ~0u, generation = ~0u, tallInfo = ~0u, tallHeight = ~0u, output = ~0u; float scene = -1; float result = 1; };
     thread_local Memo memo;
     const uint32_t surface = gpureg::Get(0x2000), color = gpureg::Get(0x2001) & 0xFFF, generation = g_nativeMsaaGeneration.load(std::memory_order_relaxed);
-    if (surface != memo.surface || color != memo.color || generation != memo.generation || g_tallInfo != memo.tallInfo || g_tallHeight != memo.tallHeight)
-        memo = { surface, color, generation, g_tallInfo, g_tallHeight,
-            std::min(float(kWidth) / float(PassWidth()), float(SurfaceRows()) / float(PassHeight())) };
+    if (surface != memo.surface || color != memo.color || generation != memo.generation || g_tallInfo != memo.tallInfo || g_tallHeight != memo.tallHeight ||
+        OutputHeight() != memo.output || g_sceneScale != memo.scene)
+        memo = { surface, color, generation, g_tallInfo, g_tallHeight, OutputHeight(), g_sceneScale,
+            IntegerTallScale(std::min(float(kWidth) / float(PassWidth()), float(SurfaceRows()) / float(PassHeight()))) };
     return memo.result;
 }
 float ScaleY() { return float(OutputHeight()) / float(kHeight) * g_sceneScale * PassScale(); }
@@ -1905,7 +1934,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width = OutputWidth();
+    td.Width = SurfaceWidth();
     td.Height = SurfaceHeight();
     td.DepthOrArraySize = 1;
     td.MipLevels = 1;
