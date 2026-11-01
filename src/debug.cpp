@@ -407,8 +407,8 @@ std::string Handle(const std::string& line)
     {
         std::string name, value;
         in >> name >> value;
-        if (name.rfind("REGPU_", 0) != 0 || (value != "0" && value != "1" && value != "on" && value != "off"))
-            return Error("switch REGPU_NAME 0|1");
+        if ((name.rfind("REGPU_", 0) != 0 && name.rfind("PGR4_", 0) != 0) || (value != "0" && value != "1" && value != "on" && value != "off"))
+            return Error("switch REGPU_NAME|PGR4_NAME 0|1");
         const bool on = value == "1" || value == "on";
         const bool known = LiveSwitch::Set(name, on);
         return Ok(std::string("\"name\":\"") + Escape(name) + "\",\"on\":" + (on ? "true" : "false") +
