@@ -350,6 +350,8 @@ struct CachedTexture
     uint64_t checkedFrame = ~0ull; // content already validated in this frame
     uint32_t unchanged = 0;        // checks in a row that found the same content
     uint32_t changes = 0;          // times the content changed after the first upload
+    bool everLive = false;         // cubes: the title rendered (some of) its faces at least once
+    uint64_t lastLiveFrame = 0;    // cubes: the renderer frame of the last put-together with rendered faces
     uint32_t width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // cubes: matches their faces
     bool native = false; // block-compressed on the GPU: the shader applies the fetch swizzle
@@ -411,6 +413,32 @@ struct FrameResources
     std::vector<std::pair<ComPtr<ID3D12CommandAllocator>, ComPtr<ID3D12GraphicsCommandList>>> pool;
     size_t poolUsed = 0;
 };
+
+// The pipeline this thread is handing to the driver compiler, named by RendererLogCrashContext if the driver faults.
+struct CompilingNow { uint64_t vs, ps; bool active; };
+thread_local CompilingNow g_compiling{};
+
+// Pipelines whose compile crashed the driver (FM4 port: AMD's amdxc64 faults on a few): written by
+// RendererLogCrashContext (the port's crash handler, through regpu::LogCrashContext) to regpu-bad-pipelines.txt
+// and refused on the next start, so a draw using one is dropped instead of killing the game.
+const char* const kBadPipelinesFile = "regpu-bad-pipelines.txt";
+bool PipelineIsPoisoned(uint64_t vs, uint64_t ps)
+{
+    static const std::set<std::pair<uint64_t, uint64_t>> bad = [] {
+        std::set<std::pair<uint64_t, uint64_t>> out;
+        if (FILE* f = fopen(kBadPipelinesFile, "r"))
+        {
+            unsigned long long v, p;
+            while (fscanf(f, "%llx %llx", &v, &p) == 2)
+                out.insert({ v, p });
+            fclose(f);
+        }
+        if (!out.empty())
+            Log("renderer: %zu pipelines refused (they crashed the driver's compiler before: %s)", out.size(), kBadPipelinesFile);
+        return out;
+    }();
+    return bad.count({ vs, ps }) != 0;
+}
 
 struct PipelineKey
 {
@@ -2226,6 +2254,19 @@ void EvictBindless()
     }
 }
 
+// Waits for the queue fence to reach a value, on an event of the calling thread: one shared event let two waiting
+// threads steal each other's wake-up, and the loser sat out its whole timeout (FM4 port: 2 s stalls in a race).
+void WaitFenceValue(UINT64 value, DWORD timeoutMs)
+{
+    thread_local HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_r.fence->GetCompletedValue() >= value)
+        return;
+    g_r.fence->SetEventOnCompletion(value, event);
+    if (WaitForSingleObject(event, timeoutMs) == WAIT_TIMEOUT && timeoutMs != INFINITE)
+        Log("perf: a fence wait timed out after %lu ms (value %llu, completed %llu)", timeoutMs, (unsigned long long)value,
+            (unsigned long long)g_r.fence->GetCompletedValue());
+}
+
 void BeginFrameIfNeeded()
 {
     if (g_r.listOpen)
@@ -2234,8 +2275,7 @@ void BeginFrameIfNeeded()
     if (g_r.fence->GetCompletedValue() < f.fence)
     {
         const auto w0 = std::chrono::steady_clock::now();
-        g_r.fence->SetEventOnCompletion(f.fence, g_r.fenceEvent);
-        WaitForSingleObject(g_r.fenceEvent, INFINITE);
+        WaitFenceValue(f.fence, INFINITE);
         g_gpuWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
     }
     f.garbage.clear();
@@ -3860,6 +3900,8 @@ struct PipelineLibrary
     HRESULT CreateOrLoad(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const PipelineKey& key, ComPtr<ID3D12PipelineState>& pso, bool* hit)
     {
         *hit = false;
+        if (PipelineIsPoisoned(key.vs, key.ps))
+            return E_FAIL; // (see kBadPipelinesFile)
         if (library)
         {
             const std::wstring name = Name(key, pd);
@@ -3873,7 +3915,9 @@ struct PipelineLibrary
                 return S_OK;
             }
             // The slow part (the driver compiling) runs outside the lock.
+            g_compiling = { key.vs, key.ps, true };
             const HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+            g_compiling.active = false;
             if (SUCCEEDED(hr))
             {
                 std::shared_lock lock(access);
@@ -3884,7 +3928,10 @@ struct PipelineLibrary
                 KeepFresh(name, pso.Get());
             return hr;
         }
-        return device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+        g_compiling = { key.vs, key.ps, true };
+        const HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+        g_compiling.active = false;
+        return hr;
     }
 
     void KeepFresh(const std::wstring& name, ID3D12PipelineState* pso)
@@ -4438,6 +4485,20 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             want = faces[i]->format;
             break;
         }
+    if (resolved)
+    {
+        cached.everLive = true;
+        cached.lastLiveFrame = g_r.frame;
+    }
+    // A cube the title renders that has no live face for a moment (its resolves late, stale or replaced) was read from
+    // guest memory, which holds no picture of it: the paint reflected an empty cube (FM4 port: purple, no reflections).
+    // The last live picture stays for up to 180 frames instead. REGPU_NO_CUBE_KEEP=1 (live): the old behaviour (A/B).
+    static LiveSwitch noKeep("REGPU_NO_CUBE_KEEP");
+    if (!resolved && cached.resource && cached.everLive && !noKeep && g_r.frame - cached.lastLiveFrame < 180)
+    {
+        format = cached.format;
+        return cached.resource.Get();
+    }
     // Faces the title rendered are at the render scale; the cube matches them (their own host
     // size: the current pass's scale differs when the cube is first fetched in another pass,
     // which rebuilt the cube mid-level, a 4-5 ms draw).
@@ -7283,8 +7344,7 @@ void HoldPresent()
     g_r.queue->Signal(g_r.fence.Get(), value);
     if (g_r.fence->GetCompletedValue() < value)
     {
-        g_r.fence->SetEventOnCompletion(value, g_r.fenceEvent);
-        WaitForSingleObject(g_r.fenceEvent, 500);
+        WaitFenceValue(value, 500);
     }
 }
 }
@@ -7371,8 +7431,7 @@ void BootPresent(const std::vector<uint8_t>& rgba)
     g_r.queue->Signal(g_r.fence.Get(), value);
     if (g_r.fence->GetCompletedValue() < value)
     {
-        g_r.fence->SetEventOnCompletion(value, g_r.fenceEvent);
-        WaitForSingleObject(g_r.fenceEvent, 500);
+        WaitFenceValue(value, 500);
     }
 }
 
@@ -7416,6 +7475,23 @@ void RendererPredictDraw(uint32_t initiator)
     if (!g_r.shaders.count(g_predPs))
         item.psCode = g_predPsOwn ? g_predPsOwn : std::make_shared<std::vector<uint32_t>>(g_predPsCode, g_predPsCode + g_predPsDwords);
     g_look.push_back(std::move(item));
+}
+
+void RendererLogCrashContext()
+{
+    if (!g_compiling.active)
+    {
+        LogFlush();
+        return;
+    }
+    Log("crash: this thread was inside the driver compiling pipeline vs %016llx ps %016llx; it will be skipped on the next start",
+        (unsigned long long)g_compiling.vs, (unsigned long long)g_compiling.ps);
+    if (FILE* f = fopen(kBadPipelinesFile, "a"))
+    {
+        fprintf(f, "%016llx %016llx\n", (unsigned long long)g_compiling.vs, (unsigned long long)g_compiling.ps);
+        fclose(f);
+    }
+    LogFlush();
 }
 
 bool RendererCompileIdle()
@@ -7629,8 +7705,7 @@ void WaitForQueueIdle()
     g_r.queue->Signal(g_r.fence.Get(), value);
     if (g_r.fence->GetCompletedValue() < value)
     {
-        g_r.fence->SetEventOnCompletion(value, g_r.fenceEvent);
-        WaitForSingleObject(g_r.fenceEvent, 2000);
+        WaitFenceValue(value, 2000);
     }
 }
 
@@ -9483,7 +9558,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // outside the image (dword 5 bits 0-1: 1 white, else black).
         if (clampX >= 6 && clampY >= 6)
             ti[0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
-        tb[0] = fetch.LodBias();
+        // Below the output resolution (a temporal upscaler's scene) the mips are biased sharper by log2 of the
+        // scale (-0.58 at 67%), as upscalers ask, so the upscaled image keeps the output's texture detail
+        // (from the FM4 port). REGPU_NO_LOD_BIAS=1 (live): the fetch's bias alone.
+        static LiveSwitch noLodBias("REGPU_NO_LOD_BIAS");
+        tb[0] = fetch.LodBias() + (g_sceneScale < 1.0f && !noLodBias ? std::log2(g_sceneScale) : 0.0f);
         memcpy(&tb[1], &index, 4);
         // A resolved texture is as wide as the pitch it was resolved with; the fetch
         // constant may declare a narrower image inside it (e.g. 163 of 192 columns):
@@ -10826,8 +10905,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
 
     if (dump)
     {
-        g_r.fence->SetEventOnCompletion(Frame().fence, g_r.fenceEvent);
-        WaitForSingleObject(g_r.fenceEvent, INFINITE);
+        WaitFenceValue(Frame().fence, INFINITE);
         for (ResolveDump& d : resolveDumps)
         {
             uint8_t* mapped = nullptr;

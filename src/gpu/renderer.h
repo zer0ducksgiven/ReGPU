@@ -18,6 +18,9 @@ void RendererPredictDraw(uint32_t initiator);
 bool RendererCompileIdle();
 // Flushes the pipeline library to disk (called when the tour finishes).
 void RendererSaveCaches();
+// From the port's crash handler: a crash inside the driver's pipeline compiler is logged and that pipeline is
+// refused from the next start on (regpu-bad-pipelines.txt).
+void RendererLogCrashContext();
 // The display gamma table entry `index` (10:10:10 RGB), applied when presenting.
 void RendererSetGammaEntry(uint32_t index, uint32_t rgb10);
 // One entry of the display's piecewise-linear gamma ramp (DC_LUT_PWL_DATA: base, delta), 0-127, per channel.

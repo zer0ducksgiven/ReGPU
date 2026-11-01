@@ -159,6 +159,11 @@ bool WindowHasFocus();
 // Logs the command processor's state (ring pointers, what it waits on, interrupts, swaps): for a
 // watchdog when the game looks hung.
 void LogState();
+// Call from the game's crash handler, on the crashing thread: if it crashed inside the graphics driver's
+// pipeline compiler (some drivers fault on a few pipelines), the pipeline is logged and refused from the
+// next start on (regpu-bad-pipelines.txt in the working directory), so its draws are dropped instead.
+// It also writes out the log lines still queued (REGPU_LOG_ASYNC).
+void LogCrashContext();
 
 // The game draws its 3D view wider than 16:9 itself (a widescreen patch): ReGPU then leaves its
 // field of view alone instead of widening it (Hor+) at wide resolutions.

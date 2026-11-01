@@ -249,10 +249,14 @@ void DecodeTexel(uint32_t format, const uint8_t* t, uint8_t* out)
     }
     case k_4_4_4_4:
     {
+        // R in the low nibble, as k_8_8_8_8 has R in the low byte (after the endian swap). With R and B
+        // the other way round, a font atlas with a glyph in each channel drew glyphs from the wrong one
+        // (FM2's Japanese text). REGPU_4444_R_HIGH=1: R in the third nibble, as before (A/B).
+        static const bool rHigh = getenv("REGPU_4444_R_HIGH") != nullptr;
         const uint16_t c = uint16_t(t[0] | (t[1] << 8));
-        out[0] = uint8_t(((c >> 8) & 15) * 17);
+        out[0] = uint8_t(((c >> (rHigh ? 8 : 0)) & 15) * 17);
         out[1] = uint8_t(((c >> 4) & 15) * 17);
-        out[2] = uint8_t((c & 15) * 17);
+        out[2] = uint8_t(((c >> (rHigh ? 0 : 8)) & 15) * 17);
         out[3] = uint8_t(((c >> 12) & 15) * 17);
         break;
     }
