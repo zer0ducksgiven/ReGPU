@@ -2893,11 +2893,25 @@ struct Manifest
 // stores it beside the unoptimised one (<key>.o.dxbc); later runs load that. The running
 // session keeps the bytecode its pipelines were built from.
 const bool g_optimizeShaders = getenv("REGPU_OPTIMIZE_SHADERS") != nullptr;
+// REGPU_OPTIMIZE_LEVEL (1-3, default 1): the fxc optimisation level of REGPU_OPTIMIZE_SHADERS' background builds. Higher
+// levels take longer to compile and may run faster on a weak GPU; other levels cache in files of their own.
+int OptimizeLevel()
+{
+    static const int level = [] {
+        const char* v = getenv("REGPU_OPTIMIZE_LEVEL");
+        const int n = v ? atoi(v) : 1;
+        return n < 1 ? 1 : n > 3 ? 3 : n;
+    }();
+    return level;
+}
 
 std::filesystem::path ShaderCachePath(uint64_t key, bool optimized = false)
 {
     char name[40];
-    snprintf(name, sizeof(name), optimized ? "%016llx.o.dxbc" : "%016llx.dxbc", (unsigned long long)key);
+    if (optimized && OptimizeLevel() != 1)
+        snprintf(name, sizeof(name), "%016llx.o%d.dxbc", (unsigned long long)key, OptimizeLevel());
+    else
+        snprintf(name, sizeof(name), optimized ? "%016llx.o.dxbc" : "%016llx.dxbc", (unsigned long long)key);
     return RegpuUserDir() / "shadercache" / name;
 }
 
@@ -2944,7 +2958,9 @@ struct ShaderOptimizer
             const D3D_SHADER_MACRO vertexStage[] = { { "REGPU_VERTEX_STAGE", "1" }, { nullptr, nullptr } };
             ComPtr<ID3DBlob> code, errors;
             if (FAILED(D3DCompile(job.hlsl.data(), job.hlsl.size(), nullptr, job.pixel ? nullptr : vertexStage, nullptr, "main",
-                    job.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0,
+                    job.pixel ? "ps_5_1" : "vs_5_1",
+                    (OptimizeLevel() == 3 ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : OptimizeLevel() == 2 ? D3DCOMPILE_OPTIMIZATION_LEVEL2 : D3DCOMPILE_OPTIMIZATION_LEVEL1) |
+                        D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0,
                     &code, &errors)))
                 continue; // the unoptimised build stays
             // Written under a temporary name: a run that reads it never sees half a file.

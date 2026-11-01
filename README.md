@@ -44,6 +44,9 @@ and green are motion, about +-8 px over the full range); `REGPU_VIEW_DEPTH=1` sh
 stored. The FSR 4 option is `Config::upscaler = Fsr4`; `REGPU_FSR_VERSION=<text>` picks the
 FidelityFX upscaler version whose name contains the text (the log lists them).
 
+Shader speed: `REGPU_OPTIMIZE_SHADERS=1` rebuilds shaders optimised in the background; `REGPU_OPTIMIZE_LEVEL=1|2|3`
+(default 1) sets the fxc level, with its own cache files per level.
+
 Ship Microsoft's `d3dcompiler_47.dll` (the Windows SDK's `Redist\D3D\x64`, redistributable) beside
 your executable: ReGPU loads it from there first. Under Wine/Proton the system copy is Wine's own,
 which can't compile the translated shaders.
