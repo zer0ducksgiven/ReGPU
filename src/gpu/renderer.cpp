@@ -9191,6 +9191,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         if (!clamp && !oldClamp)
             ti[0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
+        // The mirroring modes (1 mirrored repeat; 3, 5, 7 mirrored once, then clamped): the shader folds
+        // the coordinate (bits 28 U, 29 V; 30, 31 once). Taken as plain clamps, FH1's wrong-way sign came
+        // out blank: its arrow is the mirror image of an atlas icon, fetched at u -0.835..-0.668 with U
+        // mirrored, and clamped to the transparent edge texel. REGPU_NO_MIRROR=1: as clamps (A/B).
+        if (static LiveSwitch noMirror("REGPU_NO_MIRROR"); !noMirror)
+        {
+            const auto mirror = [](uint32_t mode, uint32_t bit, uint32_t onceBit) {
+                return mode == 1 ? bit : (mode == 3 || mode == 5 || mode == 7) ? bit | onceBit : 0u;
+            };
+            ti[0] |= mirror(clampX, 1u << 28, 1u << 30) | mirror(clampY, 1u << 29, 1u << 31);
+        }
         // Anisotropy the fetch asks for (dword 3 bits 25-27: 2 = 2x .. 5 = 16x), for the linear wrapping
         // sampler: bits 20-22 pick s4-s7 (hlsl.cpp). Only with REGPU_ANISO_FROM_FETCH (else s0 is 16x).
         if (const uint32_t aniso = (fetch.dwords[3] >> 25) & 7; AnisoFromFetch() && !point && !clamp && aniso >= 2 && aniso <= 5)

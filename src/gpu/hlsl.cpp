@@ -267,6 +267,15 @@ float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias
     return r;
 }
 
+// The Xenos clamp modes that mirror (fetch dword 0 bits 10-15): 1 mirrored repeat folds every other
+// tile back; 3, 5 and 7 mirror once about 0 and then clamp (the sampler or the axis clamp does that).
+float2 Mirror(float2 uv, uint info)
+{
+    if ((info >> 28) & 1u) uv.x = ((info >> 30) & 1u) ? abs(uv.x) : 1.0 - abs(frac(uv.x * 0.5) * 2.0 - 1.0);
+    if ((info >> 29) & 1u) uv.y = ((info >> 31) & 1u) ? abs(uv.y) : 1.0 - abs(frac(uv.y * 0.5) * 2.0 - 1.0);
+    return uv;
+}
+
 float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
 {
     uint index = asuint(tbias[slot].y);
@@ -291,6 +300,8 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
     if (denorm) uv = (uv + texel) / texelSize;
     else uv += texel / texelSize;
+    // Mirrored addressing (tinfo.x bits 28 U, 29 V; 30, 31: mirrored once, then clamped).
+    uv = Mirror(uv, tinfo[slot].x);
     // Clamp to border (tinfo.x bit 16; bit 17 white): outside the image the border colour, as
     // shadow maps rely on (white: nothing casts a shadow beyond the map).
     if (((tinfo[slot].x >> 16) & 1u) && any(uv < 0.0 || uv > 1.0))
@@ -1004,6 +1015,7 @@ float4 TFetch2D(uint slot, float3 coord, bool denorm, float bias, float2 texel)
     const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
     if (denorm) uv = (uv + texel) / texelSize;
     else uv += texel / texelSize;
+    uv = Mirror(uv, info);
     if (((info >> 16) & 1u) && any(uv < 0.0 || uv > 1.0))
         return ((info >> 17) & 1u) ? float4(1, 1, 1, 1) : float4(0, 0, 0, 0);
     if ((info >> 18) & 1u) uv.x = clamp(uv.x, 0.5 / texelSize.x, 1.0 - 0.5 / texelSize.x);
