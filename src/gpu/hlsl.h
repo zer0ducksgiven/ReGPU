@@ -27,6 +27,7 @@ struct TranslatedShader
     std::string error;
     std::string hlsl;
     uint32_t usedTextureSlots = 0;  // bit per fetch slot (pixel shaders)
+    bool memExport = false;         // a vertex shader writing eA/eM (memory export): not translated, its writes are lost
     std::vector<uint32_t> vertexFetchConstants; // vertex shaders
     std::vector<std::array<uint32_t, 4>> vertexFetchLayout; // vfl[k] for each vertex fetch (see hlsl.cpp)
     // Float constants the code reads: c[0] up to this (exclusive), 256 with relative

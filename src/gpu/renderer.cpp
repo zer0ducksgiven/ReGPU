@@ -933,27 +933,81 @@ struct SlotBinding
     float tbias[4] = {};
     bool samplesResolve = false;
 };
-// A cache valid for one frame: entries carry the frame they were made in instead of the map
-// being cleared each frame (re-inserting freed nodes cost a heap allocation per entry).
+// A cache valid for one frame: an open-addressed table whose slots carry the frame they were filled
+// in; a slot of another frame is empty, so a new frame starts with an empty table without clearing
+// it. (A std::unordered_map, a node and a cache miss per lookup, was ~3% of the command processor
+// across the index, upload, texture and bindless caches.) Grows when a frame fills half of it.
 template <class V>
 struct FrameMap
 {
-    struct Entry
+    struct Slot
     {
-        uint64_t frame;
-        V value;
+        uint64_t key = 0;
+        uint64_t frame = ~0ull;
+        V value{};
     };
-    std::unordered_map<uint64_t, Entry> map;
+    std::vector<Slot> slots = std::vector<Slot>(4096);
+    size_t used = 0;          // slots filled this frame
+    uint64_t usedFrame = ~0ull;
+    static size_t Hash(uint64_t key)
+    {
+        key ^= key >> 31;
+        key *= 0x9E3779B97F4A7C15ull;
+        return size_t(key ^ (key >> 29));
+    }
     V* Find(uint64_t key, uint64_t frame)
     {
-        auto it = map.find(key);
-        return it != map.end() && it->second.frame == frame ? &it->second.value : nullptr;
+        const size_t mask = slots.size() - 1;
+        for (size_t i = Hash(key) & mask;; i = (i + 1) & mask)
+        {
+            Slot& s = slots[i];
+            if (s.frame != frame)
+                return nullptr;
+            if (s.key == key)
+                return &s.value;
+        }
     }
     void Put(uint64_t key, uint64_t frame, const V& value)
     {
-        if (map.size() > (1u << 15)) // (stale entries of old frames)
-            map.clear();
-        map[key] = { frame, value };
+        if (usedFrame != frame)
+        {
+            usedFrame = frame;
+            used = 0;
+        }
+        if ((used + 1) * 2 > slots.size())
+            Grow(frame);
+        const size_t mask = slots.size() - 1;
+        for (size_t i = Hash(key) & mask;; i = (i + 1) & mask)
+        {
+            Slot& s = slots[i];
+            if (s.frame != frame)
+            {
+                s = { key, frame, value };
+                used++;
+                return;
+            }
+            if (s.key == key)
+            {
+                s.value = value;
+                return;
+            }
+        }
+    }
+    void Grow(uint64_t frame)
+    {
+        std::vector<Slot> old(slots.size() * 2);
+        old.swap(slots);
+        used = 0;
+        const size_t mask = slots.size() - 1;
+        for (const Slot& o : old)
+            if (o.frame == frame)
+                for (size_t i = Hash(o.key) & mask;; i = (i + 1) & mask)
+                    if (slots[i].frame != frame)
+                    {
+                        slots[i] = o;
+                        used++;
+                        break;
+                    }
     }
 };
 
@@ -2599,8 +2653,8 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
         {
             if (ContentHash(src, bytes) == it->second.sampled)
             {
-                g_uploadStats.hits++;
-                g_uploadStats.sampledHits++;
+                if (g_perfTiming) g_uploadStats.hits++;
+                if (g_perfTiming) g_uploadStats.sampledHits++;
                 return known->first;
             }
             it->second.changed = true;
@@ -2634,7 +2688,7 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
             s.sampledFrame = g_r.frame;
         }
     }
-    g_uploadStats.hashed += bytes;
+    if (g_perfTiming) g_uploadStats.hashed += bytes;
     // REGPU_TRACE_UPLOADS=1: the ranges hashed most (bytes and uses a frame), every 240 frames. FH1 free
     // roam: one 32 KB vertex range used by 352 draws a frame is 40% of the ~26 MB.
     if (static const bool traceUploads = getenv("REGPU_TRACE_UPLOADS") != nullptr; traceUploads)
@@ -2661,11 +2715,11 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     }
     if (known && known->second == sample)
     {
-        g_uploadStats.hits++;
+        if (g_perfTiming) g_uploadStats.hits++;
         return known->first;
     }
-    g_uploadStats.copies++;
-    g_uploadStats.copied += bytes;
+    if (g_perfTiming) g_uploadStats.copies++;
+    if (g_perfTiming) g_uploadStats.copied += bytes;
     if (RendererTracing() && bytes > (16u << 10))
         Log("upload: %08X %u bytes (ring %llu)", guest, bytes, (unsigned long long)f.ringUsed.load());
     const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
@@ -3046,7 +3100,12 @@ struct ShaderOptimizer
             jobs.push_back({ key, pixel, hlsl });
         }
         static std::once_flag started;
-        std::call_once(started, [this] { std::thread([this] { Run(); }).detach(); });
+        // REGPU_OPTIMIZE_THREADS=n: n builders (default 1, at the lowest priority).
+        std::call_once(started, [this] {
+            const int n = getenv("REGPU_OPTIMIZE_THREADS") ? std::clamp(atoi(getenv("REGPU_OPTIMIZE_THREADS")), 1, 16) : 1;
+            for (int i = 0; i < n; i++)
+                std::thread([this] { Run(); }).detach();
+        });
         cv.notify_one();
     }
 
@@ -3295,17 +3354,32 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
 const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background = false)
 {
     thread_local std::unordered_map<uint64_t, const CompiledShader*> known;
-    if (auto it = known.find(hash); it != known.end())
+    // Neighbouring draws mostly use the same shaders: a small direct-mapped table in front of the map
+    // (its lookups were ~0.7% of the command processor).
+    struct Recent
     {
+        uint64_t hash = 0;
+        const CompiledShader* cs = nullptr;
+    };
+    thread_local Recent recent[64];
+    Recent& r = recent[(hash ^ (hash >> 17)) & 63];
+    const CompiledShader* found = r.hash == hash ? r.cs : nullptr;
+    if (!found)
+        if (auto it = known.find(hash); it != known.end())
+            found = it->second;
+    if (found)
+    {
+        r = { hash, found };
         // First seen as a background find (a memory scan), it may still be parked: a draw
         // that needs it must promote it, or its wait never ends.
         if (!background)
-            g_compiler.Promote(*it->second);
-        return *it->second;
+            g_compiler.Promote(*found);
+        return *found;
     }
     std::lock_guard shaderLock(g_shaderMutex);
     const CompiledShader& cs = GetShaderLocked(hash, codeBE, pixel, background);
     known.emplace(hash, &cs);
+    r = { hash, &cs };
     return cs;
 }
 
@@ -3359,6 +3433,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
             {
                 cs.info.ok = true;
                 cs.info.usedTextureSlots = base.info.usedTextureSlots;
+                cs.info.memExport = base.info.memExport;
                 cs.info.constantsUsed = base.info.constantsUsed; // same ALU code
                 cs.info.constantMask = base.info.constantMask;
                 cs.info.interpolatorsWritten = base.info.interpolatorsWritten;
@@ -9779,7 +9854,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         Log("draw #%u vs %016llx ps %016llx prim %u n %zu blend %08X mask %X scissor %ld,%ld-%ld,%ld vte %03X wide %d layer %d pitch %u%s%s", g_r.drawsThisFrame.load(),
             (unsigned long long)C().vsHash, (unsigned long long)C().psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
             gpureg::Get(RB_COLOR_MASK) & 15, scissor.left, scissor.top, scissor.right, scissor.bottom, gpureg::Get(PA_CL_VTE_CNTL) & 0x3FF,
-            int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF, g_occlusionOpen ? " [in occlusion query]" : "", tex.c_str());
+            int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF,
+            g_occlusionOpen ? " [in occlusion query]" : GetShader(C().vsHash, C().vsCode, false).info.memExport ? " [memexport]" : "", tex.c_str());
         Log("    host: scissor %ld,%ld-%ld,%ld viewport %g,%g %gx%g depth %p colour %p (bases %03X %03X)", hostScissor.left, hostScissor.top,
             hostScissor.right, hostScissor.bottom, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, static_cast<void*>(C().depth.Get()),
             static_cast<void*>(C().color.Get()), C().depthBase, C().colorBase);
@@ -9790,16 +9866,25 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         if (getenv("REGPU_TRACE_VC"))
             for (uint32_t i = 0; i < 256; i++)
             {
-                const float* c = vcRing->c[i];
-                if (c[0] != 0 || c[1] != 0 || c[2] != 0 || c[3] != 0)
-                    Log("    vc%u = %g %g %g %g", i, c[0], c[1], c[2], c[3]);
+                // The vertex shader's constants as the guest set them (the register file), the ones it reads
+                // marked: the ring holds only those, and a hooked draw's are elsewhere.
+                float c[4];
+                for (int j = 0; j < 4; j++)
+                {
+                    const uint32_t bits = gpureg::Get(gpureg::AluConstants + i * 4 + j);
+                    memcpy(&c[j], &bits, 4);
+                }
+                const bool read = ((vs.info.constantMask[i >> 6] >> (i & 63)) & 1) != 0;
+                if (read || c[0] != 0 || c[1] != 0 || c[2] != 0 || c[3] != 0)
+                    Log("    vc%u = %g %g %g %g%s", i, c[0], c[1], c[2], c[3], read ? " (read)" : "");
             }
+        if (vs.hlslSource && vs.hlslSource != &vs)
+            Log("    vs is a variant of %016llx (its code, this shader's fetch layout)", (unsigned long long)vs.hlslSource->hash);
         // The shader's fetches (VFetchK k): fetch constant, format, signed, normalised, stride, offset, exponent.
         for (size_t k = 0; k < vs.info.vertexFetchLayout.size(); k++)
         {
             const auto& l = vs.info.vertexFetchLayout[k];
-            if (l[1] || l[0])
-                Log("    fetch %zu: vf%u format %u%s%s stride %u offset %u exp %d", k, l[0] & 0x7F, (l[0] >> 8) & 0x3F, (l[0] & 0x4000) ? " signed" : "",
+            Log("    fetch %zu: vf%u format %u%s%s stride %u offset %u exp %d", k, l[0] & 0x7F, (l[0] >> 8) & 0x3F, (l[0] & 0x4000) ? " signed" : "",
                     (l[0] & 0x8000) ? " norm" : "", l[1], l[2], int(l[3] << 10) >> 26);
         }
         for (uint32_t k : vs.info.vertexFetchConstants)
@@ -9858,6 +9943,25 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                     }
                     if (n)
                         Log("    vf%u dword %u of %u: min %g max %g mean %g, %u of %u above 0.5", k, off, stride, lo, hi, sum / n, above, n);
+                    // and the first indices with that value and the vertex's first dword
+                    std::string first;
+                    for (size_t j = 0; j < list.size() && j < 48; j++)
+                    {
+                        const uint64_t at = uint64_t(list[j]) * stride;
+                        if (at + off >= dwordsInBuffer)
+                        {
+                            first += " " + std::to_string(list[j]) + ":-";
+                            continue;
+                        }
+                        const uint32_t b0 = __builtin_bswap32(v[at + off]), p0 = __builtin_bswap32(v[at]);
+                        float f, x;
+                        memcpy(&f, &b0, 4);
+                        memcpy(&x, &p0, 4);
+                        char t[48];
+                        snprintf(t, sizeof(t), " %u:%g@%g", list[j], f, x);
+                        first += t;
+                    }
+                    Log("    vf%u first indices (index:value@dword0):%s", k, first.c_str());
                 }
             }
         }
@@ -9865,11 +9969,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             gpureg::Get(0x200E), gpureg::Get(0x200F), gpureg::Get(PA_SC_WINDOW_SCISSOR_TL), gpureg::Get(PA_SC_WINDOW_SCISSOR_BR), gpureg::Get(PA_SC_WINDOW_OFFSET),
             RegFloat(PA_CL_VPORT_XOFFSET), RegFloat(PA_CL_VPORT_YOFFSET), RegFloat(PA_CL_VPORT_XSCALE), RegFloat(PA_CL_VPORT_YSCALE));
         Log("    vport z scale %g offset %g, vte %08X, clip %08X, depth clamp/zrange regs %08X %08X", RegFloat(PA_CL_VPORT_ZSCALE), RegFloat(PA_CL_VPORT_ZOFFSET), gpureg::Get(0x2206), gpureg::Get(0x2204), gpureg::Get(0x2280), gpureg::Get(0x2281));
-        Log("    alpha ref %g (pinfo.x %u) edram mode %u colormask %X", RegFloat(RB_ALPHA_REF), pc->info[0], edramMode, gpureg::Get(RB_COLOR_MASK));
+        Log("    alpha ref %g (pinfo.x %u) edram mode %u colormask %X, pixel position into r%d (SQ_PROGRAM_CNTL %08X SQ_CONTEXT_MISC %08X)", RegFloat(RB_ALPHA_REF),
+            pc->info[0], edramMode, gpureg::Get(RB_COLOR_MASK), pc->info[1] == 0xFF ? -1 : int(pc->info[1]), gpureg::Get(SQ_PROGRAM_CNTL), gpureg::Get(SQ_CONTEXT_MISC));
         Log("    surface %08X color %08X depth %08X depthctl %08X stencil %08X colorctl %08X mode %X", gpureg::Get(0x2000), gpureg::Get(0x2001), gpureg::Get(0x2002),
             gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_STENCILREFMASK), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
-        for (uint32_t c : { 0u, 1u, 5u, 6u, 7u, 14u, 22u, 254u, 255u })
-            Log("    pc%u = %g %g %g %g", c, pcRing->c[c][0], pcRing->c[c][1], pcRing->c[c][2], pcRing->c[c][3]);
+        for (uint32_t c = 0; c < 256; c++)
+            if (c == 0 || c == 1 || c == 5 || c == 6 || c == 7 || c == 14 || c == 22 || c == 254 || c == 255 || ((ps.info.constantMask[c >> 6] >> (c & 63)) & 1))
+                Log("    pc%u = %g %g %g %g", c, pcRing->c[c][0], pcRing->c[c][1], pcRing->c[c][2], pcRing->c[c][3]); // (and every one the pixel shader reads)
     }
     // A draw inside an occlusion query is also drawn with the depth test always passing, in a query of
     // its own: the samples it covers, the console's Total (a game fades a light flare by the share that

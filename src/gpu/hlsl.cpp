@@ -425,6 +425,8 @@ struct Emitter
             }
             return reg < 4 ? "oC[" + std::to_string(reg) + "]" : "";
         }
+        if (reg >= 32 && reg <= 37)
+            result.memExport = true; // eA, eM0-4 (dropped: captures mark these draws)
         if (reg == 63)
             return "opts";
         if (reg == 62)
