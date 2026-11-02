@@ -9040,6 +9040,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     memset(vc->vuser, 0, sizeof(vc->vuser));
     if (const auto onDraw = regpu::GetHost().onDraw; onDraw && (vs.tag || ps.tag))
         onDraw(C().vsHash, C().psHash, vs.tag, ps.tag, vc->c, vc->vuser);
+    float clearColour[4] = {};
+    const auto clearBeforeDraw = regpu::GetHost().clearBeforeDraw;
+    const bool clearBefore = clearBeforeDraw && (vs.tag || ps.tag) && clearBeforeDraw(C().vsHash, C().psHash, vs.tag, ps.tag, clearColour);
     pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
     const uint32_t colorControl = gpureg::Get(RB_COLORCONTROL);
@@ -9373,6 +9376,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ds.stencilRef = ref;
         C().list->OMSetStencilRef(ref);
     }
+    // The game asked for the colour target to be cleared before this draw (Host::clearBeforeDraw).
+    if (clearBefore)
+        C().list->ClearRenderTargetView(C().rtv, clearColour, 1, &hostScissor);
     {
         // RB_BLEND_RED..ALPHA: the constant colour for blend factors 12-15.
         const float factor[4] = { RegFloat(0x2105), RegFloat(0x2106), RegFloat(0x2107), RegFloat(0x2108) };
