@@ -153,7 +153,9 @@ std::atomic<uint32_t>& NativeSlot(uint32_t key) { return g_nativeMsaa[(key ^ key
 std::atomic<uint32_t> g_nativeMsaaGeneration{ 0 }; // bumped when an entry changes (BigPassSize's memo)
 void SetNativeMsaa(uint32_t key, uint32_t msaa)
 {
-    if (NativeSlot(key).exchange(key << 2 | msaa, std::memory_order_relaxed) != (key << 2 | msaa))
+    // Read first: written at every draw, the slot's cache line bounced between the draw workers.
+    std::atomic<uint32_t>& slot = NativeSlot(key);
+    if (slot.load(std::memory_order_relaxed) != (key << 2 | msaa) && slot.exchange(key << 2 | msaa, std::memory_order_relaxed) != (key << 2 | msaa))
         g_nativeMsaaGeneration.fetch_add(1, std::memory_order_relaxed);
 }
 // The same, for depth surfaces: the MSAA layout each depth EDRAM base and row width (in samples)
@@ -677,6 +679,7 @@ struct DrawContext
     std::vector<uint32_t> vsCode, psCode;
     uint64_t vsHash = 0, psHash = 0;
     bool worker = false; // a draw worker: frame-level work (begin, resolves, swaps) is not its job
+    uint32_t draws = 0;  // a worker's draws, added to drawsThisFrame once at the end of its piece
 };
 DrawContext g_mainContext;
 thread_local DrawContext* t_context = nullptr;
@@ -1039,6 +1042,32 @@ struct FrameMap
     }
 };
 
+// A FrameMap the draw workers share (REGPU_DRAW_WORKERS), behind each thread's own: what one thread
+// looked up this frame, the others find under a read lock instead of the texture mutex. (Each worker's
+// own cache starts the frame empty, so without it every worker took the texture mutex for every
+// texture, index buffer and bindless slot once a frame: over half of a worker's busy time in PGR4.)
+template <class V>
+struct SharedFrameMap
+{
+    FrameMap<V> map;
+    std::shared_mutex mutex;
+    bool Find(uint64_t key, uint64_t frame, V& out)
+    {
+        std::shared_lock lock(mutex);
+        if (const V* v = map.Find(key, frame))
+        {
+            out = *v;
+            return true;
+        }
+        return false;
+    }
+    void Put(uint64_t key, uint64_t frame, const V& value)
+    {
+        std::unique_lock lock(mutex);
+        map.Put(key, frame, value);
+    }
+};
+
 // Bindings by fetch constant: a texture bound by many draws (in any slot) is looked up once
 // per frame and resolve epoch (textures are still checked once per frame for changes).
 // (A direct-mapped table: an entry holds the fetch words it was made for, so a collision only
@@ -1250,6 +1279,7 @@ struct Pending
     size_t bytes, stride;
 };
 std::vector<Pending> g_next; // the textures this frame checks (for the next)
+std::mutex g_nextMutex;      // g_next (the draw workers push too)
 std::atomic<uint32_t> g_cursor{ 0 }, g_busy{ 0 };
 std::atomic<uint64_t> g_generation{ 0 };
 std::mutex g_mutex;
@@ -1335,32 +1365,34 @@ void StartFrame()
     g_cv.notify_all();
 }
 
-// The command processor's thread (draw workers hash for themselves and queue nothing).
-bool Owner()
-{
-    static const std::thread::id owner = std::this_thread::get_id();
-    return std::this_thread::get_id() == owner;
-}
-
 LiveSwitch g_noAhead("REGPU_NO_TEXTURE_AHEAD");
 
 // A texture that skips its check this frame and is due next frame, queued for the workers. Hash
 // queues the textures checked this frame, but with staggered checks (every 4th or 16th frame by
 // key) those are not next frame's: the command processor was hashing most textures itself (~5% of
 // its time in FM2's race). REGPU_NO_TEXTURE_AHEAD=1: not queued (A/B).
+// The draw workers (REGPU_DRAW_WORKERS) use the hashes too: they run only inside the command processor's
+// segments, never during StartFrame, so g_index and the jobs are fixed while they read them; their pushes to
+// g_next lock. (They hashed every texture themselves before, under the texture mutex: a worker's draws cost
+// three times the command processor's in PGR4.)
+void Push(const Pending& p)
+{
+    std::lock_guard lock(g_nextMutex);
+    g_next.push_back(p);
+}
+
 void Ahead(uint64_t key, const uint8_t* source, size_t bytes, size_t stride)
 {
-    if (Enabled() && !g_noAhead && Owner())
-        g_next.push_back({ key, source, bytes, stride });
+    if (Enabled() && !g_noAhead)
+        Push({ key, source, bytes, stride });
 }
 
 // The texture's hash, from the workers when they have it and memory still matches.
 uint64_t Hash(uint64_t key, const uint8_t* source, size_t bytes, size_t stride)
 {
-    // The command processor's thread only (draw workers hash as before).
-    if (!Enabled() || !Owner())
+    if (!Enabled())
         return ContentHashFwd(source, bytes, stride);
-    g_next.push_back({ key, source, bytes, stride });
+    Push({ key, source, bytes, stride });
     if (const auto it = g_index.find(key); it != g_index.end())
     {
         Job& job = g_jobs[it->second];
@@ -2185,11 +2217,19 @@ UINT BindlessIndex(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t kind)
 {
     const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(resource)) << 8 ^ uint64_t(format) << 2 ^ uint64_t(kind);
     thread_local FrameMap<UINT> known;
+    static SharedFrameMap<UINT> shared;
     if (const UINT* index = known.Find(key, g_r.frame))
         return *index;
+    if (UINT index; C().worker && shared.Find(key, g_r.frame, index))
+    {
+        known.Put(key, g_r.frame, index);
+        return index;
+    }
     std::lock_guard textureLock(g_textureMutex);
     const UINT index = BindlessIndexLocked(resource, format, kind);
     known.Put(key, g_r.frame, index);
+    if (RendererDrawWorkers())
+        shared.Put(key, g_r.frame, index);
     return index;
 }
 
@@ -2525,8 +2565,16 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
     {
         uint64_t hash = 0, frame = ~0ull, dynamicUntil = 0;
     };
+    // The answer holds for the rest of the frame once a buffer is checked in it: each thread keeps this
+    // frame's answers (a map lookup and a lock per vertex fetch per draw otherwise).
+    const uint64_t key = uint64_t(address) << 32 | bytes;
+    thread_local FrameMap<bool> answered;
+    if (const bool* a = answered.Find(key, g_r.frame))
+        return *a;
     static std::unordered_map<uint64_t, Seen> seen;
-    Seen& s = seen[uint64_t(address) << 32 | bytes];
+    static std::mutex mutex; // the draw workers (REGPU_DRAW_WORKERS) check buffers too
+    std::lock_guard lock(mutex);
+    Seen& s = seen[key];
     // Hashing is the cost: a buffer that stopped changing (static geometry, most of them) is
     // checked every 16th frame, one that changes every frame.
     const bool due = s.frame == ~0ull || g_r.frame <= s.dynamicUntil || g_r.frame >= s.frame + 16;
@@ -2572,7 +2620,10 @@ bool DynamicBuffer(uint32_t address, uint32_t bytes)
             Log("dynamic: %u of %u large buffers copied, %llu KB", n, total, (unsigned long long)(bytesTotal >> 10));
         }
     }
-    return g_r.frame <= s.dynamicUntil;
+    const bool dynamic = g_r.frame <= s.dynamicUntil;
+    if (s.frame == g_r.frame)
+        answered.Put(key, g_r.frame, dynamic);
+    return dynamic;
 }
 
 // Whether guest memory can be read. A XenonRecomp port commits all of it; a host that protects
@@ -2821,28 +2872,46 @@ void FlushIndexCopies()
 
 // The view of the guest index buffer at physical address `base` (count indices), swapped
 // into the arena; false when it cannot be cached (the draw fetches indices itself).
-bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view);
+bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view, uint64_t hash);
 thread_local bool g_indexChanging = false; // set by GetIndexBufferLocked: the entry is checked at every draw
 // Each thread remembers this frame's index buffers (checked once per frame), except ones seen changing.
 bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
 {
     thread_local FrameMap<D3D12_INDEX_BUFFER_VIEW> known;
     const uint64_t key = uint64_t(base) << 32 ^ uint64_t(count) << 3 ^ uint64_t(is32) << 2 ^ endian;
+    static SharedFrameMap<D3D12_INDEX_BUFFER_VIEW> shared;
     if (const auto* v = known.Find(key, g_r.frame))
     {
         view = *v;
         return true;
     }
+    if (C().worker && shared.Find(key, g_r.frame, view))
+    {
+        known.Put(key, g_r.frame, view);
+        return true;
+    }
+    // The indices are hashed before the lock: the draw workers otherwise queued on the texture mutex behind
+    // one another's hashing of the index buffers seen changing (checked at every draw).
+    const uint32_t bytes = count * (is32 ? 4 : 2);
+    if (!bytes || bytes > (16u << 20))
+        return false;
+    static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
+    const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(base));
+    const uint64_t hash = sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
     std::lock_guard textureLock(g_textureMutex);
     g_indexChanging = false;
-    if (!GetIndexBufferLocked(base, count, is32, endian, view))
+    if (!GetIndexBufferLocked(base, count, is32, endian, view, hash))
         return false;
     if (!g_indexChanging)
+    {
         known.Put(key, g_r.frame, view);
+        if (RendererDrawWorkers())
+            shared.Put(key, g_r.frame, view);
+    }
     return true;
 }
 
-bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
+bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view, uint64_t hash)
 {
     IndexArena& arena = g_indexArena;
     const uint32_t bytes = count * (is32 ? 4 : 2);
@@ -2903,11 +2972,10 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
     }
     e.checkedFrame = g_r.frame;
     const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(base));
-    // Every index, not a sample: a game that streams new geometry into the same address and size
-    // can change only words between the samples, and the old indices drew on (FM2 port, report #4:
-    // black wedges of track). REGPU_INDEX_SAMPLED_HASH=1 samples every 256 bytes as before (A/B).
-    static LiveSwitch sampledIndexHash("REGPU_INDEX_SAMPLED_HASH");
-    const uint64_t hash = sampledIndexHash ? ContentHash(src, bytes) : FullHash(src, bytes);
+    // (hash: every index, not a sample, made by GetIndexBuffer before the lock: a game that streams new
+    // geometry into the same address and size can change only words between the samples, and the old
+    // indices drew on (FM2 port, report #4: black wedges of track). REGPU_INDEX_SAMPLED_HASH=1 samples
+    // every 256 bytes as before (A/B).)
     if (!inserted && hash == e.hash)
     {
         if (e.stagedFrame == g_r.frame)
@@ -4861,16 +4929,30 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool&
     const bool cacheable = !ResolvedFor(fetch) && !RendererTracing();
     const uint64_t key = TextureKey(fetch.Address(), fetch.Format(), fetch.Width(), fetch.Height()) ^ uint64_t(fetch.dwords[0]) << 7 ^
         uint64_t(fetch.dwords[3] & 0xFFF) << 41 ^ uint64_t(fetch.dwords[1] & 0xC0) << 50;
+    static SharedFrameMap<Known> shared;
     if (cacheable)
+    {
         if (const Known* k = known.Find(key, g_r.frame))
         {
             format = k->format;
             native = k->native;
             return k->resource;
         }
+        if (Known k; C().worker && shared.Find(key, g_r.frame, k))
+        {
+            known.Put(key, g_r.frame, k);
+            format = k.format;
+            native = k.native;
+            return k.resource;
+        }
+    }
     ID3D12Resource* r = GetTextureLocked(fetch, format, native);
     if (cacheable && r)
+    {
         known.Put(key, g_r.frame, { r, format, native });
+        if (RendererDrawWorkers())
+            shared.Put(key, g_r.frame, { r, format, native });
+    }
     return r;
 }
 
@@ -5494,6 +5576,9 @@ struct Phase
 };
 Phase g_phase;
 thread_local bool t_widened = false; // WindowScissor's last answer was widened
+// A replayed draw's answer, decided on the command processor when it was logged (RendererTileWidenNow)
+thread_local bool t_forced = false, t_forcedWidened = false;
+thread_local int32_t t_forcedRect[4]{};
 bool g_mergedResolve = false;        // the resolve about to run is a merged first tile's (its clear stays in the tile)
 // Unmerged, a later tile draws over what the first tile's clearing resolve left in the EDRAM; merged,
 // the widened first tile draws the later tiles' rows over whatever the end of the last frame left
@@ -5571,7 +5656,13 @@ D3D12_RECT WindowScissor()
     }
     {
         int32_t r[4] = { x0, y0, x1, y1 };
-        TileMerge::t_widened = TileMerge::Widen(gpureg::Get(0x2000 /* RB_SURFACE_INFO */), r);
+        if (TileMerge::t_forced)
+        {
+            TileMerge::t_widened = TileMerge::t_forcedWidened;
+            memcpy(r, TileMerge::t_forcedRect, sizeof(r));
+        }
+        else
+            TileMerge::t_widened = TileMerge::Widen(gpureg::Get(0x2000 /* RB_SURFACE_INFO */), r);
         if (TileMerge::t_widened)
             x0 = r[0], y0 = r[1], x1 = r[2], y1 = r[3];
     }
@@ -8055,6 +8146,8 @@ struct Workers
     uint32_t count = 0;
     std::atomic<uint32_t> next{ 0 }, finished{ 0 };
     std::vector<ID3D12GraphicsCommandList*> lists;
+    std::vector<uint64_t> pieceNs; // REGPU_TRACE_PIECES
+    std::vector<uint32_t> pieceThread;
 } g_workers;
 
 // One piece on this thread, with a worker context of its own.
@@ -8073,9 +8166,13 @@ void TranslatePiece(DrawContext& ctx, uint32_t i)
     ListPrologue(recorder);
     g_drawState.Invalidate();
     (*g_workers.job)(i);
+    g_r.drawsThisFrame += ctx.draws;
     t_context = saved;
+    const auto t1 = std::chrono::steady_clock::now();
     real->Close();
     g_workers.lists[i] = real;
+    g_workers.pieceNs[i] = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    g_workers.pieceThread[i] = GetCurrentThreadId();
     g_pieceNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     g_pieceCount++;
 }
@@ -8143,7 +8240,9 @@ uint32_t RendererDrawWorkers()
 
 bool RendererParallelReady()
 {
-    return RendererDrawWorkers() > 0 && g_r.ok && GameSettled() && GetSettings().upscaler == Settings::Upscaler::Off && !RendererTracing();
+    // REGPU_NO_DRAW_WORKERS: the pool stays, draws go serial (A/B live, "switch REGPU_NO_DRAW_WORKERS 1")
+    static LiveSwitch off("REGPU_NO_DRAW_WORKERS");
+    return RendererDrawWorkers() > 0 && !off && g_r.ok && GameSettled() && GetSettings().upscaler == Settings::Upscaler::Off && !RendererTracing();
 }
 
 bool RendererIsResolveDraw()
@@ -8488,6 +8587,36 @@ void RendererTrackTile(RendererTile& tile)
     }
 }
 
+uint32_t RendererTileWidenNow(int32_t rect[4])
+{
+    // The scissor WindowScissor starts from (EDRAM space, then back to screen space with the vertex offset)
+    const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
+    const int32_t wx = int32_t(offsetReg << 17) >> 17, wy = int32_t((offsetReg >> 16) << 17) >> 17;
+    const bool vertexOffset = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1;
+    const uint32_t tl = gpureg::Get(PA_SC_WINDOW_SCISSOR_TL), br = gpureg::Get(PA_SC_WINDOW_SCISSOR_BR);
+    rect[0] = int32_t(tl & 0x3FFF), rect[1] = int32_t((tl >> 16) & 0x3FFF), rect[2] = int32_t(br & 0x3FFF), rect[3] = int32_t((br >> 16) & 0x3FFF);
+    if (!(tl >> 31))
+    {
+        rect[0] += wx; rect[2] += wx; rect[1] += wy; rect[3] += wy;
+    }
+    if (vertexOffset)
+    {
+        rect[0] -= wx; rect[2] -= wx; rect[1] -= wy; rect[3] -= wy;
+    }
+    const bool cleared = TileMerge::g_phase.laterCleared;
+    if (!TileMerge::Widen(gpureg::Get(0x2000 /* RB_SURFACE_INFO */), rect))
+        return 0;
+    return !cleared && TileMerge::g_phase.laterCleared ? 2 : 1;
+}
+
+void RendererForceTileWiden(bool set, bool widened, const int32_t rect[4])
+{
+    TileMerge::t_forced = set;
+    TileMerge::t_forcedWidened = widened;
+    if (set && rect)
+        memcpy(TileMerge::t_forcedRect, rect, sizeof(TileMerge::t_forcedRect));
+}
+
 void RendererSetTile(const RendererTile& tile)
 {
     g_tile.originY = tile.originY;
@@ -8539,6 +8668,8 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
         g_workers.next = 0;
         g_workers.finished = 0;
         g_workers.lists.assign(n, nullptr);
+        g_workers.pieceNs.assign(n, 0);
+        g_workers.pieceThread.assign(n, 0);
         g_workers.generation++;
     }
     g_workers.start.notify_all();
@@ -8552,6 +8683,18 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
     {
         std::unique_lock lock(g_workers.mutex);
         g_workers.done.wait(lock, [] { return g_workers.finished.load() >= g_workers.count; });
+    }
+    if (static LiveSwitch trace("REGPU_TRACE_PIECES"); trace)
+    {
+        static uint32_t logged = 0;
+        if (logged++ % 50 == 0)
+        {
+            std::string line;
+            for (uint32_t i = 0; i < n; i++)
+                line += " " + std::to_string(g_workers.pieceNs[i] / 1000) + "us@" + std::to_string(g_workers.pieceThread[i] % 10000);
+            Log("pieces: wall %lldus, cp %u:%s", (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - segmentStart).count(),
+                GetCurrentThreadId() % 10000, line.c_str());
+        }
     }
     g_prepList = nullptr;
     prepReal->Close();
@@ -10107,7 +10250,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
     }
     Section(6);
-    g_r.drawsThisFrame++;
+    if (C().worker)
+        C().draws++;
+    else
+        g_r.drawsThisFrame++;
     // REGPU_SUBMIT_DRAWS=<n>: submit the frame so far every n draws (never inside an occlusion query), so
     // the GPU starts on it while the rest is recorded (pgr4-native). Off by default: FM2's race, already
     // GPU-bound, lost 4-17% at n = 128-512. It may help a game whose GPU waits on recording.

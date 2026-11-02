@@ -40,6 +40,13 @@ struct RendererTile
 };
 // Whether draws may be translated on workers now (game settled, no upscaler, ...).
 bool RendererParallelReady();
+// TileMerge for the draw workers: whether the current draw's scissor is the widened first tile, decided
+// on the command processor as the draw is logged (the tile pass has moved on by the time a worker replays
+// it). Returns 0 (not widened), 1 (widened to rect) or 2 (widened, and it is the first: the later tiles'
+// rows are cleared before it, so it is drawn on the command processor in order).
+uint32_t RendererTileWidenNow(int32_t rect[4]);
+// On a worker, the answer RendererTileWidenNow gave for the draw being replayed (set false after it).
+void RendererForceTileWiden(bool set, bool widened, const int32_t rect[4]);
 uint32_t RendererDrawWorkers();
 // The current draw is a resolve (EDRAM copy): a point the stream is not cut across.
 bool RendererIsResolveDraw();

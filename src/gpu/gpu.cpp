@@ -296,22 +296,80 @@ void Replay(size_t first, size_t endPos)
             FrameOnShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
             break;
         case kDraw:
+        {
+            const int32_t rect[4] = { int32_t(a[4]), int32_t(a[5]), int32_t(a[6]), int32_t(a[7]) };
+            RendererForceTileWiden(true, a[3] != 0, rect);
             FrameOnDraw(a[0], a[1], a[2]);
+            RendererForceTileWiden(false, false, nullptr);
             break;
+        }
         }
         at += size_t(n) + 1;
     }
     gpureg::t_file = saved;
 }
 
+// Segments too small to go parallel are drawn straight away, not logged: logging one costs a snapshot of
+// the whole register file (128 KB) and its replay another copy, and PGR4 cuts ~45 segments a frame of
+// which two have enough draws to share out. Which ones are small comes from the last frame (a segment
+// is known by its place in the frame); a wrong guess only costs that segment's parallelism for a frame.
+// REGPU_LOG_ALL_SEGMENTS=1: log every segment, as before (A/B).
+std::vector<uint32_t> g_sizes, g_lastSizes; // draws of each segment this frame / the last
+uint32_t g_index = 0;                        // the segment the next draw belongs to
+uint32_t g_directDraws = 0;                  // draws of the current segment drawn straight away
+constexpr uint32_t kParallelDraws = 2 * 96;  // fewer than this never make two pieces (Flush)
+
+// Whether the current segment's draws go straight to the renderer.
+bool Direct()
+{
+    static LiveSwitch logAll("REGPU_LOG_ALL_SEGMENTS");
+    return !g_open && !logAll && g_index < g_lastSizes.size() && g_lastSizes[g_index] < kParallelDraws;
+}
+
+// The current segment ends (logged or drawn straight away).
+void EndSegment(uint32_t draws)
+{
+    if (!draws)
+        return;
+    if (g_sizes.size() <= g_index)
+        g_sizes.resize(g_index + 1);
+    g_sizes[g_index++] = draws;
+}
+
+// A frame ends: its segment sizes are the guide for the next.
+void EndFrame()
+{
+    if (static LiveSwitch trace("REGPU_TRACE_SEGMENTS"); trace)
+    {
+        static uint32_t frames = 0;
+        if (frames++ % 300 == 0)
+        {
+            std::string line;
+            for (uint32_t n : g_sizes)
+                line += " " + std::to_string(n);
+            Log("segments:%s", line.c_str());
+        }
+    }
+    g_lastSizes.swap(g_sizes);
+    g_sizes.clear();
+    g_index = 0;
+}
+
 // Translates the open segment (on the workers if it is large enough).
 void Flush()
 {
+    EndSegment(g_open ? g_draws : g_directDraws);
+    g_directDraws = 0;
     if (!g_open)
         return;
     g_open = false;
     const size_t end = g_log.size();
-    const uint32_t workers = RendererDrawWorkers() + 1;
+    // REGPU_DRAW_PIECES=n ("env REGPU_DRAW_PIECES n" while running): at most n pieces a segment (more than
+    // the workers: they take the next piece as they finish one, evening out pieces of uneven cost).
+    static uint32_t flushes = 0, pieceCap = 0;
+    if (flushes++ % 256 == 0)
+        pieceCap = getenv("REGPU_DRAW_PIECES") ? uint32_t(atoi(getenv("REGPU_DRAW_PIECES"))) : 0;
+    const uint32_t workers = pieceCap ? pieceCap : RendererDrawWorkers() + 1;
     const uint32_t pieces = std::min<uint32_t>(uint32_t(g_snapCount), std::min(workers, g_draws / 96));
     {
         static uint64_t segments = 0, parallel = 0, draws = 0, parallelDraws = 0;
@@ -419,13 +477,31 @@ void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             FrameOnDraw(initiator, dmaBase, dmaSize);
             return;
         }
+        // TileMerge's widened first tile, decided now (the tile pass moves on before the workers replay it);
+        // the first widened draw clears the later tiles' rows first, so it runs here in order.
+        int32_t widenedRect[4];
+        const uint32_t widen = RendererTileWidenNow(widenedRect);
+        if (widen == 2)
+        {
+            seg::Flush();
+            FrameOnDraw(initiator, dmaBase, dmaSize);
+            return;
+        }
+        if (seg::Direct())
+        {
+            seg::g_directDraws++;
+            FrameOnDraw(initiator, dmaBase, dmaSize);
+            RendererTrackTile(seg::g_tile);
+            return;
+        }
         if (!seg::g_open || seg::g_draws % seg::kSnapEvery == 0)
         {
             seg::g_open = true;
             seg::TakeSnapshot();
         }
-        const uint32_t a[3] = { initiator, dmaBase, dmaSize };
-        seg::Append(seg::kDraw, a, 3);
+        const uint32_t a[8] = { initiator, dmaBase, dmaSize, widen, uint32_t(widenedRect[0]), uint32_t(widenedRect[1]), uint32_t(widenedRect[2]),
+                                uint32_t(widenedRect[3]) };
+        seg::Append(seg::kDraw, a, 8);
         seg::g_draws++;
         RendererTrackTile(seg::g_tile);
         return;
@@ -1546,6 +1622,7 @@ namespace
 void PresentSwap(uint64_t frame, uint32_t frontBuffer)
 {
     seg::Flush();
+    seg::EndFrame();
     seg::g_tile = RendererTile{};
     if (work::Active())
     {
