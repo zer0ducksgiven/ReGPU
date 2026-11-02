@@ -3099,6 +3099,100 @@ struct DiskWriter
     }
 } g_diskWriter;
 
+// Vertex shaders as the title binds them: the D3D layer patches each shipped vertex shader's fetch
+// instructions (data format, stride, offset) for the vertex declaration it is drawn with, so the shaders the
+// game draws with never match the shipped ones (Host::staticShaders) and can't be compiled at the first boot.
+// A runtime vertex shader is recorded as its shipped shader plus the 3-dword instructions that differ
+// ("V shipped runtime group:w0.w1.w2 ..." in pipelines.manifest, uploaded with players' logs); the first boot
+// rebuilds and compiles every variant listed in the seed (Host::pipelineSeed). Only hashes and those patched
+// words are kept: the code itself comes from the player's own copy of the game.
+namespace VertexPatch
+{
+std::mutex g_mutex;
+std::unordered_map<size_t, std::vector<std::pair<uint64_t, std::vector<uint32_t>>>> g_byLength; // shipped vertex shaders
+std::unordered_map<uint64_t, std::pair<size_t, size_t>> g_byHash;                               // hash -> length, index
+
+void AddShipped(uint64_t hash, const std::vector<uint32_t>& code)
+{
+    std::lock_guard lock(g_mutex);
+    if (g_byHash.count(hash))
+        return;
+    auto& list = g_byLength[code.size()];
+    g_byHash[hash] = { code.size(), list.size() };
+    list.push_back({ hash, code });
+}
+
+// The manifest line for a runtime vertex shader, or empty when no shipped shader of its length differs from
+// it in a few whole instructions only (the fetches).
+std::string Line(uint64_t hash, const std::vector<uint32_t>& code)
+{
+    std::lock_guard lock(g_mutex);
+    const auto it = g_byLength.find(code.size());
+    if (it == g_byLength.end())
+        return {};
+    const std::pair<uint64_t, std::vector<uint32_t>>* best = nullptr;
+    std::vector<size_t> bestGroups;
+    for (const auto& base : it->second)
+    {
+        std::vector<size_t> groups;
+        for (size_t i = 0; i < code.size() && groups.size() <= 32; i++)
+            if (code[i] != base.second[i] && (groups.empty() || groups.back() != i / 3))
+                groups.push_back(i / 3);
+        if (groups.size() <= 32 && (!best || groups.size() < bestGroups.size()))
+        {
+            best = &base;
+            bestGroups = std::move(groups);
+        }
+    }
+    if (!best || bestGroups.empty())
+        return {};
+    char buf[64];
+    snprintf(buf, sizeof(buf), "V %llx %llx", (unsigned long long)best->first, (unsigned long long)hash);
+    std::string line = buf;
+    for (size_t g : bestGroups)
+    {
+        uint32_t w[3] = {};
+        for (size_t k = 0; k < 3; k++)
+            if (g * 3 + k < code.size())
+                w[k] = code[g * 3 + k];
+        snprintf(buf, sizeof(buf), " %zx:%x.%x.%x", g, w[0], w[1], w[2]);
+        line += buf;
+    }
+    return line;
+}
+
+// A "V" line's runtime shader rebuilt from its shipped one; false if the line doesn't fit (the hash checks it).
+bool Rebuild(const char* line, uint64_t& hash, std::vector<uint32_t>& code)
+{
+    unsigned long long shipped = 0, runtime = 0;
+    int used = 0;
+    if (sscanf(line, "V %llx %llx%n", &shipped, &runtime, &used) < 2 || !used)
+        return false;
+    {
+        std::lock_guard lock(g_mutex);
+        const auto it = g_byHash.find(shipped);
+        if (it == g_byHash.end())
+            return false;
+        code = g_byLength[it->second.first][it->second.second].second;
+    }
+    for (const char* p = line + used; *p;)
+    {
+        unsigned long long g;
+        unsigned w0, w1, w2;
+        int n = 0;
+        if (sscanf(p, " %llx:%x.%x.%x%n", &g, &w0, &w1, &w2, &n) < 4 || !n)
+            break;
+        p += n;
+        const uint32_t words[3] = { w0, w1, w2 };
+        for (size_t k = 0; k < 3; k++)
+            if (g * 3 + k < code.size())
+                code[g * 3 + k] = words[k];
+    }
+    hash = Fnv(code.data(), code.size() * 4);
+    return hash == runtime;
+}
+}
+
 struct Manifest
 {
     std::mutex mutex;
@@ -3106,6 +3200,7 @@ struct Manifest
     std::vector<PipelineKey> pending; // loaded at start, not built yet
     size_t next = 0;
     std::unordered_set<uint64_t> shaderFiles;
+    std::unordered_set<uint64_t> patched; // runtime vertex shaders with a "V" line already
 
     static std::filesystem::path Path() { return RegpuUserDir() / "pipelines.manifest"; }
     static std::filesystem::path UcodePath(bool pixel, uint64_t hash)
@@ -3120,6 +3215,11 @@ struct Manifest
         std::string line;
         while (std::getline(in, line))
         {
+            if (unsigned long long shipped, runtime; sscanf(line.c_str(), "V %llx %llx", &shipped, &runtime) == 2)
+            {
+                patched.insert(runtime);
+                continue;
+            }
             PipelineKey k{};
             unsigned long long vs, ps;
             // (Older manifests end at the flags: no polygon offset.)
@@ -3150,10 +3250,14 @@ struct Manifest
         std::lock_guard lock(mutex);
         if (codeBE.empty() || !shaderFiles.insert(hash).second)
             return;
-        g_diskWriter.Push([path = UcodePath(pixel, hash), code = codeBE] {
+        const bool patch = !pixel && patched.insert(hash).second;
+        g_diskWriter.Push([path = UcodePath(pixel, hash), code = codeBE, patch, hash] {
             std::error_code ec;
             if (!std::filesystem::exists(path, ec))
                 std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(code.data()), std::streamsize(code.size() * 4));
+            if (patch)
+                if (const std::string line = VertexPatch::Line(hash, code); !line.empty())
+                    std::ofstream(Path(), std::ios::app) << line << '\n';
         });
     }
     static bool LoadShader(bool pixel, uint64_t hash, std::vector<uint32_t>& out)
@@ -10897,6 +11001,8 @@ void PrecompileAll()
         if (!ucode::Plausible(ucode::Parse(s.code.data(), uint32_t(s.code.size()), s.pixel)))
             continue;
         const uint64_t hash = Fnv(s.code.data(), s.code.size() * 4) ^ (s.pixel ? 1 : 0);
+        if (!s.pixel)
+            VertexPatch::AddShipped(hash, s.code);
         if (g_r.shaders.count(hash))
             continue;
         g_scanKnown.insert(hash);
@@ -10905,6 +11011,33 @@ void PrecompileAll()
             compiling.push_back(&cs);
         queued++;
     }
+    // The vertex shaders the game makes from them (VertexPatch), as the seed lists them.
+    size_t variants = 0, variantLines = 0, fitting = 0;
+    if (host.pipelineSeed && !getenv("REGPU_NO_SEED_PIPELINES"))
+        for (const char* p = host.pipelineSeed(); p && *p;)
+        {
+            const char* end = strchr(p, '\n');
+            const std::string line(p, end ? end : p + strlen(p));
+            p = end ? end + 1 : p + line.size();
+            if (line.rfind("V ", 0) != 0)
+                continue;
+            variantLines++;
+            uint64_t hash;
+            std::vector<uint32_t> code;
+            if (!VertexPatch::Rebuild(line.c_str(), hash, code))
+                continue;
+            fitting++;
+            if (g_r.shaders.count(hash))
+                continue;
+            const CompiledShader& cs = GetShader(hash, code, false, true);
+            if (cs.state.load() == CompiledShader::Pending)
+                compiling.push_back(&cs);
+            queued++;
+            variants++;
+        }
+    if (variantLines)
+        Log("static shaders: vertex shader variants in the seed: %zu, %zu rebuilt from the shipped shaders, %zu new to compile", variantLines, fitting,
+            variants);
     // Compiling them while the game runs halves the frame rate for minutes, so the first
     // boot waits here with the overlay up; later boots find the bytecode cached and
     // queue nothing.
