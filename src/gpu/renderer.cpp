@@ -5559,6 +5559,67 @@ uint64_t DrawKey(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     return h;
 }
 
+// Keys counted (the first tile's draws, by DrawKey): an open-addressing table, so the ~1500 a frame of
+// the race's first tile cost no allocation each (an unordered_multiset did).
+struct KeyCounts
+{
+    std::vector<std::pair<uint64_t, uint32_t>> slots; // key (0: empty), count
+    size_t used = 0;
+    static size_t Hash(uint64_t k) { return size_t((k ^ (k >> 29)) * 0x9E3779B97F4A7C15ull >> 20); }
+    void Add(uint64_t key)
+    {
+        key |= 1; // (0 marks an empty slot)
+        if ((used + 1) * 2 > slots.size())
+        {
+            std::vector<std::pair<uint64_t, uint32_t>> old(std::max<size_t>(slots.size() * 2, 1024));
+            old.swap(slots);
+            used = 0;
+            for (const auto& o : old)
+                if (o.first)
+                    for (size_t i = Hash(o.first) & (slots.size() - 1);; i = (i + 1) & (slots.size() - 1))
+                        if (!slots[i].first)
+                        {
+                            slots[i] = o;
+                            used++;
+                            break;
+                        }
+        }
+        for (size_t i = Hash(key) & (slots.size() - 1);; i = (i + 1) & (slots.size() - 1))
+        {
+            if (slots[i].first == key)
+            {
+                slots[i].second++;
+                return;
+            }
+            if (!slots[i].first)
+            {
+                slots[i] = { key, 1 };
+                used++;
+                return;
+            }
+        }
+    }
+    // One of the key, taken away; false if there is none left.
+    bool Take(uint64_t key)
+    {
+        key |= 1;
+        if (slots.empty())
+            return false;
+        for (size_t i = Hash(key) & (slots.size() - 1);; i = (i + 1) & (slots.size() - 1))
+        {
+            if (!slots[i].first)
+                return false;
+            if (slots[i].first == key)
+            {
+                if (!slots[i].second)
+                    return false;
+                slots[i].second--;
+                return true;
+            }
+        }
+    }
+};
+
 // Where the current tile pass is (the command processor's thread): the surface, whether the
 // first tile has resolved, and which later tiles have.
 struct Phase
@@ -5569,7 +5630,7 @@ struct Phase
     int current = -1; // the tile running: 0 the first, 1.. the later ones
     // The first tile's draws (before its first resolve), by what they draw: a later tile drops only
     // these. Tiles can differ (PGR4's race: the second tile had one draw more, a road marking).
-    std::unordered_multiset<uint64_t> drawn;
+    KeyCounts drawn;
     uint32_t counts[4]{}; // REGPU_TRACE_TILES: first tile before / after its first resolve, later tiles the same
     uint32_t bases[2]{};  // REGPU_TRACE_TILES: colour | depth EDRAM bases of the first and the later tiles' last draws
     bool laterCleared = false; // the later tiles' rows were readied for the widened first tile (LaterClear)
@@ -7428,6 +7489,7 @@ void HoldPresent()
     if (!ok)
         return;
     ID3D12CommandList* lists[] = { g_hold.list.Get() };
+    g_r.recorder.Real(); // (after what the replay stream still queues)
     SubmitLists(1, lists);
     PresenterPresent();
     // Wait for it: the allocator and upload buffer are reused at the next hold.
@@ -7516,6 +7578,7 @@ void BootPresent(const std::vector<uint8_t>& rgba)
     if (!ok)
         return;
     ID3D12CommandList* lists[] = { g_hold.list.Get() };
+    g_r.recorder.Real(); // (after what the replay stream still queues)
     SubmitLists(1, lists);
     PresenterPresent();
     const UINT64 value = g_r.nextFence++;
@@ -7788,9 +7851,71 @@ void SplitMainList()
     }
 }
 
+// SplitMainList without waiting for the replay thread: the closed part is queued (and with submit, the
+// queue submitted) by the replay thread when it gets there (RecordedList::HandOff). Lists queued by the
+// command processor itself go through the stream too (QueueInStream), so the order holds; whatever
+// queues directly drains first (Real(), WaitForQueueIdle).
+void QueueClosed(ID3D12GraphicsCommandList* closed, void*)
+{
+    closed->Close();
+    ID3D12CommandList* lists[] = { closed };
+    QueueLists(1, lists);
+}
+void QueueClosedAndSubmit(ID3D12GraphicsCommandList* closed, void* ctx)
+{
+    QueueClosed(closed, ctx);
+    SubmitLists(0, nullptr);
+}
+void SplitMainListAsync(bool submit)
+{
+    static LiveSwitch sync("REGPU_SYNC_SPLITS"); // (A/B: wait for the replay as before)
+    if (sync)
+    {
+        SplitMainList();
+        if (submit)
+            SubmitLists(0, nullptr);
+        return;
+    }
+    const bool queryOpen = g_occlusionOpen;
+    if (queryOpen)
+        EndOcclusionPart();
+    g_r.recorder.HandOff(AcquireList(), submit ? QueueClosedAndSubmit : QueueClosed, nullptr);
+    ListPrologue(g_r.recorder);
+    g_drawState.Invalidate();
+    SelectSurfaces(true);
+    if (queryOpen)
+    {
+        if (g_occlusionCount + 1 <= kOcclusionPerFrame)
+        {
+            g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
+            g_occlusionCurrent.main.push_back(g_occlusionIndex);
+            C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+        }
+        else
+        {
+            g_occlusionOpen = false;
+            g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent);
+        }
+    }
+}
+// Lists queued at this point of the main stream (the draw workers' pieces).
+void QueueInStream(std::vector<ID3D12CommandList*> lists)
+{
+    static LiveSwitch sync("REGPU_SYNC_SPLITS");
+    if (sync)
+        return QueueLists(UINT(lists.size()), lists.data());
+    auto* held = new std::vector<ID3D12CommandList*>(std::move(lists));
+    g_r.recorder.HandOff(nullptr, [](ID3D12GraphicsCommandList*, void* ctx) {
+        auto* v = static_cast<std::vector<ID3D12CommandList*>*>(ctx);
+        QueueLists(UINT(v->size()), v->data());
+        delete v;
+    }, held);
+}
+
 // Waits until everything submitted to the queue so far has finished.
 void WaitForQueueIdle()
 {
+    g_r.recorder.Real(); // (hand-offs still in the replay stream queue their lists first)
     SubmitLists(0, nullptr); // (queued lists first: the signal follows them)
     const UINT64 value = g_r.nextFence++;
     g_r.queue->Signal(g_r.fence.Get(), value);
@@ -8290,7 +8415,7 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
             p.current = 0;
             p.counts[p.firstResolved ? 1 : 0]++;
             if (!p.firstResolved && !resolve)
-                p.drawn.insert(TileMerge::DrawKey(initiator, dmaBase, dmaSize));
+                p.drawn.Add(TileMerge::DrawKey(initiator, dmaBase, dmaSize));
             p.bases[0] = (gpureg::Get(RB_COLOR_INFO) & 0xFFF) << 16 | (gpureg::Get(RB_DEPTH_INFO) & 0xFFF);
             if (resolve)
             {
@@ -8353,10 +8478,8 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
                 if (!dropStencil && (gpureg::Get(RB_DEPTHCONTROL) & 1))
                     return false;
                 // Drawn by the first tile: dropped (each first-tile draw stands for one later one).
-                const auto it = p.drawn.find(TileMerge::DrawKey(initiator, dmaBase, dmaSize));
-                if (it == p.drawn.end())
+                if (!p.drawn.Take(TileMerge::DrawKey(initiator, dmaBase, dmaSize)))
                     return false;
-                p.drawn.erase(it);
                 static LiveSwitch traceDrops("REGPU_TRACE_TILE_DROPS"); // debug: one frame's dropped draws every 300
                 if (traceDrops && g_r.frame % 300 == 0)
                     Log("tile drop: frame %llu #%u tile %d vs %016llx ps %016llx prim %u depthctl %08X colour %03X depth %03X", (unsigned long long)g_r.frame, number, int(i) + 1,
@@ -8646,7 +8769,7 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
         }
     } done{ segmentStart };
     BeginFrameIfNeeded();
-    SplitMainList();
+    SplitMainListAsync(false);
     // Texture uploads of the pieces, executed before them.
     ID3D12GraphicsCommandList* prepReal = AcquireList();
     RecordedList prep;
@@ -8702,7 +8825,7 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
     lists.push_back(prepReal);
     for (ID3D12GraphicsCommandList* l : g_workers.lists)
         lists.push_back(l);
-    QueueLists(UINT(lists.size()), lists.data());
+    QueueInStream(std::move(lists));
 }
 
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
@@ -10262,8 +10385,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (submitEvery && !C().worker && ++sinceSubmit >= submitEvery && !g_occlusionOpen)
     {
         sinceSubmit = 0;
-        SplitMainList();
-        SubmitLists(0, nullptr);
+        SplitMainListAsync(true);
     }
 }
 

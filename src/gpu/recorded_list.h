@@ -66,6 +66,18 @@ public:
         m_real = real;
     }
 
+    // Hands the list over in order, without waiting: when the replay reaches this point, fn gets the real
+    // list so far (to close and queue) and the replay goes on into next. With next null, fn is just called
+    // there (closed null), to queue other lists behind what precedes. (Real() waits for the replay
+    // instead: the command processor spent ~16% of its time in it in PGR4.)
+    using HandOffFn = void (*)(ID3D12GraphicsCommandList* closed, void* ctx);
+    void HandOff(ID3D12GraphicsCommandList* next, HandOffFn fn, void* ctx)
+    {
+        struct A { ID3D12GraphicsCommandList* next; HandOffFn fn; void* ctx; } a{ next, fn, ctx };
+        Put(kHandOff, &a, sizeof(a));
+        Submit();
+    }
+
     // The real list, with everything recorded so far replayed into it.
     ID3D12GraphicsCommandList* Real()
     {
@@ -161,7 +173,7 @@ private:
     {
         kBarrier, kCopyTexture, kRootSignature, kTable, kCbv, kRoot32, kTargets, kPipeline, kViewports, kScissors, kStencilRef, kBlendFactor,
         kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer,
-        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery
+        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery, kHandOff
     };
     static constexpr size_t kChunk = 64 << 10;
 
@@ -308,6 +320,15 @@ private:
             {
                 const UINT* d = reinterpret_cast<const UINT*>(a);
                 l->DrawInstanced(d[0], d[1], d[2], d[3]);
+                break;
+            }
+            case kHandOff:
+            {
+                struct A { ID3D12GraphicsCommandList* next; HandOffFn fn; void* ctx; };
+                const A h = At<A>(a);
+                h.fn(h.next ? l : nullptr, h.ctx);
+                if (h.next)
+                    l = m_real = h.next;
                 break;
             }
             case kBeginQuery:
