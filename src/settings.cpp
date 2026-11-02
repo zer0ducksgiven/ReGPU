@@ -66,3 +66,4 @@ void regpu::SaveCaches() { RendererSaveCaches(); }
 
 bool regpu::WindowHasFocus() { return PresenterHasFocus(); }
 void regpu::LogState() { GpuLogState(); }
+void regpu::LogCrashContext() { RendererLogCrashContext(); }

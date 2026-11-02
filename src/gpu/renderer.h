@@ -18,6 +18,9 @@ void RendererPredictDraw(uint32_t initiator);
 bool RendererCompileIdle();
 // Flushes the pipeline library to disk (called when the tour finishes).
 void RendererSaveCaches();
+// From the port's crash handler: a crash inside the driver's pipeline compiler is logged and that pipeline is
+// refused from the next start on (regpu-bad-pipelines.txt).
+void RendererLogCrashContext();
 // The display gamma table entry `index` (10:10:10 RGB), applied when presenting.
 void RendererSetGammaEntry(uint32_t index, uint32_t rgb10);
 // One entry of the display's piecewise-linear gamma ramp (DC_LUT_PWL_DATA: base, delta), 0-127, per channel.
@@ -37,6 +40,13 @@ struct RendererTile
 };
 // Whether draws may be translated on workers now (game settled, no upscaler, ...).
 bool RendererParallelReady();
+// TileMerge for the draw workers: whether the current draw's scissor is the widened first tile, decided
+// on the command processor as the draw is logged (the tile pass has moved on by the time a worker replays
+// it). Returns 0 (not widened), 1 (widened to rect) or 2 (widened, and it is the first: the later tiles'
+// rows are cleared before it, so it is drawn on the command processor in order).
+uint32_t RendererTileWidenNow(int32_t rect[4]);
+// On a worker, the answer RendererTileWidenNow gave for the draw being replayed (set false after it).
+void RendererForceTileWiden(bool set, bool widened, const int32_t rect[4]);
 uint32_t RendererDrawWorkers();
 // The current draw is a resolve (EDRAM copy): a point the stream is not cut across.
 bool RendererIsResolveDraw();
@@ -67,7 +77,9 @@ bool RendererTileReplay(uint32_t surface, const int32_t first[4], const int32_t 
 // `replay`: the draw is in a buffer the command processor found to be a later tile's replay.
 bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uint32_t initiator, bool replay, uint32_t dmaBase, uint32_t dmaSize);
 void RendererOcclusionBegin();
-bool RendererOcclusionEnd(uint32_t& samples);
+// The query's samples that passed and, as the console's Total, the samples its draws covered, as
+// counted for the last finished query that wrote its counts to `address` (RB_SAMPLE_COUNT_ADDR).
+bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address);
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.
 void RendererTrackTile(RendererTile& tile);
 void RendererSetTile(const RendererTile& tile);

@@ -49,6 +49,8 @@ std::condition_variable g_swapped;
 uint64_t g_frame = 0; // the renderer's frame number (it can start again from 0)
 uint64_t g_swaps = 0; // swaps seen, for the waits
 std::deque<Clock::time_point> g_swapTimes; // the last second's swaps (fps)
+std::vector<float> g_frameMs; // frame times (ms) since the last "frametimes"
+Clock::time_point g_lastSwap{};
 
 // Input: buttons held until released, and timed presses/sticks/triggers.
 struct Timed
@@ -141,6 +143,33 @@ std::string Handle(const std::string& line)
             g_swapTimes.pop_front();
         char buf[256];
         snprintf(buf, sizeof(buf), "\"frame\":%llu,\"fps\":%zu,\"draws\":%u", (unsigned long long)g_frame, g_swapTimes.size(), RendererLastFrameDraws());
+        return Ok(buf);
+    }
+    // frametimes: frame-time statistics since the last call (average, percentiles, worst, frames over 20/33 ms)
+    if (cmd == "frametimes")
+    {
+        std::vector<float> v;
+        {
+            std::lock_guard lock(g_mutex);
+            v.swap(g_frameMs);
+        }
+        if (v.empty())
+            return Error("no frames");
+        double sum = 0;
+        for (float x : v)
+            sum += x;
+        std::vector<float> sorted = v;
+        std::sort(sorted.begin(), sorted.end());
+        auto pct = [&](double q) { return sorted[std::min(sorted.size() - 1, size_t(q * double(sorted.size())))]; };
+        size_t over20 = 0, over33 = 0;
+        for (float x : v)
+        {
+            over20 += x > 20.0f;
+            over33 += x > 33.4f;
+        }
+        char buf[256];
+        snprintf(buf, sizeof(buf), "\"frames\":%zu,\"avg\":%.3f,\"p50\":%.3f,\"p99\":%.3f,\"p999\":%.3f,\"max\":%.3f,\"over20\":%zu,\"over33\":%zu",
+            v.size(), sum / double(v.size()), pct(0.5), pct(0.99), pct(0.999), sorted.back(), over20, over33);
         return Ok(buf);
     }
     // press A [ms]   press A+B 200   (held for ms, default 120, then released)
@@ -301,7 +330,12 @@ std::string Handle(const std::string& line)
         RENDERDOC_API_1_1_2* api = nullptr;
         if (!getApi || !getApi(eRENDERDOC_API_Version_1_1_2, reinterpret_cast<void**>(&api)) || !api)
             return Error("RENDERDOC_GetAPI failed");
-        api->TriggerCapture();
+        int frames = 1;
+        in >> frames;
+        if (frames > 1)
+            api->TriggerMultiFrameCapture(static_cast<uint32_t>(frames));
+        else
+            api->TriggerCapture();
         return Ok("\"note\":\"captured at the next present\"");
 #else
         return Error("built without RenderDoc's renderdoc_app.h");
@@ -407,8 +441,8 @@ std::string Handle(const std::string& line)
     {
         std::string name, value;
         in >> name >> value;
-        if (name.rfind("REGPU_", 0) != 0 || (value != "0" && value != "1" && value != "on" && value != "off"))
-            return Error("switch REGPU_NAME 0|1");
+        if ((name.rfind("REGPU_", 0) != 0 && name.rfind("PGR4_", 0) != 0) || (value != "0" && value != "1" && value != "on" && value != "off"))
+            return Error("switch REGPU_NAME|PGR4_NAME 0|1");
         const bool on = value == "1" || value == "on";
         const bool known = LiveSwitch::Set(name, on);
         return Ok(std::string("\"name\":\"") + Escape(name) + "\",\"on\":" + (on ? "true" : "false") +
@@ -583,6 +617,12 @@ void DebugOnSwap(uint64_t frame)
         std::lock_guard lock(g_mutex);
         g_frame = frame;
         g_swaps++;
+        {
+            const auto now = Clock::now();
+            if (g_lastSwap != Clock::time_point{} && g_frameMs.size() < 200000)
+                g_frameMs.push_back(std::chrono::duration<float, std::milli>(now - g_lastSwap).count());
+            g_lastSwap = now;
+        }
         g_swapTimes.push_back(Clock::now());
         if (g_swapTimes.size() > 2000)
             g_swapTimes.pop_front();

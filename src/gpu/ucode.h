@@ -74,6 +74,7 @@ struct Fetch
     bool denormalized;   // coordinates in texels
     uint32_t dimension;
     float lodBias;       // texture fetch LOD bias (instruction)
+    uint32_t magFilter = 3; // texture fetch: 0 point, 1 linear, 3 the fetch constant's (w1 bits 12-13)
     float offsetX = 0, offsetY = 0; // texture fetch texel offsets (signed 5 bits, half texels)
     bool predicated, predCondition;
 };

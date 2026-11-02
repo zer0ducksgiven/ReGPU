@@ -11,14 +11,39 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <cstdlib>
+#include <memory>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include <d3d12.h>
 
-// REGPU_PERF: calls recorded, by op (RecordedList::Op), and resource barriers in them.
+// REGPU_PERF: calls recorded, by op (RecordedList::Op), and resource barriers in them (counted only then:
+// an atomic increment per recorded call was ~1% of the command processor).
 inline std::atomic<uint64_t> g_recordedOps[32];
 inline std::atomic<uint64_t> g_recordedBarriers{ 0 };
+inline const bool g_countRecorded = getenv("REGPU_PERF") != nullptr;
+
+// Bytes that are written right after the buffer grows: growing must not zero them first (resize's
+// value-initialisation was a memset per recorded call, ~3% of the command processor).
+template <typename T>
+struct NoInitAllocator : std::allocator<T>
+{
+    template <typename U>
+    struct rebind
+    {
+        using other = NoInitAllocator<U>;
+    };
+    NoInitAllocator() = default;
+    template <typename U>
+    NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
+    template <typename U>
+    void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) { ::new (static_cast<void*>(p)) U; }
+    template <typename U, typename... A>
+    void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
+};
+using RecordBytes = std::vector<uint8_t, NoInitAllocator<uint8_t>>;
 // REGPU_TRACE_BARRIERS: called with each barrier call's return address (renderer.cpp counts them).
 inline void (*g_barrierSites)(void* caller, UINT n, const D3D12_RESOURCE_BARRIER* b) = nullptr;
 
@@ -39,6 +64,18 @@ public:
     {
         Drain();
         m_real = real;
+    }
+
+    // Hands the list over in order, without waiting: when the replay reaches this point, fn gets the real
+    // list so far (to close and queue) and the replay goes on into next. With next null, fn is just called
+    // there (closed null), to queue other lists behind what precedes. (Real() waits for the replay
+    // instead: the command processor spent ~16% of its time in it in PGR4.)
+    using HandOffFn = void (*)(ID3D12GraphicsCommandList* closed, void* ctx);
+    void HandOff(ID3D12GraphicsCommandList* next, HandOffFn fn, void* ctx)
+    {
+        struct A { ID3D12GraphicsCommandList* next; HandOffFn fn; void* ctx; } a{ next, fn, ctx };
+        Put(kHandOff, &a, sizeof(a));
+        Submit();
     }
 
     // The real list, with everything recorded so far replayed into it.
@@ -136,23 +173,26 @@ private:
     {
         kBarrier, kCopyTexture, kRootSignature, kTable, kCbv, kRoot32, kTargets, kPipeline, kViewports, kScissors, kStencilRef, kBlendFactor,
         kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer,
-        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery
+        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery, kHandOff
     };
     static constexpr size_t kChunk = 64 << 10;
 
     ID3D12GraphicsCommandList* m_real = nullptr;
     bool m_direct = false;
-    std::vector<uint8_t> m_current;
+    RecordBytes m_current;
     std::mutex m_mutex;
     std::condition_variable m_work, m_idle;
-    std::deque<std::vector<uint8_t>> m_queue, m_spare;
+    std::deque<RecordBytes> m_queue, m_spare;
     bool m_busy = false;
 
     void Put(Op op, const void* a, size_t na, const void* b = nullptr, size_t nb = 0)
     {
-        if (op == kBarrier)
-            g_recordedBarriers.fetch_add(*static_cast<const UINT*>(a), std::memory_order_relaxed);
-        g_recordedOps[op].fetch_add(1, std::memory_order_relaxed);
+        if (g_countRecorded)
+        {
+            if (op == kBarrier)
+                g_recordedBarriers.fetch_add(*static_cast<const UINT*>(a), std::memory_order_relaxed);
+            g_recordedOps[op].fetch_add(1, std::memory_order_relaxed);
+        }
         const size_t at = m_current.size();
         const uint32_t header[2] = { op, uint32_t((na + nb + 7) & ~size_t(7)) }; // 8-byte aligned commands
         m_current.resize(at + sizeof(header) + header[1]);
@@ -200,7 +240,7 @@ private:
         SetThreadDescription(GetCurrentThread(), L"command list replay");
         for (;;)
         {
-            std::vector<uint8_t> chunk;
+            RecordBytes chunk;
             {
                 std::unique_lock lock(m_mutex);
                 m_work.wait(lock, [this] { return !m_queue.empty(); });
@@ -280,6 +320,15 @@ private:
             {
                 const UINT* d = reinterpret_cast<const UINT*>(a);
                 l->DrawInstanced(d[0], d[1], d[2], d[3]);
+                break;
+            }
+            case kHandOff:
+            {
+                struct A { ID3D12GraphicsCommandList* next; HandOffFn fn; void* ctx; };
+                const A h = At<A>(a);
+                h.fn(h.next ? l : nullptr, h.ctx);
+                if (h.next)
+                    l = m_real = h.next;
                 break;
             }
             case kBeginQuery:

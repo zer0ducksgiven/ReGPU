@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include "gpu/hlsl.h"
 #include "live_switch.h"
@@ -27,6 +28,9 @@ cbuffer VSConstants : register(b0)
     // The game's own constants for the shaders it rewrote (Host::rewriteShader, set per draw in
     // Host::onDraw); zero unless it sets them.
     float4 vuser[4];
+    // x: the polygon offset's constant part (PA_SU_POLY_OFFSET_*_OFFSET), added to depth: the console
+    // adds it as an absolute amount, D3D12's depth bias scales it by each primitive's depth.
+    float4 vdepth;
     // xy: clip-space factors for perspective geometry in a wide pass (outputs wider than
     // 16:9; 1 otherwise): x narrows the view to the wider screen (Hor+), y zooms in when
     // REGPU_WIDE_FOV limits how far the view widens; z keeps 2D (HUD, menus) at 16:9; w is 0
@@ -206,6 +210,16 @@ float3 CubeDirection(float3 stf)
 }
 
 float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel);
+static int gFilterOverride = -1; // the fetch instruction's filter (0 point, 1 linear), -1 the constant's
+// The sampler for a fetch: the constant's mode (0 linear wrap, 1 linear clamp, 2 point clamp, 3 point
+// wrap), its filter replaced by the instruction's when it has one.
+uint FetchMode(uint mode)
+{
+    const bool wrap = mode == 0u || mode == 3u;
+    if (gFilterOverride == 0) return wrap ? 3u : 2u;
+    if (gFilterOverride == 1) return wrap ? 0u : 1u;
+    return mode;
+}
 
 // Sampling with a LOD bias is a pixel-shader-only operation: a vertex shader cannot compute an
 // implicit LOD, and dxc rejects the module outright ("sampling with implicit lod is only allowed
@@ -300,8 +314,11 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
     if (denorm) uv = (uv + texel) / texelSize;
     else uv += texel / texelSize;
-    // Mirrored addressing (tinfo.x bits 28 U, 29 V; 30, 31: mirrored once, then clamped).
-    uv = Mirror(uv, tinfo[slot].x);
+    // Mirrored (tinfo.x bits 28 U, 29 V: repeating; 30 U, 31 V: once, then clamped below).
+    if ((tinfo[slot].x >> 28) & 1u) uv.x = 1.0 - abs(frac(uv.x * 0.5) * 2.0 - 1.0);
+    if ((tinfo[slot].x >> 29) & 1u) uv.y = 1.0 - abs(frac(uv.y * 0.5) * 2.0 - 1.0);
+    if ((tinfo[slot].x >> 30) & 1u) uv.x = abs(uv.x);
+    if ((tinfo[slot].x >> 31) & 1u) uv.y = abs(uv.y);
     // Clamp to border (tinfo.x bit 16; bit 17 white): outside the image the border colour, as
     // shadow maps rely on (white: nothing casts a shadow beyond the map).
     if (((tinfo[slot].x >> 16) & 1u) && any(uv < 0.0 || uv > 1.0))
@@ -311,7 +328,7 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     if ((tinfo[slot].x >> 18) & 1u) uv.x = clamp(uv.x, 0.5 / texelSize.x, 1.0 - 0.5 / texelSize.x);
     if ((tinfo[slot].x >> 19) & 1u) uv.y = clamp(uv.y, 0.5 / texelSize.y, 1.0 - 0.5 / texelSize.y);
     if (tbias[slot].z > 0.0) uv *= tbias[slot].zw; // declared image inside a wider resolved texture (renderer.cpp)
-    uint mode = tinfo[slot].x & 3u;
+    uint mode = FetchMode(tinfo[slot].x & 3u);
     // Vertex shaders read data tables this way (PGR4's riders: bone matrices, three texels a bone):
     // the fetch constant's filter applies, point sampling exactly one texel. Always linear here,
     // each matrix row was blended with its neighbours and the bodies came out mangled.
@@ -417,6 +434,8 @@ struct Emitter
             }
             return reg < 4 ? "oC[" + std::to_string(reg) + "]" : "";
         }
+        if (reg >= 32 && reg <= 37)
+            result.memExport = true; // eA, eM0-4 (dropped: captures mark these draws)
         if (reg == 63)
             return "opts";
         if (reg == 62)
@@ -431,6 +450,15 @@ struct Emitter
 
     static std::string Masked(const std::string& target, const std::string& value, uint32_t mask)
     {
+        // One swizzled write for the components in order (r.xyz = v.xyz), unless REGPU_FULL_ALU.
+        if (!FullAlu() && std::popcount(mask & 15u) > 1)
+        {
+            std::string comps;
+            for (int c = 0; c < 4; c++)
+                if ((mask >> c) & 1)
+                    comps += "xyzw"[c];
+            return target + "." + comps + " = " + value + "." + comps + "; ";
+        }
         std::string s;
         for (int c = 0; c < 4; c++)
         {
@@ -553,11 +581,32 @@ struct Emitter
         }
     }
 
+    // REGPU_FULL_ALU=1: every instruction computes both halves through v and s, and masked writes go one
+    // component at a time, as before (A/B).
+    static bool FullAlu()
+    {
+        static const bool full = getenv("REGPU_FULL_ALU") != nullptr;
+        return full;
+    }
+
     void EmitAlu(const Alu& a)
     {
-        std::string body = "{ float4 v = float4(0, 0, 0, 0); float s = ps; ";
+        // Leaner code for the common cases, the same results: the scalar half "retain previous" (op 50,
+        // unclamped, unwritten) leaves ps as it is, and a vector result nothing reads (no component
+        // written, no predicate, kill or address side effect) isn't computed. Shaders compile without
+        // optimisation, so all of it reached the GPU's compiler as written (FM2 port: 229 -> 240 fps).
+        const bool lean = !FullAlu();
+        const bool scalarKept = lean && a.scalarOp == 50 && !a.scalarClamp && !a.scalarMask;
+        const bool vectorSideEffect = (a.vectorOp >= 20 && a.vectorOp <= 27) || a.vectorOp == 29;
+        const bool vectorUnused = lean && !a.vectorMask && !vectorSideEffect &&
+            !(a.exportData && a.scalarDestRelative); // (a relative export zeroes the unwritten components)
+        if (scalarKept && vectorUnused && !a.exportData)
+            return; // a no-op
+        std::string body = std::string("{ ") + (vectorUnused ? "" : "float4 v = float4(0, 0, 0, 0); ") + (scalarKept ? "" : "float s = ps; ");
         const std::string A = Src(a.src[0]), B = Src(a.src[1]), C = Src(a.src[2]);
-        if (a.vectorOp >= 20 && a.vectorOp <= 23)
+        if (vectorUnused)
+            ;
+        else if (a.vectorOp >= 20 && a.vectorOp <= 23)
         {
             static const char* cmp[] = { "== 0.0", "!= 0.0", "> 0.0", ">= 0.0" };
             // SETP_*_PUSH (Xenia ucode.h): p = src0.w == 0 && src1.w <op> 0; dest = 0 when
@@ -577,14 +626,16 @@ struct Emitter
         }
         else
             body += "v = " + VectorExpr(a, A, B, C) + "; ";
-        if (a.vectorClamp)
+        if (a.vectorClamp && !vectorUnused)
             body += "v = saturate(v); ";
-        body += ScalarCode(a) + " ";
+        if (!scalarKept)
+            body += ScalarCode(a) + " ";
         if (a.vectorOp == 29) // MAXAv: a0 from the first operand's W, after the reads
             body += "a0 = clamp(int(floor((" + A + ").w + 0.5)), -256, 255); ";
         if (a.scalarClamp)
             body += "s = saturate(s); ";
-        body += "ps = s; ";
+        if (!scalarKept)
+            body += "ps = s; ";
 
         if (a.exportData)
         {
@@ -715,7 +766,14 @@ struct Emitter
                     f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
             // Declared, then assigned: fxc drops the value when the fetch initialises the declaration
             // in some shaders ("internal error: invalid access of unbound variable").
-            body = std::string("{ float4 t; t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+            // The instruction's own filter (mag filter 0 point, 1 linear) overrides the fetch constant's,
+            // as on the console. PGR4's brake light glow reads an 8x6 visibility map in its vertex
+            // shader with point filtering; filtered by the constant's linear filter, each bulb's glow
+            // came and went as the car moved a fraction of a texel. REGPU_NO_FETCH_FILTER_OVERRIDE=1: ignored.
+            static const bool noOverride = getenv("REGPU_NO_FETCH_FILTER_OVERRIDE") != nullptr;
+            const bool overrides = !noOverride && (f.magFilter == 0 || f.magFilter == 1);
+            body = std::string("{ float4 t; ") + (overrides ? "gFilterOverride = " + std::to_string(f.magFilter) + "; " : "") + "t = " + call + "; " +
+                (overrides ? "gFilterOverride = -1; " : "") + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
             result.usedTextureSlots |= 1u << f.constIndex;
         }
         else if (f.opcode == 18 && pixel)
@@ -1296,6 +1354,8 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    float zc = p.z * w;\n"
              "    if (!(vte.x & (1u << 9)) && !(vte.x & (1u << 8)) && !(vte.x & (1u << 29)))\n"
              "        zc = r.pos.z * ((vte.x & 16u) ? vscale.z : 1.0) + ((vte.x & 32u) ? voffset.z : 0.0) * w;\n"
+             "    // The polygon offset's constant part (vdepth.x, renderer.cpp PolygonOffsetDepth).\n"
+             "    zc += vdepth.x * w;\n"
              "    r.pos = float4(ndc * w, zc, w);\n"
              "    return r;\n}\n";
     }
@@ -1314,7 +1374,7 @@ TranslatedShader TranslateShader(const Shader& shader)
             decl += "    float4 r" + std::to_string(n) + (n < 16 ? " = input.o[" + std::to_string(n) + "];\n" : " = 0;\n");
         for (uint32_t n : regs)
             if (n < 16)
-                inputs += "    if (pinfo.y == " + std::to_string(n) + "u) r" + std::to_string(n) + " = float4(((pinfo.z & 64u) ? floor(input.pos.xy) : input.pos.xy) * pinfo2.yz, input.pcoord);\n";
+                inputs += "    if (pinfo.y == " + std::to_string(n) + "u) r" + std::to_string(n) + " = float4(((pinfo.z & 65536u) ? floor(input.pos.xy) : input.pos.xy) * pinfo2.yz, input.pcoord);\n";
         h += decl +
              "    float4 oC[4]; [unroll] for (int k = 0; k < 4; k++) oC[k] = 0;\n"
              "    float ps = 0; bool p = false; int a0 = 0, aL = 0;\n" + inputs;
@@ -1328,6 +1388,7 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    case 5: if (!(oC[0].a != pinfo2.x)) discard; break;\n"
              "    case 6: if (!(oC[0].a >= pinfo2.x)) discard; break;\n"
              "    }\n"
+             "    if (pinfo.z & 64u) { uint2 q = uint2(input.pos.xy) & 1u; if (!(oC[0].a >= 1.0 - float((pinfo.z >> (8u + ((q.x << 1) | q.y) * 2u)) & 3u) * 0.25)) discard; } // alpha to mask, dithered\n"
              "    oC[0] *= exp2(float(int(pinfo.w))); // colour exponent bias (RB_COLOR_INFO), after the alpha test\n"
              "    if (pinfo.z & 8u) oC[0] = clamp(oC[0], -32.0, 32.0); // 16_16 fixed range\n"
              "    if (pinfo.z & 32u) oC[0].a = round(saturate(oC[0].a) * 3.0) / 3.0; // 2-bit alpha surface (k_2_10_10_10_FLOAT)\n"

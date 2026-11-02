@@ -249,10 +249,14 @@ void DecodeTexel(uint32_t format, const uint8_t* t, uint8_t* out)
     }
     case k_4_4_4_4:
     {
+        // R in the low nibble, as k_8_8_8_8 has R in the low byte (after the endian swap). With R and B
+        // the other way round, a font atlas with a glyph in each channel drew glyphs from the wrong one
+        // (FM2's Japanese text). REGPU_4444_R_HIGH=1: R in the third nibble, as before (A/B).
+        static const bool rHigh = getenv("REGPU_4444_R_HIGH") != nullptr;
         const uint16_t c = uint16_t(t[0] | (t[1] << 8));
-        out[0] = uint8_t(((c >> 8) & 15) * 17);
+        out[0] = uint8_t(((c >> (rHigh ? 8 : 0)) & 15) * 17);
         out[1] = uint8_t(((c >> 4) & 15) * 17);
-        out[2] = uint8_t((c & 15) * 17);
+        out[2] = uint8_t(((c >> (rHigh ? 0 : 8)) & 15) * 17);
         out[3] = uint8_t(((c >> 12) & 15) * 17);
         break;
     }
@@ -635,7 +639,17 @@ uint32_t TextureFaceStride(const TextureFetch& fetch)
 {
     FormatInfo info;
     if (!Info(fetch.Format(), info))
-        info = { 1, 2 }; // 32 bpp (render-target formats)
+    {
+        // Formats with no decoder here are render targets the title resolved into: their faces sit
+        // as far apart as their texels are wide. 64 bpp: k_16_16_16_16_EDRAM 21, k_16_16_16_16 26,
+        // k_16_16_16_16_EXPAND 29, k_32_32_FLOAT 37 (PGR4's car reflection cube is 29: read at
+        // 32 bpp, faces 1-5 came from the wrong places and the car body reflected black);
+        // 16 bpp: k_16 24, k_16_EXPAND 27, k_16_FLOAT 30. Otherwise 32 bpp.
+        // REGPU_NO_FACE_STRIDE_BPP=1: 32 bpp for all of them (A/B).
+        static LiveSwitch oldStride("REGPU_NO_FACE_STRIDE_BPP");
+        const uint32_t f = fetch.Format();
+        info = { 1, oldStride ? 2u : f == 21 || f == 26 || f == 29 || f == 37 ? 3u : f == 24 || f == 27 || f == 30 ? 1u : 2u };
+    }
     const uint32_t blocksX = (fetch.Width() + info.blockSize - 1) / info.blockSize;
     uint32_t blocksY = (fetch.Height() + info.blockSize - 1) / info.blockSize;
     uint32_t pitchBlocks = std::max(fetch.Pitch() / info.blockSize, blocksX);
