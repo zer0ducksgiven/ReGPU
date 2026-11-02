@@ -5859,7 +5859,14 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
                 p = *end ? end + 1 : end;
             }
     ResolvedTexture& dest = g_r.resolved[base];
-    const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
+    // Rounded down, not to nearest: only the rows (and columns) whose pixel centres the draws covered hold
+    // the image. At a scale that leaves a fraction (1080p is 1.5x 720p), PGR4's exposure chain ends in a
+    // 32x1 image: 1.5 rows became a 2-row texture whose second row was never drawn, the single row it
+    // samples blended in garbage, and the exposure flickered and ran away (washed-out menus, black races).
+    // REGPU_ROUND_RESOLVE_SIZE=1: to nearest, as before (A/B).
+    static LiveSwitch roundSize("REGPU_ROUND_RESOLVE_SIZE");
+    const uint32_t hostWidth = roundSize ? uint32_t(HostX(LONG(width))) : std::max(1u, uint32_t(double(width) * ScaleX() + 1e-3));
+    const uint32_t hostHeight = roundSize ? uint32_t(HostY(LONG(height))) : std::max(1u, uint32_t(double(height) * ScaleY() + 1e-3));
     EnsureResolved(dest, width, height, hostWidth, hostHeight, format);
     if (RendererTracing())
         Log("resolve: -> %08X %ux%u as %ux%u host (scale %.3f x %.3f, texture %ux%u)", base, width, height, hostWidth, hostHeight, ScaleX(), ScaleY(),
