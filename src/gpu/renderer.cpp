@@ -374,8 +374,20 @@ struct CompiledShader
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
 
-std::atomic<uint64_t> g_lastFrameFence{ 0 }; // the queue fence of the last frame ended
-std::atomic<uint32_t> g_framesEnded{ 0 };
+// REGPU_TRACE_OVERWRITE=1: guest ranges the GPU reads in place are hashed when recorded and again once that frame has
+// run; a difference means the title rewrote them first, and the GPU may have drawn what it wrote (exploded geometry).
+namespace overwrite
+{
+struct Range
+{
+    uint32_t address, bytes;
+    uint64_t hash, vs;
+    bool index;
+};
+std::mutex g_mutex;
+std::vector<Range> g_ranges[8];
+std::unordered_set<uint64_t> g_seen[8];
+}
 
 struct CachedTexture
 {
@@ -3046,6 +3058,65 @@ bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D
             shared.Put(key, g_r.frame, view);
     }
     return true;
+}
+
+namespace overwrite
+{
+// Checked the moment the frame's fence completes, on a thread of its own: a rewrite after that is legitimate.
+void EndFrame(UINT slot, UINT64 fence, uint64_t frame)
+{
+    struct Job
+    {
+        std::vector<Range> ranges;
+        UINT64 fence;
+        uint64_t frame;
+    };
+    static std::mutex queueMutex;
+    static std::condition_variable wake;
+    static std::deque<Job> queue;
+    std::vector<Range> ranges;
+    {
+        std::lock_guard lock(g_mutex);
+        ranges.swap(g_ranges[slot]);
+        g_seen[slot].clear();
+    }
+    if (ranges.empty())
+        return;
+    static std::once_flag started;
+    std::call_once(started, [] {
+        std::thread([] {
+            for (;;)
+            {
+                Job job;
+                {
+                    std::unique_lock lock(queueMutex);
+                    wake.wait(lock, [] { return !queue.empty(); });
+                    job = std::move(queue.front());
+                    queue.pop_front();
+                }
+                WaitFenceValue(job.fence, INFINITE);
+                uint32_t changed = 0;
+                for (const Range& r : job.ranges)
+                    if (FullHash(GuestPtr<uint8_t>(GpuPhysToGuest(r.address)), r.bytes) != r.hash && changed++ < 8)
+                        Log("overwrite: %s %08X %u bytes rewritten before the GPU finished (vs %016llx, frame %llu)", r.index ? "indices" : "vertices", r.address, r.bytes, (unsigned long long)r.vs, (unsigned long long)job.frame);
+            }
+        }).detach();
+    });
+    std::lock_guard lock(queueMutex);
+    queue.push_back({ std::move(ranges), fence, frame });
+    wake.notify_one();
+}
+}
+
+void NoteInPlace(uint32_t address, uint32_t bytes, bool index, uint64_t vs)
+{
+    static LiveSwitch trace("REGPU_TRACE_OVERWRITE");
+    if (!trace || !bytes)
+        return;
+    const UINT slot = g_r.frameIndex;
+    std::lock_guard lock(overwrite::g_mutex);
+    if (overwrite::g_seen[slot].insert(uint64_t(address) << 32 | bytes).second)
+        overwrite::g_ranges[slot].push_back({ address, bytes, FullHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes), vs, index });
 }
 
 bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view, uint64_t hash)
@@ -8433,7 +8504,10 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
 // REGPU_EARLY_FENCES writes them at record time again (A/B).
 uint64_t FenceSubmitImpl()
 {
-    static LiveSwitch early("REGPU_EARLY_FENCES");
+    // REGPU_TRUTHFUL_FENCES: buffers are copied as with early fences, but fences land after the host GPU, so a title
+    // freeing memory on a fence can't overwrite what the GPU has yet to draw (exploded scenery). The title must then
+    // not wait on them to pace its frame (the port skips that wait), or its frame and the GPU take turns again.
+    static const bool early = getenv("REGPU_EARLY_FENCES") != nullptr && !RendererTruthfulFences();
     if (!g_r.ok)
         return 0;
     // With record-time fences, a fence that follows a small resolve write-back of this frame still goes
@@ -8636,24 +8710,11 @@ bool RendererIsResolveDraw()
 
 uint64_t RendererFenceSubmit() { return FenceSubmitImpl(); }
 
-namespace regpu
+bool RendererTruthfulFences()
 {
-// With early fences the title hears its GPU work is done when it is recorded, so it may stream new data over a mesh
-// the host GPU has yet to draw: for a frame, huge dark triangles across the sky (PGR4). Until this frame's commands
-// have run. Bounded, for a title reading on the thread that draws: then nothing can be in flight behind it for long.
-// REGPU_NO_READ_WAIT: the read goes ahead at once.
-void WaitBeforeGuestOverwrite()
-{
-    static LiveSwitch off("REGPU_NO_READ_WAIT");
-    if (off || !g_r.ok || !RendererEarlyFences())
-        return;
-    const uint32_t ended = g_framesEnded.load(std::memory_order_acquire);
-    for (int i = 0; i < 34 && g_framesEnded.load(std::memory_order_acquire) == ended; i++)
-        Sleep(1);
-    WaitFenceValue(g_lastFrameFence.load(std::memory_order_acquire), 100);
+    static const bool on = getenv("REGPU_TRUTHFUL_FENCES") != nullptr;
+    return on;
 }
-}
-
 bool RendererEarlyFences()
 {
     static const bool on = getenv("REGPU_EARLY_FENCES") != nullptr;
@@ -9482,6 +9543,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const bool directIndex = g_r.physical && !noDirectIndex && !indexOverrun && !indexRewritten && (indexSource == 0 || indexSource == 2) &&
         (prim == 4 || prim == 13 || (prim == 6 && (!restartOn || stripCut)));
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
+    if (directIndex && indexSource == 0)
+        NoteInPlace(dmaBase & 0x1FFFFFFF, indexBytes, true, C().vsHash);
     IndexListEntry* indexEntry = directIndex ? nullptr : CachedIndexList(initiator, dmaBase, dmaSize);
     static const std::vector<uint32_t> noList;
     const std::vector<uint32_t>& list = indexEntry ? indexEntry->list : noList;
@@ -9740,6 +9803,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                                           : RendererEarlyFences() ? kEarlyFenceDirectFetchBytes : kDirectFetchBytes;
         if (g_r.physical && !noDirect && bytes >= directBytes && !DynamicBuffer(address, bytes))
         {
+            NoteInPlace(address & 0x1FFFFFFF, bytes, false, C().vsHash);
             vc->vf[k][0] = address & 0x1FFFFFFF;
             vc->vf[k][1] = d1 & 3;
             vc->vf[k][2] = 1;
@@ -11497,8 +11561,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         PresenterPresent();
     Frame().fence = g_r.nextFence++;
     g_r.queue->Signal(g_r.fence.Get(), Frame().fence);
-    g_lastFrameFence.store(Frame().fence, std::memory_order_release);
-    g_framesEnded.fetch_add(1, std::memory_order_release);
+    overwrite::EndFrame(g_r.frameIndex, Frame().fence, g_r.frame);
     g_r.listOpen = false;
 
     if (dump)

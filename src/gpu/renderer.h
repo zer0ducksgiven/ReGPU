@@ -61,6 +61,7 @@ uint64_t RendererFenceSubmit();
 // (where the GPU is never far behind), instead of after the host GPU. The title can then rewrite
 // memory the host GPU has yet to read, so guest ranges seen changing are copied, not read in place.
 bool RendererEarlyFences();
+bool RendererTruthfulFences();
 // Blocks until the host GPU has reached a value from RendererFenceSubmit.
 void RendererFenceWait(uint64_t value, void* event);
 // The fence writer, after RendererFenceWait(value): resolve write-backs recorded before it land in guest memory.
