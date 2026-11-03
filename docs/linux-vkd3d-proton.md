@@ -12,7 +12,7 @@ under Wine with FH1R's Vulkan renderer. See [Results](#results).
 ## What you need
 
 - A Windows build of the game with ReGPU in it. For FH1R that's the `feature/regpu-plugin` branch
-  (game PR #611), cross-built on Linux with `tools/build_windows.sh` (clang-cl and xwin).
+  ([FH1R PR #611](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/pull/611)), cross-built on Linux with `tools/build_windows.sh` (clang-cl and xwin).
 - Wine with vkd3d-proton and DXVK's `dxgi.dll`. A copy of a Proton install from Steam has all
   three. We used Proton 11.0 (`proton-11.0-2e`: Wine 11.0, vkd3d-proton `212991fc`, DXVK
   `v2.7.1-498`). Copy it rather than pointing a prefix at Steam's own files.
@@ -51,7 +51,7 @@ The rest of the build is the normal cross-build:
 
 ## Running it
 
-FH1R's `tools/run_regpu_wine.sh` (game repo) does the setup and the launch:
+FH1R's `tools/run_regpu_wine.sh` ([FH1R PR #616](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/pull/616)) does the setup and the launch:
 
 ```sh
 tools/run_regpu_wine.sh setup "$HOME/.steam/steam/steamapps/common/Proton 11.0"  # copies it, makes the prefix
