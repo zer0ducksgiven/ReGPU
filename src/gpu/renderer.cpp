@@ -4494,6 +4494,17 @@ bool PlainRectMustDraw()
     static LiveSwitch skipPlainRects("REGPU_SKIP_PLAIN_RECTS"); // 1: skippable like the rest, as before
     return g_plainRectDraw && !skipPlainRects;
 }
+// Set by the draw: a rectangle list or a draw of six vertices or fewer (a screen pass: the scene's
+// tonemap, exposure, bloom and blur passes, HUD panels). Skipped while its pipeline built, a post pass
+// left that whole frame washed out or flat (PGR4 first sessions: "extreme flickering during gameplay",
+// report #14); these wait for their pipeline instead, a one-off hitch on first use.
+// REGPU_SKIP_SCREEN_PASSES=1: skippable like the rest, as before.
+thread_local bool g_screenPassDraw = false;
+bool ScreenPassMustDraw()
+{
+    static LiveSwitch skipScreenPasses("REGPU_SKIP_SCREEN_PASSES");
+    return g_screenPassDraw && !skipScreenPasses;
+}
 
 bool SkippableDraw(bool depthOnly, uint32_t blend)
 {
@@ -4504,7 +4515,7 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
     // for later passes to draw through (FH1's minimap came out as white blobs for a moment when the world
     // loaded: 27 such draws were dropped while their pipelines built, the first frame after the load).
     // REGPU_SKIP_PLAIN_RECTS=1: skippable like the rest, as before.
-    if (PlainRectMustDraw())
+    if (PlainRectMustDraw() || ScreenPassMustDraw())
         return false;
     const bool opaque = (blend & 0xFF1F1F1F) == 0x00010001 || (blend & 0x1F) == 1 && ((blend >> 8) & 0x1F) == 0;
     return !opaque || GameSettled();
@@ -9271,6 +9282,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     Section(1);
     LiveSwitch &asyncShaders = g_sw_REGPU_ASYNC_SHADERS;
     const bool shadersPending = vs.state.load(std::memory_order_acquire) == CompiledShader::Pending || ps.state.load(std::memory_order_acquire) == CompiledShader::Pending;
+    g_screenPassDraw = (initiator & 0x3F) == 8 || (initiator >> 16) <= 6; // (before both skip checks)
     if (shadersPending && SkippableDraw(edramMode == 5, gpureg::Get(RB_BLENDCONTROL0)))
     {
         g_skippedPipeline++;
