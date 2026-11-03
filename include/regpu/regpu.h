@@ -125,6 +125,11 @@ struct Host
     // shader's constants (as the title set them); `user` is four float4 the rewritten shaders can read
     // as vuser[0..3] (zero unless set here).
     void (*onDraw)(uint64_t vs, uint64_t ps, uint32_t vsTag, uint32_t psTag, const float c[256][4], float user[4][4]) = nullptr;
+    // Optional: a draw with a tagged shader, before it is recorded: true clears the bound colour target
+    // over the draw's scissor to `colour` first. For pixels a title leaves unwritten and reads back, which
+    // on the console hold whatever another view of the same EDRAM left there (a depth surface, say), and
+    // here hold the colour surface's previous contents.
+    bool (*clearBeforeDraw)(uint64_t vs, uint64_t ps, uint32_t vsTag, uint32_t psTag, float colour[4]) = nullptr;
     // Optional: each frame the game finishes (VdSwap), on the renderer's thread.
     void (*onSwap)(uint64_t frame) = nullptr;
     // Optional: a character typed into the game window (WM_CHAR), e.g. for cheat codes.
