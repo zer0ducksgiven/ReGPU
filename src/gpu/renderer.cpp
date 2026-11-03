@@ -500,13 +500,19 @@ thread_local CompilingNow g_compiling{};
 
 // Pipelines whose compile crashed the driver (FM4 port: AMD's amdxc64 faults on a few): written by
 // RendererLogCrashContext (the port's crash handler, through regpu::LogCrashContext) to regpu-bad-pipelines.txt
-// and refused on the next start, so a draw using one is dropped instead of killing the game.
+// and refused on the next start, so a draw using one is dropped instead of killing the game. The file is in
+// Config::userDir (the path is made on the first pipeline, so the crash handler doesn't allocate).
 const char* const kBadPipelinesFile = "regpu-bad-pipelines.txt";
+const std::wstring& BadPipelinesPath()
+{
+    static const std::wstring path = (regpu::GetConfig().userDir / kBadPipelinesFile).wstring();
+    return path;
+}
 bool PipelineIsPoisoned(uint64_t vs, uint64_t ps)
 {
     static const std::set<std::pair<uint64_t, uint64_t>> bad = [] {
         std::set<std::pair<uint64_t, uint64_t>> out;
-        if (FILE* f = fopen(kBadPipelinesFile, "r"))
+        if (FILE* f = _wfopen(BadPipelinesPath().c_str(), L"r"))
         {
             unsigned long long v, p;
             while (fscanf(f, "%llx %llx", &v, &p) == 2)
@@ -8298,7 +8304,7 @@ void RendererLogCrashContext()
     }
     Log("crash: this thread was inside the driver compiling pipeline vs %016llx ps %016llx; it will be skipped on the next start",
         (unsigned long long)g_compiling.vs, (unsigned long long)g_compiling.ps);
-    if (FILE* f = fopen(kBadPipelinesFile, "a"))
+    if (FILE* f = _wfopen(BadPipelinesPath().c_str(), L"a"))
     {
         fprintf(f, "%016llx %016llx\n", (unsigned long long)g_compiling.vs, (unsigned long long)g_compiling.ps);
         fclose(f);

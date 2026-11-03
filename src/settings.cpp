@@ -4,6 +4,7 @@
 #include <algorithm>
 
 #include "debug.h"
+#include "log.h"
 #include "memory.h"
 #include "gpu/renderer.h"
 
@@ -29,6 +30,7 @@ Host& GetHost()
 void Start()
 {
     g_base = GetHost().base;
+    LogStart(); // regpu.log in Config::userDir, now that the host has set it
     DebugServerStart(); // REGPU_DEBUG=1: tools/regpuctl.py drives the running game
     PresenterInit();
     GpuInit();

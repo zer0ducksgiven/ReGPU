@@ -1,11 +1,14 @@
 #include "log.h"
 
+#include "regpu/regpu.h"
+
 #include <windows.h>
 
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -17,34 +20,61 @@ std::mutex g_logMutex;
 std::condition_variable g_logCv;
 std::deque<std::string> g_queue; // lines waiting for the writer thread
 bool g_writerStarted = false;
+std::mutex g_fileMutex;       // g_logFile, g_fileReady and g_early
 FILE* g_logFile = nullptr;
+bool g_fileReady = false;     // LogStart has run: Config::userDir is final
+std::deque<std::string> g_early; // lines from before then, written to the file when it opens
 const auto g_start = std::chrono::steady_clock::now();
 std::deque<std::string> g_recent; // the last lines, for the debug server's log command
 
-// REGPU_LOG_DIR: where the log file goes (FM4 port: a slow or removable drive stalled game threads on
-// every write).
-FILE* LogFile()
+// regpu.log goes in Config::userDir, or in REGPU_LOG_DIR (FM4 port: a slow or removable drive stalled
+// game threads on every write). With g_fileMutex held.
+FILE* OpenLogFile()
 {
-    if (!g_logFile)
-    {
-        const char* dir = getenv("REGPU_LOG_DIR");
-        g_logFile = fopen(dir && *dir ? (std::string(dir) + "\\regpu.log").c_str() : "regpu.log", "w");
-    }
-    return g_logFile;
+    if (const char* dir = getenv("REGPU_LOG_DIR"); dir && *dir)
+        return fopen((std::string(dir) + "\\regpu.log").c_str(), "w");
+    const std::filesystem::path& dir = regpu::GetConfig().userDir;
+    std::error_code ec;
+    if (!dir.empty())
+        std::filesystem::create_directories(dir, ec);
+    return _wfopen((dir / "regpu.log").c_str(), L"w");
 }
 
 void WriteLines(const std::deque<std::string>& lines)
 {
-    FILE* file = LogFile();
+    std::lock_guard lock(g_fileMutex);
     for (const std::string& line : lines)
-        for (FILE* f : { stderr, file })
-            if (f)
-                fputs(line.c_str(), f);
-    for (FILE* f : { stderr, file })
-        if (f)
-            fflush(f);
+    {
+        fputs(line.c_str(), stderr);
+        if (g_logFile)
+            fputs(line.c_str(), g_logFile);
+        else if (!g_fileReady && g_early.size() < 5000)
+            g_early.push_back(line);
+    }
+    fflush(stderr);
+    if (g_logFile)
+        fflush(g_logFile);
+}
 }
 
+void LogStart()
+{
+    std::lock_guard lock(g_fileMutex);
+    if (g_fileReady)
+        return;
+    g_fileReady = true;
+    g_logFile = OpenLogFile();
+    if (g_logFile)
+    {
+        for (const std::string& line : g_early)
+            fputs(line.c_str(), g_logFile);
+        fflush(g_logFile);
+    }
+    g_early.clear();
+}
+
+namespace
+{
 // The writer thread: lines are written off the calling thread, so a stalling drive doesn't hold up the
 // renderer or the game.
 void WriterLoop()
