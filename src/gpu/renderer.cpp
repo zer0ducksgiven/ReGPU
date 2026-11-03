@@ -374,6 +374,9 @@ struct CompiledShader
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
 
+std::atomic<uint64_t> g_lastFrameFence{ 0 }; // the queue fence of the last frame ended
+std::atomic<uint32_t> g_framesEnded{ 0 };
+
 struct CachedTexture
 {
     ComPtr<ID3D12Resource> resource;
@@ -895,7 +898,7 @@ struct TexturePool
     };
     std::vector<ComPtr<ID3D12Heap>> heaps;
     uint64_t used = kHeapBytes; // in heaps.back()
-    std::unordered_map<uint64_t, std::vector<Block>> free; // by size
+    std::map<uint64_t, std::vector<Block>> free; // by size
     std::unordered_map<ID3D12Resource*, Block> live;
     std::deque<std::pair<uint64_t, Block>> retired; // frame retired, block
 } g_texturePool;
@@ -916,6 +919,20 @@ ComPtr<ID3D12Resource> CreateTexture(const D3D12_RESOURCE_DESC& desc, D3D12_RESO
         {
             block = list.back();
             list.pop_back();
+        }
+        else if (auto larger = pool.free.lower_bound(size); [&] {
+                     // A free block of a bigger size, split: blocks reused only by exact size left heaps of
+                     // sizes nothing asked for any more, and new heaps kept coming under a steady budget.
+                     while (larger != pool.free.end() && larger->second.empty())
+                         ++larger;
+                     return larger != pool.free.end();
+                 }())
+        {
+            block = larger->second.back();
+            larger->second.pop_back();
+            if (block.size > size)
+                pool.free[block.size - size].push_back({ block.heap, block.offset + size, block.size - size });
+            block.size = size;
         }
         else
         {
@@ -2326,7 +2343,8 @@ void EvictBindless()
 // Textures not sampled for a while go, oldest first, once they pass a budget: the cache is keyed by guest address,
 // and a title streaming textures to new addresses otherwise grows it until video memory runs out (PGR4: 280,000
 // textures after an hour, CreateHeap out of memory). An evicted texture comes back as a fresh upload.
-// REGPU_TEXTURE_BUDGET_MB overrides half the adapter's video memory (512 MB to 4 GB); REGPU_NO_TEXTURE_EVICT: never.
+// The budget is 1 GB (the console has 512 MB for everything; a scene's textures fit well within it, decoded or not):
+// REGPU_TEXTURE_BUDGET_MB overrides it; REGPU_NO_TEXTURE_EVICT: never.
 void EvictTextures()
 {
     if (g_r.frame % 64 != 0)
@@ -2337,16 +2355,7 @@ void EvictTextures()
     static const uint64_t budget = [] {
         if (const char* s = getenv("REGPU_TEXTURE_BUDGET_MB"))
             return strtoull(s, nullptr, 10) << 20;
-        uint64_t video = 0;
-        ComPtr<IDXGIFactory4> factory;
-        ComPtr<IDXGIAdapter1> adapter;
-        DXGI_ADAPTER_DESC1 desc{};
-        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(g_r.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) &&
-            SUCCEEDED(adapter->GetDesc1(&desc)))
-            video = desc.DedicatedVideoMemory;
-        const uint64_t result = std::clamp<uint64_t>(video / 2, 512ull << 20, 4096ull << 20);
-        Log("renderer: texture budget %llu MB", (unsigned long long)(result >> 20));
-        return result;
+        return 1024ull << 20;
     }();
     std::lock_guard textureLock(g_textureMutex);
     struct Candidate
@@ -2367,6 +2376,38 @@ void EvictTextures()
         // Not this frame's or the last few seconds': those are the scene in view.
         if (it->second.checkedFrame + 300 < g_r.frame)
             candidates.push_back({ it->second.checkedFrame, it, bytes });
+    }
+    static uint64_t lastSize = 0;
+    if (g_r.frame >= lastSize + 3600)
+    {
+        lastSize = g_r.frame;
+        Log("renderer: textures %llu MB in %zu, %zu texture heaps", (unsigned long long)(total >> 20), g_r.textures.size(), g_texturePool.heaps.size());
+        const auto bytesOf = [](ID3D12Resource* r) -> uint64_t {
+            return r ? g_r.device->GetResourceAllocationInfo(0, 1, &static_cast<const D3D12_RESOURCE_DESC&>(r->GetDesc())).SizeInBytes : 0;
+        };
+        const auto cacheBytes = [&](const auto& map) {
+            uint64_t n = 0;
+            for (const auto& [key, t] : map)
+                n += bytesOf(t.resource.Get());
+            return n >> 20;
+        };
+        uint64_t resolved = 0, spares = 0;
+        for (const auto& [key, t] : g_r.resolved)
+        {
+            resolved += bytesOf(t.resource.Get()) + bytesOf(t.packed.Get());
+            for (const auto& spare : t.spares)
+                spares += bytesOf(spare.resource.Get());
+        }
+        uint64_t used = 0;
+        ComPtr<IDXGIFactory4> factory;
+        ComPtr<IDXGIAdapter3> adapter;
+        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(g_r.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) &&
+            SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+            used = info.CurrentUsage;
+        Log("renderer: video memory %llu MB; resolved %llu MB in %zu, spares %llu MB, cubes %llu MB in %zu, volumes %llu MB in %zu, mip chains %llu MB in %zu, bindless %zu",
+            (unsigned long long)(used >> 20), (unsigned long long)(resolved >> 20), g_r.resolved.size(), (unsigned long long)(spares >> 20), (unsigned long long)cacheBytes(g_r.cubes),
+            g_r.cubes.size(), (unsigned long long)cacheBytes(g_r.volumes), g_r.volumes.size(), (unsigned long long)cacheBytes(g_r.mipChains), g_r.mipChains.size(), g_r.bindless.size());
     }
     if (total <= budget)
         return;
@@ -8594,6 +8635,25 @@ bool RendererIsResolveDraw()
 }
 
 uint64_t RendererFenceSubmit() { return FenceSubmitImpl(); }
+
+namespace regpu
+{
+// With early fences the title hears its GPU work is done when it is recorded, so it may stream new data over a mesh
+// the host GPU has yet to draw: for a frame, huge dark triangles across the sky (PGR4). Until this frame's commands
+// have run. Bounded, for a title reading on the thread that draws: then nothing can be in flight behind it for long.
+// REGPU_NO_READ_WAIT: the read goes ahead at once.
+void WaitBeforeGuestOverwrite()
+{
+    static LiveSwitch off("REGPU_NO_READ_WAIT");
+    if (off || !g_r.ok || !RendererEarlyFences())
+        return;
+    const uint32_t ended = g_framesEnded.load(std::memory_order_acquire);
+    for (int i = 0; i < 34 && g_framesEnded.load(std::memory_order_acquire) == ended; i++)
+        Sleep(1);
+    WaitFenceValue(g_lastFrameFence.load(std::memory_order_acquire), 100);
+}
+}
+
 bool RendererEarlyFences()
 {
     static const bool on = getenv("REGPU_EARLY_FENCES") != nullptr;
@@ -11437,6 +11497,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         PresenterPresent();
     Frame().fence = g_r.nextFence++;
     g_r.queue->Signal(g_r.fence.Get(), Frame().fence);
+    g_lastFrameFence.store(Frame().fence, std::memory_order_release);
+    g_framesEnded.fetch_add(1, std::memory_order_release);
     g_r.listOpen = false;
 
     if (dump)
