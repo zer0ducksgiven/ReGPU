@@ -8920,7 +8920,10 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
         }
     } done{ segmentStart };
     BeginFrameIfNeeded();
-    SplitMainListAsync(false);
+    // Waiting for the replay here, not handed off: the pieces call the driver directly, and the main stream's
+    // render target views they bind (created in order in it) must exist by then (the D3D12 debug layer:
+    // "descriptor handle has not been initialized"; AMD GPUs hung in races, 0.1.2-0.1.4).
+    SplitMainList();
     // Texture uploads of the pieces, executed before them.
     ID3D12GraphicsCommandList* prepReal = AcquireList();
     RecordedList prep;
@@ -8977,6 +8980,10 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
     for (ID3D12GraphicsCommandList* l : g_workers.lists)
         lists.push_back(l);
     QueueInStream(std::move(lists));
+    // This thread translated a piece in that piece's list with its own draw state: what it set there isn't
+    // set in the main list (draws skipped setting the pipeline and root signature: "No pipeline state has
+    // been set in this command list", a no-op on NVIDIA, a GPU hang on AMD).
+    g_drawState.Invalidate();
 }
 
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
