@@ -2323,6 +2323,72 @@ void EvictBindless()
     }
 }
 
+// Textures not sampled for a while go, oldest first, once they pass a budget: the cache is keyed by guest address,
+// and a title streaming textures to new addresses otherwise grows it until video memory runs out (PGR4: 280,000
+// textures after an hour, CreateHeap out of memory). An evicted texture comes back as a fresh upload.
+// REGPU_TEXTURE_BUDGET_MB overrides half the adapter's video memory (512 MB to 4 GB); REGPU_NO_TEXTURE_EVICT: never.
+void EvictTextures()
+{
+    if (g_r.frame % 64 != 0)
+        return;
+    static LiveSwitch noEvict("REGPU_NO_TEXTURE_EVICT");
+    if (noEvict)
+        return;
+    static const uint64_t budget = [] {
+        if (const char* s = getenv("REGPU_TEXTURE_BUDGET_MB"))
+            return strtoull(s, nullptr, 10) << 20;
+        uint64_t video = 0;
+        ComPtr<IDXGIFactory4> factory;
+        ComPtr<IDXGIAdapter1> adapter;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(g_r.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) &&
+            SUCCEEDED(adapter->GetDesc1(&desc)))
+            video = desc.DedicatedVideoMemory;
+        const uint64_t result = std::clamp<uint64_t>(video / 2, 512ull << 20, 4096ull << 20);
+        Log("renderer: texture budget %llu MB", (unsigned long long)(result >> 20));
+        return result;
+    }();
+    std::lock_guard textureLock(g_textureMutex);
+    struct Candidate
+    {
+        uint64_t lastUsed;
+        decltype(g_r.textures)::iterator it;
+        uint64_t bytes;
+    };
+    std::vector<Candidate> candidates;
+    uint64_t total = 0;
+    for (auto it = g_r.textures.begin(); it != g_r.textures.end(); ++it)
+    {
+        if (!it->second.resource)
+            continue;
+        const auto block = g_texturePool.live.find(it->second.resource.Get());
+        const uint64_t bytes = block != g_texturePool.live.end() ? block->second.size : g_r.device->GetResourceAllocationInfo(0, 1, &static_cast<const D3D12_RESOURCE_DESC&>(it->second.resource->GetDesc())).SizeInBytes;
+        total += bytes;
+        // Not this frame's or the last few seconds': those are the scene in view.
+        if (it->second.checkedFrame + 300 < g_r.frame)
+            candidates.push_back({ it->second.checkedFrame, it, bytes });
+    }
+    if (total <= budget)
+        return;
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.lastUsed < b.lastUsed; });
+    size_t evicted = 0;
+    for (const Candidate& c : candidates)
+    {
+        if (total <= budget)
+            break;
+        RetireTexture(std::move(c.it->second.resource));
+        g_r.textures.erase(c.it);
+        total -= c.bytes;
+        evicted++;
+    }
+    static uint64_t lastLog = 0;
+    if (g_r.frame >= lastLog + 3600)
+    {
+        lastLog = g_r.frame;
+        Log("renderer: evicted %zu textures, %llu MB in %zu left", evicted, (unsigned long long)(total >> 20), g_r.textures.size());
+    }
+}
+
 // Waits for the queue fence to reach a value, on an event of the calling thread: one shared event let two waiting
 // threads steal each other's wake-up, and the loser sat out its whole timeout (FM4 port: 2 s stalls in a race).
 void WaitFenceValue(UINT64 value, DWORD timeoutMs)
@@ -2521,6 +2587,7 @@ void BeginFrameIfNeeded()
     }
     f.descriptorsUsed = 2;
     EvictBindless();
+    EvictTextures();
     ReclaimTextureBlocks();
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
     C().list->SetDescriptorHeaps(g_r.samplerHeap ? 2 : 1, heaps);
