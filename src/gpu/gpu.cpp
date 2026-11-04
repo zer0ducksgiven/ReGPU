@@ -696,11 +696,16 @@ void Drain()
 // packet waits for them (the title may read a fence in its handler). Acting at once, a title could
 // see a later signal before an earlier fence and reuse memory the GPU still reads (from the FM4
 // port). REGPU_NO_FENCE_ORDER=1: they act at once, as before (A/B).
-LiveSwitch g_noFenceOrder("REGPU_NO_FENCE_ORDER");
+// (Built on first use: the host sets its defaults after static initialisation.)
+LiveSwitch& NoFenceOrder()
+{
+    static LiveSwitch s("REGPU_NO_FENCE_ORDER");
+    return s;
+}
 
 void OrderedStore(uint32_t address, uint32_t value)
 {
-    if (!g_noFenceOrder)
+    if (!NoFenceOrder())
         PendingWrites::Add(0, address, value, true);
     else
         StoreBE32(address, value);
@@ -1148,7 +1153,7 @@ uint32_t ExecutePacket(uint32_t ptr)
     case 0x54: // INTERRUPT: cpu mask
         seg::Flush();
         work::Drain(); // after the draws before it, like the hardware
-        if (!g_noFenceOrder)
+        if (!NoFenceOrder())
             PendingWrites::Drain(); // and after the fence writes before it
         for (uint32_t cpu = 0; cpu < 6; cpu++)
         {
