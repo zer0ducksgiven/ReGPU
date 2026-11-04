@@ -3648,6 +3648,7 @@ struct ShaderCompiler
             waiting--;
             jobs++;
             queue.push_front(const_cast<CompiledShader*>(&cs));
+            cv.notify_one(); // (idle workers sleep: unwoken, the draw waited for the next shader pushed, up to 180 s)
         }
     }
 
@@ -4569,7 +4570,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         if (ms > 30.0 && getenv("REGPU_PERF"))
             Log("perf: pipeline %016llx/%016llx took %.1f ms to create (background)", (unsigned long long)key.vs, (unsigned long long)key.ps, ms);
         if (FAILED(hr))
-            Log("renderer: pipeline %016llx/%016llx failed", (unsigned long long)key.vs, (unsigned long long)key.ps);
+            Log("renderer: pipeline %016llx/%016llx failed (%08lX)", (unsigned long long)key.vs, (unsigned long long)key.ps, hr);
         (hit ? g_stats.pipelinesLoaded : g_stats.pipelinesBuilt)++;
         entry->state.store(FAILED(hr) ? 2 : 1, std::memory_order_release);
         g_stats.End(!hit);
