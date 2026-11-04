@@ -279,6 +279,8 @@ Fetch DecodeFetch(const uint32_t* w)
         f.srcSwizzle = Bits(w[0], 26, 6);
         f.dimension = Bits(w[2], 14, 2);
         f.magFilter = Bits(w[1], 12, 2);
+        f.useComputedLod = Bits(w[1], 28, 1);
+        f.useRegisterLod = Bits(w[1], 29, 1);
         f.lodBias = float(int32_t(Bits(w[2], 2, 7) << 25) >> 25) / 16.0f;
         f.offsetX = float(int32_t(Bits(w[2], 16, 5) << 27) >> 27) * 0.5f;
         f.offsetY = float(int32_t(Bits(w[2], 21, 5) << 27) >> 27) * 0.5f;

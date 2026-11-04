@@ -210,6 +210,7 @@ float3 CubeDirection(float3 stf)
 }
 
 float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel);
+static bool gLevelWrap = false; // a pixel fetch at a given level: wrap as the constant says (the vertex path clamps)
 static int gFilterOverride = -1; // the fetch instruction's filter (0 point, 1 linear), -1 the constant's
 // The sampler for a fetch: the constant's mode (0 linear wrap, 1 linear clamp, 2 point clamp, 3 point
 // wrap), its filter replaced by the instruction's when it has one.
@@ -338,6 +339,8 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
         return t.SampleLevel(sPointClamp, uv, max(bias, 0));
     if (vertexStage && mode == 3)
         return t.SampleLevel(sPointWrap, uv, max(bias, 0));
+    if (vertexStage && gLevelWrap && mode == 0)
+        return t.SampleLevel(sLinearWrap, uv, max(bias, 0));
     if (vertexStage)
         return t.SampleLevel(sLinearClamp, uv, max(bias, 0));
     if (mode == 1) return REGPU_SAMPLE_BIAS_2D(t, sLinearClamp, uv, bias);
@@ -758,13 +761,20 @@ struct Emitter
             const std::string uv = f.dimension == 0 && !no1d ? "float3(" + reg + comp[f.srcSwizzle & 3] + ", 0.5, 0)"
                 : "float3(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ", " + reg +
                 comp[(f.srcSwizzle >> 4) & 3] + ")";
+            // setTexLOD's register and the instruction's LOD mode, as Xenia: without computed LOD the
+            // fetch samples the given level (TFetch's vertex path), with it the register adds to the bias.
+            // PGR4's buildings pick their reflection's blur this way; ignored, they reflected a sharp
+            // cube map. REGPU_NO_REGISTER_LOD=1: always computed, no register.
+            static const bool noRegisterLod = getenv("REGPU_NO_REGISTER_LOD") != nullptr;
+            const bool level = pixel && !noRegisterLod && !f.useComputedLod;
+            const std::string lod = !noRegisterLod && f.useRegisterLod ? "regLod + " : "";
             char call[320];
-            if (LeanFetch() && pixel && f.dimension == 1)
+            if (LeanFetch() && pixel && f.dimension == 1 && !level && lod.empty())
                 snprintf(call, sizeof(call), "TFetch2D(%u, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
                     f.denormalized ? "true" : "false", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
             else
-                snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
-                    f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
+                snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %s%.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
+                    f.denormalized ? "true" : "false", pixel && !level ? "false" : "true", lod.c_str(), f.lodBias, f.constIndex, f.offsetX, f.offsetY);
             // Declared, then assigned: fxc drops the value when the fetch initialises the declaration
             // in some shaders ("internal error: invalid access of unbound variable").
             // The instruction's own filter (mag filter 0 point, 1 linear) overrides the fetch constant's,
@@ -773,9 +783,14 @@ struct Emitter
             // came and went as the car moved a fraction of a texel. REGPU_NO_FETCH_FILTER_OVERRIDE=1: ignored.
             static const bool noOverride = getenv("REGPU_NO_FETCH_FILTER_OVERRIDE") != nullptr;
             const bool overrides = !noOverride && (f.magFilter == 0 || f.magFilter == 1);
-            body = std::string("{ float4 t; ") + (overrides ? "gFilterOverride = " + std::to_string(f.magFilter) + "; " : "") + "t = " + call + "; " +
-                (overrides ? "gFilterOverride = -1; " : "") + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+            body = std::string("{ float4 t; ") + (level ? "gLevelWrap = true; " : "") + (overrides ? "gFilterOverride = " + std::to_string(f.magFilter) + "; " : "") + "t = " + call + "; " +
+                (overrides ? "gFilterOverride = -1; " : "") + (level ? "gLevelWrap = false; " : "") + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
             result.usedTextureSlots |= 1u << f.constIndex;
+        }
+        else if (f.opcode == 24)
+        {
+            // setTexLOD: the level (or added bias) for later fetches.
+            body = "regLod = r[" + std::to_string(f.src) + "]." + "xyzw"[f.srcSwizzle & 3] + ";";
         }
         else if (f.opcode == 18 && pixel)
         {
@@ -1215,7 +1230,7 @@ TranslatedShader TranslateShader(const Shader& shader)
             decl += "    float4 r" + std::to_string(n) + " = 0;\n";
         h += "void GuestVS(uint vindex, out float4 opos, out float4 o[16], out float4 opts)\n{\n" + decl +
              "    [unroll] for (int j = 0; j < 16; j++) o[j] = 0;\n"
-             "    r0.x = float(vindex); opos = float4(0, 0, 0, 1); opts = 0; float ps = 0; bool p = false; int a0 = 0, aL = 0;\n" +
+             "    r0.x = float(vindex); opos = float4(0, 0, 0, 1); opts = 0; float ps = 0, regLod = 0; bool p = false; int a0 = 0, aL = 0;\n" +
              std::string(e.saveFetchIndex ? "    float vfi = 0; // the index of the last full vertex fetch, for its mini fetches\n" : "");
         h += e.out;
         h += "}\n"
@@ -1378,7 +1393,7 @@ TranslatedShader TranslateShader(const Shader& shader)
                 inputs += "    if (pinfo.y == " + std::to_string(n) + "u) r" + std::to_string(n) + " = float4(((pinfo.z & 65536u) ? floor(input.pos.xy) : input.pos.xy) * pinfo2.yz, input.pcoord);\n";
         h += decl +
              "    float4 oC[4]; [unroll] for (int k = 0; k < 4; k++) oC[k] = 0;\n"
-             "    float ps = 0; bool p = false; int a0 = 0, aL = 0;\n" + inputs;
+             "    float ps = 0, regLod = 0; bool p = false; int a0 = 0, aL = 0;\n" + inputs;
         h += e.out;
         h += "    switch (pinfo.x)\n    {\n"
              "    case 0: discard; break;\n"
