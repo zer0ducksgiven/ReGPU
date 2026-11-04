@@ -4,6 +4,7 @@
 // whose shade pulses with the frame count, proving the path end to end.
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -94,6 +95,38 @@ ComPtr<ID3D12Device> g_device;
 ComPtr<ID3D12CommandQueue> g_queue;
 std::atomic<bool> g_rendererActive{ false };
 
+// The GPU to draw on: the high-performance one. On a laptop with two (NVIDIA Optimus, AMD switchable
+// graphics) Direct3D's default adapter is the integrated GPU unless the executable exports
+// NvOptimusEnablement / AmdPowerXpressRequestHighPerformance, which a plugin DLL cannot do for its host.
+// REGPU_ADAPTER=<n> picks the n-th adapter in that order instead (0 is the first). Null when none
+// makes a feature level 12.0 device: D3D12CreateDevice then takes the default.
+ComPtr<IDXGIAdapter1> PickAdapter()
+{
+    ComPtr<IDXGIFactory6> factory;
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))))
+        return nullptr;
+    const char* wanted = getenv("REGPU_ADAPTER");
+    const int pick = wanted && *wanted ? atoi(wanted) : -1;
+    ComPtr<IDXGIAdapter1> chosen;
+    for (UINT i = 0;; i++)
+    {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (FAILED(factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter))))
+            break;
+        DXGI_ADAPTER_DESC1 desc{};
+        adapter->GetDesc1(&desc);
+        char name[128] = {};
+        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+        const bool software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE;
+        const bool usable = !software && SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr));
+        Log("presenter: adapter %u: %s (vendor %04X, %llu MB dedicated)%s", i, name, desc.VendorId,
+            (unsigned long long)(desc.DedicatedVideoMemory >> 20), software ? ", software" : usable ? "" : ", no feature level 12.0");
+        if (usable && !chosen && (pick < 0 || int(i) == pick))
+            chosen = adapter;
+    }
+    return chosen;
+}
+
 void EnsureDevice()
 {
     std::lock_guard lock(g_deviceMutex);
@@ -132,7 +165,18 @@ void EnsureDevice()
             Log("presenter: device-removed breadcrumbs and page-fault reporting on (REGPU_DRED)");
         }
     }
-    Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device)), "D3D12CreateDevice");
+    ComPtr<IDXGIAdapter1> adapter = PickAdapter();
+    Check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device)), "D3D12CreateDevice");
+    if (adapter)
+    {
+        DXGI_ADAPTER_DESC1 desc{};
+        adapter->GetDesc1(&desc);
+        char name[128] = {};
+        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+        Log("presenter: drawing on %s", name);
+    }
+    else
+        Log("presenter: drawing on the default adapter");
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     Check(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue)), "CreateCommandQueue");
