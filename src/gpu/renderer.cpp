@@ -10182,6 +10182,20 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // The game asked for the colour target to be cleared before this draw (Host::clearBeforeDraw).
     if (clearBefore)
         C().list->ClearRenderTargetView(C().rtv, clearColour, 1, &hostScissor);
+    // The EDRAM is one memory: a depth-only draw (mode 5) writing depth and stencil FF at the colour
+    // surface's own base leaves its tiles reading white as colour. FH1 starts its night light buffer
+    // this way (a rectangle at depth 1): left black, every pixel decoded as full light.
+    // REGPU_NO_ALIASED_DEPTH_FILL=1: colour keeps its contents (A/B).
+    {
+        static LiveSwitch noAliasedFill("REGPU_NO_ALIASED_DEPTH_FILL");
+        const uint32_t depthControl = gpureg::Get(RB_DEPTHCONTROL);
+        if (!noAliasedFill && (gpureg::Get(RB_MODECONTROL) & 7) == 5 && (depthControl & 7) == 7 && ((depthControl >> 4) & 7) == 7 &&
+            (gpureg::Get(RB_STENCILREFMASK) & 0xFF) == 0xFF && ((gpureg::Get(RB_COLOR_INFO) ^ gpureg::Get(RB_DEPTH_INFO)) & 0xFFF) == 0)
+        {
+            const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+            C().list->ClearRenderTargetView(C().rtv, white, 1, &hostScissor);
+        }
+    }
     {
         // RB_BLEND_RED..ALPHA: the constant colour for blend factors 12-15.
         const float factor[4] = { RegFloat(0x2105), RegFloat(0x2106), RegFloat(0x2107), RegFloat(0x2108) };
