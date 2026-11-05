@@ -28,6 +28,8 @@ constexpr UINT kWidth = 1280, kHeight = 720;
 struct Presenter
 {
     HWND window = nullptr;
+    HWND surface = nullptr; // the child window holding the swap chain (not with Config::hostWindow)
+    std::atomic<bool> fullscreen{ false };
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<IDXGISwapChain3> swapChain;
@@ -62,8 +64,12 @@ void RenderSize(uint32_t& width, uint32_t& height)
 namespace
 {
 
+void LayoutSurface();
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (msg == WM_SIZE && hwnd == g_p.window)
+        LayoutSurface();
     if (msg == WM_CLOSE)
     {
         Log("presenter: window closed, exiting");
@@ -160,6 +166,28 @@ void SizeWindow(HWND hwnd, uint32_t width, uint32_t height)
     Log("presenter: window client %ux%u", width, height);
 }
 
+// The swap chain's child window in its parent: fullscreen, the largest rectangle of the output's aspect
+// ratio, centred (the parent's black background shows around it, and other windows cannot cover the
+// bars); windowed, the whole client area (the picture stretches with the window).
+void LayoutSurface()
+{
+    if (!g_p.surface)
+        return;
+    RECT c{};
+    GetClientRect(g_p.window, &c);
+    LONG cw = c.right, ch = c.bottom, w = cw, h = ch;
+    const Settings& st = GetSettings();
+    if (g_p.fullscreen && st.width && st.height)
+    {
+        if (int64_t(cw) * st.height > int64_t(ch) * st.width)
+            w = LONG(int64_t(ch) * st.width / st.height);
+        else
+            h = LONG(int64_t(cw) * st.height / st.width);
+    }
+    const bool own = GetWindowThreadProcessId(g_p.surface, nullptr) == GetCurrentThreadId();
+    SetWindowPos(g_p.surface, nullptr, (cw - w) / 2, (ch - h) / 2, w, h, SWP_NOZORDER | SWP_NOACTIVATE | (own ? 0u : UINT(SWP_ASYNCWINDOWPOS)));
+}
+
 void CreateWindowAndDevice()
 {
     // Physical pixels for the window ReGPU opens (an unaware window at 125% scaling would be stretched).
@@ -179,7 +207,6 @@ void CreateWindowAndDevice()
     // swap chain stretches to the window.
     const Settings& settings = GetSettings();
     const uint32_t outW = settings.width, outH = settings.height;
-    HWND surface = nullptr;
     if (settings.hostWindow)
     {
         // The host's window (Config::hostWindow): the swap chain goes straight onto it, and it
@@ -189,18 +216,10 @@ void CreateWindowAndDevice()
     }
     else if (settings.fullscreen)
     {
-        // Borderless window over the whole display; its black background shows around the picture.
-        // The picture (the swap chain) is a child window: the largest rectangle of the chosen
-        // aspect ratio, centred. Other windows cannot cover the black bars this way.
+        // Borderless window over the whole display; the picture is its child window (LayoutSurface).
         const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+        g_p.fullscreen = true;
         g_p.window = CreateWindowExW(0, L"regpu", GetSettings().windowTitle.c_str(), WS_POPUP | WS_VISIBLE, 0, 0, sw, sh, nullptr, nullptr, wc.hInstance, nullptr);
-        LONG w = sw, h = sh;
-        if (int64_t(sw) * outH > int64_t(sh) * outW)
-            w = LONG(int64_t(sh) * outW / outH);
-        else
-            h = LONG(int64_t(sw) * outH / outW);
-        surface = CreateWindowExW(0, L"regpu", nullptr, WS_CHILD | WS_VISIBLE, (sw - w) / 2, (sh - h) / 2, w, h,
-            g_p.window, nullptr, wc.hInstance, nullptr);
     }
     else
     {
@@ -210,6 +229,21 @@ void CreateWindowAndDevice()
         SizeWindow(g_p.window, outW, outH);
         ShowWindow(g_p.window, SW_SHOW);
     }
+    // The swap chain goes on the window itself, except fullscreen at an aspect ratio other than the display's:
+    // there the picture is a child window between black bars (LayoutSurface). A child covering the whole window
+    // showed black in fullscreen while focused on an AMD card (FM2 report #59). Switching live (SetFullscreen)
+    // into fullscreen at another aspect ratio stretches the picture until the next start.
+    if (!settings.hostWindow && settings.fullscreen)
+    {
+        RECT client{};
+        GetClientRect(g_p.window, &client);
+        if (int64_t(client.right) * outH != int64_t(client.bottom) * outW)
+        {
+            g_p.surface = CreateWindowExW(0, L"regpu", nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, g_p.window, nullptr, wc.hInstance, nullptr);
+            LayoutSurface();
+        }
+    }
+    Log("presenter: picture in %s", g_p.surface ? "a child window (black bars)" : "the game window");
 
     ComPtr<IDXGIFactory4> factory;
     Check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
@@ -228,7 +262,7 @@ void CreateWindowAndDevice()
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     ComPtr<IDXGISwapChain1> sc1;
-    Check(factory->CreateSwapChainForHwnd(g_p.queue.Get(), surface ? surface : g_p.window, &sd, nullptr, nullptr, &sc1), "CreateSwapChainForHwnd");
+    Check(factory->CreateSwapChainForHwnd(g_p.queue.Get(), g_p.surface ? g_p.surface : g_p.window, &sd, nullptr, nullptr, &sc1), "CreateSwapChainForHwnd");
     Check(sc1.As(&g_p.swapChain), "IDXGISwapChain3");
     factory->MakeWindowAssociation(g_p.window, DXGI_MWA_NO_ALT_ENTER);
 
@@ -404,6 +438,32 @@ void PresenterResize(uint32_t width, uint32_t height)
         g_p.device->CreateRenderTargetView(g_p.backBuffers[i].Get(), nullptr, h);
     }
     Log("presenter: swap chain %ux%u", width, height);
+    LayoutSurface(); // (fullscreen: the bars follow the new aspect ratio)
+}
+
+void regpu::SetFullscreen(bool on)
+{
+    if (!g_p.window || GetSettings().hostWindow || g_p.fullscreen == on)
+        return;
+    g_p.fullscreen = on;
+    GetSettings().fullscreen = on;
+    if (on)
+    {
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfoW(MonitorFromWindow(g_p.window, MONITOR_DEFAULTTONEAREST), &mi);
+        if (IsZoomed(g_p.window))
+            ShowWindowAsync(g_p.window, SW_RESTORE);
+        SetWindowLongW(g_p.window, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(g_p.window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+            mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+    }
+    else
+    {
+        SetWindowLongW(g_p.window, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPos(g_p.window, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+        SizeWindow(g_p.window, GetSettings().width, GetSettings().height);
+    }
+    Log("presenter: %s (live)", on ? "fullscreen" : "windowed");
 }
 
 void regpu::SetWindowSize(uint32_t width, uint32_t height)

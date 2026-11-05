@@ -588,7 +588,7 @@ struct Renderer
     ComPtr<ID3D12PipelineState> depthBlit;                // depth buffer -> R32_FLOAT
     ComPtr<ID3D12PipelineState> depthPackBlit;            // depth and stencil -> the guest's D24S8 words as RGBA8
     ComPtr<ID3D12PipelineState> colorBlit8, colorBlit16;  // colour -> 8888 / RGBA16F, scaled
-    ComPtr<ID3D12PipelineState> depthBlitMs, colorBlitMs8, colorBlitMs16; // the same from multisampled surfaces
+    ComPtr<ID3D12PipelineState> depthBlitMs[9], colorBlitMs8[9], colorBlitMs16[9]; // the same from multisampled surfaces, by sample count
     // EDRAM surfaces: one host colour and one host depth target per EDRAM base
     // (RB_COLOR_INFO / RB_DEPTH_INFO bits 0-11), so passes that the title
     // places at different EDRAM offsets do not overwrite each other.
@@ -684,6 +684,13 @@ D3D12_GPU_DESCRIPTOR_HANDLE SamplerTable()
 }
 
 std::atomic<uint64_t> g_outputRequest{ 0 }; // regpu::SetOutputSize: width << 32 | height, 0 none (ApplyOutputSize)
+std::atomic<uint32_t> g_msaaRequest{ 0 };   // regpu::SetMsaa: samples, 0 none (ApplyMsaa)
+std::atomic<uint32_t> g_pipelineGen{ 0 };   // bumped when every pipeline is replaced (ApplyMsaa): GetPipeline's caches start over
+}
+
+void regpu::SetMsaa(uint32_t samples)
+{
+    g_msaaRequest.store(samples ? samples : 1, std::memory_order_relaxed);
 }
 
 void regpu::SetAnisotropy(int maxAnisotropy)
@@ -1553,22 +1560,25 @@ bool PhysicalHeapAliasesGuest(ID3D12Device* d, ID3D12Resource* physical)
 // Depth resolves: a depth-stencil buffer can only be copied whole, so the
 // resolve rectangle is drawn into an R32_FLOAT texture by a tiny pass that
 // reads the depth buffer at the same pixel.
+// The highest sample count up to want that the device supports for both the colour and depth formats (1 when none).
+uint32_t SupportedMsaa(uint32_t want)
+{
+    for (want = want > 8 ? 8 : want; want > 1; want /= 2)
+    {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS colour{ kColorFormat, want }, depth{ DXGI_FORMAT_D32_FLOAT_S8X24_UINT, want };
+        if (SUCCEEDED(g_r.device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &colour, sizeof colour)) && colour.NumQualityLevels &&
+            SUCCEEDED(g_r.device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &depth, sizeof depth)) && depth.NumQualityLevels)
+            return want;
+    }
+    return 1;
+}
+
 void InitDepthBlit()
 {
     auto* d = g_r.device;
     // Anti-aliasing: the highest sample count the setting asks for that the device supports
     // for both the colour and depth formats (1 when none).
-    g_msaa = 1;
-    for (uint32_t want = GetSettings().msaa; want > 1; want /= 2)
-    {
-        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS colour{ kColorFormat, want }, depth{ DXGI_FORMAT_D32_FLOAT_S8X24_UINT, want };
-        if (SUCCEEDED(d->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &colour, sizeof colour)) && colour.NumQualityLevels &&
-            SUCCEEDED(d->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &depth, sizeof depth)) && depth.NumQualityLevels)
-        {
-            g_msaa = want;
-            break;
-        }
-    }
+    g_msaa = SupportedMsaa(GetSettings().msaa);
     Log("renderer: anti-aliasing %ux (setting %u)", g_msaa, GetSettings().msaa);
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -1681,10 +1691,13 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlit8)), "CreateGraphicsPipelineState(colour blit 8)");
     pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlit16)), "CreateGraphicsPipelineState(colour blit 16)");
-    if (g_msaa > 1)
+    // The same passes reading a multisampled surface, for each supported sample count (regpu::SetMsaa can
+    // change it while the game runs): depth takes sample 0, colour averages all samples.
+    for (uint32_t samples = 2; samples <= 8; samples *= 2)
     {
-        // The same passes reading a multisampled surface: depth takes sample 0, colour averages all samples.
-        const std::string msSource = "#define SAMPLES " + std::to_string(g_msaa) + R"(
+        if (SupportedMsaa(samples) != samples)
+            continue;
+        const std::string msSource = "#define SAMPLES " + std::to_string(samples) + R"(
 Texture2DMS<float, SAMPLES> depthMs : register(t0);
 Texture2DMS<float4, SAMPLES> colorMs : register(t0);
 cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; };
@@ -1733,12 +1746,12 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
         pd.VS = { msVs->GetBufferPointer(), msVs->GetBufferSize() };
         pd.PS = { msPs->GetBufferPointer(), msPs->GetBufferSize() };
         pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
-        Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.depthBlitMs)), "CreateGraphicsPipelineState(depth blit ms)");
+        Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.depthBlitMs[samples])), "CreateGraphicsPipelineState(depth blit ms)");
         pd.PS = { msColor->GetBufferPointer(), msColor->GetBufferSize() };
         pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlitMs8)), "CreateGraphicsPipelineState(colour blit ms 8)");
+        Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlitMs8[samples])), "CreateGraphicsPipelineState(colour blit ms 8)");
         pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlitMs16)), "CreateGraphicsPipelineState(colour blit ms 16)");
+        Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlitMs16[samples])), "CreateGraphicsPipelineState(colour blit ms 16)");
     }
 }
 
@@ -2070,24 +2083,19 @@ FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
 // the EDRAM surfaces (made at the output size on first use) are dropped and come back at the new size,
 // as do the frame readback, the upscaler's images and the swap chain. Resolved images take their new
 // size at their next resolve. The guest redraws every surface it uses each frame.
-void ApplyOutputSize()
+// Every frame in flight may still use the old surfaces and pipelines: waits for them.
+void WaitGpuIdle()
 {
-    const uint64_t request = g_outputRequest.exchange(0);
-    if (!request || !g_r.ok)
-        return;
-    Settings& st = GetSettings();
-    const uint32_t w = uint32_t(request >> 32), h = uint32_t(request);
-    if (w == st.width && h == st.height)
-        return;
-    // Every frame in flight may still use the old surfaces.
     if (const UINT64 last = g_r.nextFence - 1; g_r.fence->GetCompletedValue() < last)
     {
         g_r.fence->SetEventOnCompletion(last, g_r.fenceEvent);
         WaitForSingleObject(g_r.fenceEvent, INFINITE);
     }
-    st.width = w;
-    st.height = h;
-    LoadOutputSize();
+}
+
+// The EDRAM surfaces are dropped and made again on their next use (a new size or sample count).
+void DropSurfaces()
+{
     {
         // Released with this frame, not now: until the frame start rebinds (SelectSurfaces), commands
         // still name the old surfaces' views (releasing them here crashed the replay thread).
@@ -2102,6 +2110,22 @@ void ApplyOutputSize()
     C().colorBase = C().depthBase = ~0u; // nothing bound: the frame start selects the new surfaces
     C().color.Reset();
     C().depth.Reset();
+}
+
+void ApplyOutputSize()
+{
+    const uint64_t request = g_outputRequest.exchange(0);
+    if (!request || !g_r.ok)
+        return;
+    Settings& st = GetSettings();
+    const uint32_t w = uint32_t(request >> 32), h = uint32_t(request);
+    if (w == st.width && h == st.height)
+        return;
+    WaitGpuIdle();
+    st.width = w;
+    st.height = h;
+    LoadOutputSize();
+    DropSurfaces();
     g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     g_upscale.depth.Reset();
     g_upscale.motion.Reset();
@@ -2110,6 +2134,33 @@ void ApplyOutputSize()
     g_upscale.reset = true;
     PresenterResize(OutputWidth(), OutputHeight());
     Log("renderer: output %ux%u (live)", OutputWidth(), OutputHeight());
+}
+
+// A new anti-aliasing sample count (regpu::SetMsaa), taken at the start of a frame with the host GPU idle:
+// the surfaces come back with the new count, and every pipeline is built again for it (a pipeline's
+// sample count is fixed). Pipelines still building keep their old entries alive (retired, never freed).
+void ApplyMsaa()
+{
+    const uint32_t request = g_msaaRequest.exchange(0);
+    if (!request || !g_r.ok)
+        return;
+    GetSettings().msaa = request;
+    const uint32_t samples = SupportedMsaa(request);
+    if (samples == g_msaa)
+        return;
+    WaitGpuIdle();
+    DropSurfaces();
+    {
+        static std::vector<std::shared_ptr<PipelineEntry>> retired;
+        std::lock_guard shaderLock(g_shaderMutex);
+        for (auto& [key, entry] : g_r.pipelines)
+            retired.push_back(std::move(entry));
+        g_r.pipelines.clear();
+        g_msaa = samples;
+        g_pipelineGen++;
+    }
+    g_upscale.reset = true;
+    Log("renderer: anti-aliasing %ux (live)", g_msaa);
 }
 
 void TransitionColor(D3D12_RESOURCE_STATES to);
@@ -2473,6 +2524,7 @@ void BeginFrameIfNeeded()
     }
     f.garbage.clear();
     ApplyOutputSize(); // (a new resolution: between frames)
+    ApplyMsaa();
     void FinishDeferredWritebacks(UINT frameIndex);
     FinishDeferredWritebacks(UINT(&f - g_r.frames)); // this slot's previous frame has completed
     static LiveSwitch perf("REGPU_PERF");
@@ -4721,10 +4773,17 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         key.flags |= 4;
     if (stripCut)
         key.flags |= 0x100; // strips restart at index 0xFFFF (DrawImpl)
-    thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (pipelines are never removed)
+    thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (cleared when the pipelines are replaced: g_pipelineGen)
     // Runs of draws share a pipeline: the last one's answer first, before the map.
     thread_local PipelineKey lastKey{};
     thread_local ID3D12PipelineState* lastPso = nullptr;
+    thread_local uint32_t gen = 0;
+    if (const uint32_t now = g_pipelineGen.load(std::memory_order_acquire); now != gen)
+    {
+        gen = now;
+        ready.clear();
+        lastPso = nullptr;
+    }
     if (lastPso && memcmp(&key, &lastKey, sizeof(key)) == 0)
         return lastPso;
     if (auto r = ready.find(key); r != ready.end())
@@ -6253,9 +6312,9 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     C().list->ResourceBarrier(barriers, b);
 
     const bool ms = g_msaa > 1;
-    ID3D12PipelineState* pso = depth ? (ms ? g_r.depthBlitMs.Get() : g_r.depthBlit.Get())
-        : format == DXGI_FORMAT_R8G8B8A8_UNORM ? (ms ? g_r.colorBlitMs8.Get() : g_r.colorBlit8.Get())
-        : (ms ? g_r.colorBlitMs16.Get() : g_r.colorBlit16.Get());
+    ID3D12PipelineState* pso = depth ? (ms ? g_r.depthBlitMs[g_msaa].Get() : g_r.depthBlit.Get())
+        : format == DXGI_FORMAT_R8G8B8A8_UNORM ? (ms ? g_r.colorBlitMs8[g_msaa].Get() : g_r.colorBlit8.Get())
+        : (ms ? g_r.colorBlitMs16[g_msaa].Get() : g_r.colorBlit16.Get());
     C().list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     C().list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
     C().list->SetPipelineState(pso);

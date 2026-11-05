@@ -184,6 +184,13 @@ void SetOutputSize(uint32_t width, uint32_t height);
 // Not shrunk to fit the screen; kept with its title bar on it. Maximised or fullscreen: unchanged.
 // Works on Config::hostWindow too.
 void SetWindowSize(uint32_t width, uint32_t height);
+// Borderless fullscreen on the window's display, or a window again (at the output size), while the game
+// runs. Config::fullscreen is the starting mode. Not with Config::hostWindow (the host owns its window).
+void SetFullscreen(bool on);
+// The anti-aliasing sample count while the game runs (Config's msaa at start): taken at the start of the
+// next frame with the host GPU idle; the surfaces are rebuilt and every pipeline is built again for the
+// new count (a hitch while they compile). Lowered to what the device supports.
+void SetMsaa(uint32_t samples);
 // Changes the frame cap and vsync while the game runs (a host's options screen); Config's maxFps
 // and vsync are the starting values.
 void SetFrameLimit(uint32_t maxFps, bool vsync);
