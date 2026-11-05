@@ -23,6 +23,7 @@ enum Format : uint32_t
     k_DXT1 = 18,
     k_DXT2_3 = 19,
     k_DXT4_5 = 20,
+    k_16 = 24, // one channel, 8-bit fallback (FH1's headlight falloff table)
     k_16_16_16_16_FLOAT = 32, // half floats; uploaded as they are (lookup tables, HDR data)
     k_DXN = 49,   // two interpolated channels (BC5): normal maps
     k_DXT5A = 59, // one interpolated channel (BC4-like), 8-byte blocks
@@ -42,6 +43,7 @@ bool Info(uint32_t format, FormatInfo& out)
     case k_1_5_5_5:
     case k_5_6_5:
     case k_8_8:
+    case k_16:
     case k_4_4_4_4: out = { 1, 1 }; return true;
     case k_8_8_8_8: out = { 1, 2 }; return true;
     case k_DXT1: out = { 4, 3 }; return true;
@@ -229,6 +231,10 @@ void DecodeTexel(uint32_t format, const uint8_t* t, uint8_t* out)
         out[0] = out[1] = out[2] = t[0];
         out[3] = 255;
         break;
+    case k_16:
+        out[0] = out[1] = out[2] = t[1]; // the high byte (little-endian after the swap)
+        out[3] = 255;
+        break;
     case k_8_8:
         out[0] = t[0];
         out[1] = t[1];
@@ -315,6 +321,7 @@ const char* TextureFormatName(uint32_t format)
     case k_5_6_5: return "565";
     case k_8_8_8_8: return "8888";
     case k_8_8: return "88";
+    case k_16: return "16";
     case k_4_4_4_4: return "4444";
     case k_DXT1: return "DXT1";
     case k_DXT2_3: return "DXT3";
