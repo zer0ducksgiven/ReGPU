@@ -409,6 +409,7 @@ struct ResolvedTexture
     bool stale = false;
     uint32_t guestBpp = 4; // bytes per pixel of the guest image: the hash covers only its memory
     uint32_t guestFormat = 0; // the copy's destination format (RB_COPY_DEST_INFO bits 7-12)
+    bool plain8888 = false; // copied from a k_8_8_8_8 surface to a k_8_8_8_8 image: its bytes aren't gamma (see the gamma-signed fetches)
     // The title resolves differently sized images (bloom chain) to one address within a
     // frame: keep earlier sizes here and swap them in rather than recreating them.
     std::vector<ResolvedTexture> spares;
@@ -6974,6 +6975,7 @@ void Resolve()
             UpscaleScene(base);
         g_r.resolved[base].swapped = swapRB;
         g_r.resolved[base].guestFormat = depth ? 0u : destFormat;
+        g_r.resolved[base].plain8888 = !depth && destFormat == 6 && ((gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF) == 0;
         // Images the game reads on the CPU are also written to memory (regpu.h Host::resolveWriteback;
         // without it, REGPU_RESOLVE_WRITEBACK's "WxH,WxH" sizes of 8888 colour, at once).
         regpu::Writeback request;
@@ -9947,6 +9949,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 if (sel < 4 && ((fetch.dwords[0] >> (2 + 2 * sel)) & 3) == 3)
                     gammaMask |= 1u << c;
             }
+            // A gamma-signed fetch of an image copied from a plain k_8_8_8_8 surface reads it as it is. FH1's menu
+            // videos draw to one and grade it with such a fetch: decoded, their dark half came out far below stock's
+            // (FH1R #685), and cancelling the decode matched stock's curve. REGPU_PLAIN_RESOLVE_GAMMA=1: decoded.
+            static LiveSwitch plainGamma("REGPU_PLAIN_RESOLVE_GAMMA");
+            if (resolvedPtr && resolvedPtr->plain8888 && !plainGamma)
+                gammaMask = 0;
             ti[0] |= gammaMask << 24;
         }
         if (!clamp && !oldClamp)
