@@ -81,6 +81,14 @@ void RendererOcclusionBegin();
 // The query's samples that passed and, as the console's Total, the samples its draws covered, as
 // counted for the last finished query that wrote its counts to `address` (RB_SAMPLE_COUNT_ADDR).
 bool RendererOcclusionEnd(uint32_t& samples, uint32_t& total, uint32_t address);
+// The same, split for queries whose draws are logged for the draw workers (gpu.cpp, seg): the command
+// processor takes the query's order (BeginLogged, ~0u: none) and its answer (Answer, which also gives its
+// place among the queries to `address`); the thread that replays the draws records the D3D query around
+// them (BeginOn, EndOn; EndOn with address 0 cuts it short without a result).
+uint32_t RendererOcclusionBeginLogged();
+bool RendererOcclusionAnswer(uint32_t& samples, uint32_t& total, uint32_t address, uint32_t order, uint32_t& kindOrder);
+void RendererOcclusionBeginOn(uint32_t order);
+void RendererOcclusionEndOn(uint32_t address, uint32_t kindOrder);
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.
 void RendererTrackTile(RendererTile& tile);
 void RendererSetTile(const RendererTile& tile);

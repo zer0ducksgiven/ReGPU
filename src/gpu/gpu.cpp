@@ -224,7 +224,7 @@ void OrderedStore(uint32_t address, uint32_t value);
 // (RendererRunPieces). REGPU_DRAW_WORKERS=0 turns it off.
 namespace seg
 {
-enum : uint32_t { kRegs = 1, kShader, kDraw };
+enum : uint32_t { kRegs = 1, kShader, kDraw, kQuery };
 constexpr uint32_t kSnapEvery = 128;
 struct Snapshot
 {
@@ -240,6 +240,10 @@ std::vector<uint32_t> g_log;
 std::vector<Snapshot> g_snaps;
 size_t g_snapCount = 0; // used entries of g_snaps (kept allocated)
 uint32_t g_draws = 0;
+uint32_t g_sinceSnap = 0; // draws logged since the last snapshot
+// A logged occlusion query is open (its begin is in the log): no snapshot until its end, so a piece
+// never starts inside it and the query's D3D begin and end land in the same piece's list.
+bool g_queryLogged = false;
 // The command processor's view: the shaders last loaded and the tile state.
 std::vector<uint32_t> g_vs, g_ps;
 uint32_t g_vsAddress = 0, g_psAddress = 0;
@@ -295,6 +299,12 @@ void Replay(size_t first, size_t endPos)
         case kShader:
             FrameOnShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
             break;
+        case kQuery:
+            if (a[0] == 0)
+                RendererOcclusionBeginOn(a[1]);
+            else
+                RendererOcclusionEndOn(a[1], a[2]);
+            break;
         case kDraw:
         {
             const int32_t rect[4] = { int32_t(a[4]), int32_t(a[5]), int32_t(a[6]), int32_t(a[7]) };
@@ -317,13 +327,20 @@ void Replay(size_t first, size_t endPos)
 std::vector<uint32_t> g_sizes, g_lastSizes; // draws of each segment this frame / the last
 uint32_t g_index = 0;                        // the segment the next draw belongs to
 uint32_t g_directDraws = 0;                  // draws of the current segment drawn straight away
+// An occlusion query begun outside a logged segment is open: its draws go straight to the renderer, in
+// stream order on the command processor's list where the query began (a D3D12 query can't span lists).
+bool g_query = false;
+uint32_t g_queryOrder = ~0u; // the open logged query's order (RendererOcclusionBeginLogged)
+bool g_queryWasLogged = false; // the open query began in the log (its end is answered without the renderer's open query)
 constexpr uint32_t kParallelDraws = 2 * 96;  // fewer than this never make two pieces (Flush)
 
 // Whether the current segment's draws go straight to the renderer.
 bool Direct()
 {
     static LiveSwitch logAll("REGPU_LOG_ALL_SEGMENTS");
-    return !g_open && !logAll && g_index < g_lastSizes.size() && g_lastSizes[g_index] < kParallelDraws;
+    if (g_query)
+        return true;
+    return !g_open &&!logAll && g_index < g_lastSizes.size() && g_lastSizes[g_index] < kParallelDraws;
 }
 
 // The current segment ends (logged or drawn straight away).
@@ -358,6 +375,12 @@ void EndFrame()
 // Translates the open segment (on the workers if it is large enough).
 void Flush()
 {
+    if (g_queryLogged) // cut inside a logged query: its D3D query ends with the piece (no result)
+    {
+        const uint32_t cut[3] = { 1, 0, 0 };
+        Append(kQuery, cut, 3);
+        g_queryLogged = false;
+    }
     EndSegment(g_open ? g_draws : g_directDraws);
     g_directDraws = 0;
     if (!g_open)
@@ -418,6 +441,7 @@ void Flush()
     g_log.clear();
     g_snapCount = 0;
     g_draws = 0;
+    g_sinceSnap = 0;
 }
 
 bool Enabled()
@@ -494,11 +518,13 @@ void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             RendererTrackTile(seg::g_tile);
             return;
         }
-        if (!seg::g_open || seg::g_draws % seg::kSnapEvery == 0)
+        if (!seg::g_open || (seg::g_sinceSnap >= seg::kSnapEvery && !seg::g_queryLogged))
         {
             seg::g_open = true;
             seg::TakeSnapshot();
+            seg::g_sinceSnap = 0;
         }
+        seg::g_sinceSnap++;
         const uint32_t a[8] = { initiator, dmaBase, dmaSize, widen, uint32_t(widenedRect[0]), uint32_t(widenedRect[1]), uint32_t(widenedRect[2]),
                                 uint32_t(widenedRect[3]) };
         seg::Append(seg::kDraw, a, 8);
@@ -1038,15 +1064,58 @@ uint32_t ExecutePacket(uint32_t ptr)
             logged++;
             Log("zpd: %08X %08X %08X %08X %08X %08X %08X %08X%s", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], end ? " (end)" : "");
         }
-        // Real counts when draws are recorded here in stream order (not with the draw thread
-        // or workers, whose lists the query would not wrap): the sun flare fades behind trees.
+        // Real counts when draws are recorded here in stream order: the sun flare fades behind trees,
+        // and lamp flares hide behind cars and walls. With draw workers the open segment is translated
+        // first and the query's draws then go straight to the renderer (seg::g_query). Not with the
+        // draw thread, whose list the query would not wrap.
         static LiveSwitch fake("REGPU_FAKE_OCCLUSION"); // A/B: the old fixed answer
-        const bool real = !fake && !work::Active() && !seg::Enabled();
+        const bool real = !fake && !work::Active();
         uint32_t samples = 1000, total = 1000;
-        if (real && !end)
+        // With draw workers: a query inside a logged segment goes into the log, recorded around its draws
+        // by whichever thread replays them, and is answered here; one outside keeps its draws on this
+        // thread until its end. REGPU_NO_LOGGED_QUERIES=1: every query flushes the segment (A/B).
+        static LiveSwitch noLogged("REGPU_NO_LOGGED_QUERIES");
+        if (real && seg::Enabled() && !end)
+        {
+            if (seg::g_open && !noLogged)
+            {
+                seg::g_queryOrder = RendererOcclusionBeginLogged();
+                const uint32_t rec[2] = { 0, seg::g_queryOrder };
+                seg::Append(seg::kQuery, rec, 2);
+                seg::g_queryLogged = seg::g_queryWasLogged = true;
+            }
+            else
+            {
+                // (Only a logged segment needs translating first: flushing a direct one would also end it,
+                // and the frame's segments would no longer line up with the last frame's sizes, Direct())
+                if (seg::g_open)
+                    seg::Flush();
+                seg::g_query = true;
+                seg::g_queryWasLogged = false;
+                RendererOcclusionBegin();
+            }
+        }
+        else if (real && seg::Enabled() && seg::g_queryWasLogged)
+        {
+            uint32_t kindOrder = 0;
+            if (!RendererOcclusionAnswer(samples, total, counts, seg::g_queryOrder, kindOrder))
+                samples = total = 1000;
+            if (seg::g_queryLogged) // (else cut short by a flush: no D3D query left to end)
+            {
+                const uint32_t rec[3] = { 1, counts, kindOrder };
+                seg::Append(seg::kQuery, rec, 3);
+            }
+            seg::g_queryLogged = seg::g_queryWasLogged = false;
+        }
+        else if (real && !end)
             RendererOcclusionBegin();
         else if (real && !RendererOcclusionEnd(samples, total, counts))
             samples = total = 1000; // no result yet (the first frames): fully visible
+        if (end)
+            seg::g_query = false;
+        static LiveSwitch fakeAnswer("REGPU_FAKE_OCCLUSION_ANSWER"); // queries recorded, answered 1000 (A/B)
+        if (fakeAnswer)
+            samples = total = 1000;
         memset(c, 0, 8 * 4);
         if (end)
         {

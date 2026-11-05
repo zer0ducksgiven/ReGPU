@@ -869,10 +869,14 @@ std::vector<int64_t> g_occlusionResult;              // by order in the frame: h
 std::vector<int64_t> g_occlusionCoverage;            // by order in the frame: host samples covered, -1 none
 std::map<std::pair<uint64_t, UINT>, std::pair<int64_t, int64_t>> g_occlusionByKind; // address, place: passed, covered (-1 none)
 std::unordered_map<uint64_t, UINT> g_occlusionKindCount; // this frame's queries so far, by address
-OcclusionParts g_occlusionCurrent;
+// The open query: per thread, as draw workers record queries in their own lists (seg, gpu.cpp).
+thread_local OcclusionParts g_occlusionCurrent;
 uint64_t g_occlusionFrame = ~0ull;
-UINT g_occlusionCount = 0, g_occlusionIndex = 0, g_occlusionOrder = 0, g_occlusionOrders = 0; // D3D queries used, open one, guest order, guest queries
-bool g_occlusionOpen = false;
+std::atomic<UINT> g_occlusionCount{ 0 };       // D3D queries used this frame (workers take them too)
+thread_local UINT g_occlusionIndex = 0;        // the open D3D query
+UINT g_occlusionOrder = 0, g_occlusionOrders = 0; // guest order, guest queries
+std::mutex g_occlusionPendingLock;              // g_occlusionPending, pushed to by workers
+thread_local bool g_occlusionOpen = false;
 std::map<std::string, std::pair<double, uint64_t>> g_passTotals; // ms, draws
 uint64_t g_passFrames = 0;
 ComPtr<ID3D12Resource> g_timestampReadback;
@@ -8177,7 +8181,7 @@ void SplitMainList()
         else
         {
             g_occlusionOpen = false; // out of D3D queries: what was counted so far is its result
-            g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent);
+            { std::lock_guard lock(g_occlusionPendingLock); g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent); }
         }
     }
 }
@@ -8225,7 +8229,7 @@ void SplitMainListAsync(bool submit)
         else
         {
             g_occlusionOpen = false;
-            g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent);
+            { std::lock_guard lock(g_occlusionPendingLock); g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent); }
         }
     }
 }
@@ -8256,19 +8260,29 @@ void WaitForQueueIdle()
     }
 }
 
+// A D3D query's count to the readback buffer. Resolved together at the frame's end (one copy over
+// the frame's range): a ResolveQueryData per query cost PGR4's Tokyo grid ~3% fps (148 -> 153).
+// REGPU_RESOLVE_EACH_QUERY=1: each as it ends, as before (A/B).
+void ResolveOcclusion(UINT index)
+{
+    static LiveSwitch each("REGPU_RESOLVE_EACH_QUERY");
+    if (each)
+        C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, index, 1, g_occlusionReadback.Get(), UINT64(index) * 8);
+}
+
 // Ends the open query's current D3D part (the guest query stays open).
 void EndOcclusionPart()
 {
     C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
-    C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex, 1, g_occlusionReadback.Get(), UINT64(g_occlusionIndex) * 8);
+    ResolveOcclusion(g_occlusionIndex);
 }
 
 void EndOcclusionQuery()
 {
     g_occlusionOpen = false;
     C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
-    C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex, 1, g_occlusionReadback.Get(), UINT64(g_occlusionIndex) * 8);
-    g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent);
+    ResolveOcclusion(g_occlusionIndex);
+    { std::lock_guard lock(g_occlusionPendingLock); g_occlusionPending[g_r.frameIndex].push_back(g_occlusionCurrent); }
 }
 
 // Deferred write-backs (regpu.h Writeback::Mode::Deferred): the requested part of a resolve is copied to
@@ -8918,7 +8932,9 @@ void RendererFenceWait(uint64_t value, void* event)
     WaitForSingleObject(HANDLE(event), 2000);
 }
 
-void RendererOcclusionBegin()
+// The command processor's side of a query's begin: the frame's counts, the heap, its order in the
+// frame. ~0u: none (out of D3D queries).
+uint32_t OcclusionPrepare()
 {
     if (!g_r.ok)
         Init();
@@ -8930,8 +8946,8 @@ void RendererOcclusionBegin()
         g_occlusionOrders = 0;
         g_occlusionKindCount.clear();
     }
-    if (g_occlusionOpen || g_occlusionCount + 4 > kOcclusionPerFrame)
-        return;
+    if (g_occlusionCount + 4 > kOcclusionPerFrame)
+        return ~0u;
     if (!g_occlusionHeap)
     {
         D3D12_QUERY_HEAP_DESC qd{};
@@ -8940,17 +8956,64 @@ void RendererOcclusionBegin()
         g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_occlusionHeap));
         g_occlusionReadback = CreateBuffer(8ull * kOcclusionPerFrame * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         if (!g_occlusionHeap || !g_occlusionReadback)
-            return;
+            return ~0u;
     }
     g_occlusionOrder = g_occlusionOrders++;
+    return g_occlusionOrder;
+}
+
+// The D3D query begins in this thread's list (the command processor's, or a draw worker's piece).
+void OcclusionRecordBegin(uint32_t order)
+{
     g_occlusionCurrent = {};
-    g_occlusionCurrent.order = g_occlusionOrder;
+    g_occlusionCurrent.order = order;
     g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
     g_occlusionCurrent.main.push_back(g_occlusionIndex);
     C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
     g_occlusionOpen = true;
+}
+
+void RendererOcclusionBegin()
+{
+    if (g_occlusionOpen)
+        return;
+    const uint32_t order = OcclusionPrepare();
+    if (order == ~0u)
+        return;
+    OcclusionRecordBegin(order);
     if (const uint64_t t = TraceFrame(); t && g_r.frame + 1 == t)
-        Log("occlusion query %u begins (draw #%u next)", g_occlusionOrder, g_r.drawsThisFrame.load() + 1);
+        Log("occlusion query %u begins (draw #%u next)", order, g_r.drawsThisFrame.load() + 1);
+}
+
+uint32_t RendererOcclusionBeginLogged()
+{
+    return OcclusionPrepare();
+}
+
+void RendererOcclusionBeginOn(uint32_t order)
+{
+    if (order != ~0u && !g_occlusionOpen)
+        OcclusionRecordBegin(order);
+}
+
+void RendererOcclusionEndOn(uint32_t address, uint32_t kindOrder)
+{
+    if (!g_occlusionOpen)
+        return;
+    g_occlusionCurrent.kind = address ? uint64_t(address) << 1 | 1 : 0; // 0: cut short, matches no query
+    g_occlusionCurrent.kindOrder = kindOrder;
+    EndOcclusionQuery();
+}
+
+bool OcclusionLookup(uint32_t& samples, uint32_t& total, UINT order, const std::pair<uint64_t, UINT>& kind);
+
+bool RendererOcclusionAnswer(uint32_t& samples, uint32_t& total, uint32_t address, uint32_t order, uint32_t& kindOrder)
+{
+    const uint64_t k = uint64_t(address) << 1 | 1;
+    kindOrder = g_occlusionKindCount[k]++;
+    if (order == ~0u)
+        return false;
+    return OcclusionLookup(samples, total, order, { k, kindOrder });
 }
 
 bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address);
@@ -9000,11 +9063,17 @@ bool OcclusionEndImpl(uint32_t& samples, uint32_t& total, uint32_t address)
 {
     if (!g_occlusionOpen)
         return false;
-    const UINT order = g_occlusionOrder;
+    const UINT order = g_occlusionCurrent.order;
     g_occlusionCurrent.kind = uint64_t(address) << 1 | 1;
     g_occlusionCurrent.kindOrder = g_occlusionKindCount[g_occlusionCurrent.kind]++;
     const std::pair<uint64_t, UINT> kind{ g_occlusionCurrent.kind, g_occlusionCurrent.kindOrder };
     EndOcclusionQuery();
+    return OcclusionLookup(samples, total, order, kind);
+}
+
+// The answer for a query: the last finished result of the same kind (address, place in the frame).
+bool OcclusionLookup(uint32_t& samples, uint32_t& total, UINT order, const std::pair<uint64_t, UINT>& kind)
+{
     // REGPU_OCCLUSION_BY_ORDER=1: answered by order in the frame, as before (A/B).
     static LiveSwitch byOrder("REGPU_OCCLUSION_BY_ORDER");
     int64_t passed = -1, covered = -1;
@@ -10721,7 +10790,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             C().list->SetPipelineState(coveragePso);
             issue();
             C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered);
-            C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, covered, 1, g_occlusionReadback.Get(), UINT64(covered) * 8);
+            ResolveOcclusion(covered);
             g_occlusionCurrent.coverage.push_back(covered);
             C().list->SetPipelineState(pso);
             g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionCount++;
@@ -11555,6 +11624,14 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     // ended after) made Close fail and removed the device. Its end then answers fully visible.
     if (g_occlusionOpen)
         EndOcclusionQuery();
+    // The frame's occlusion counts, in one copy (ResolveOcclusion): every query in the range has ended,
+    // in this list or one executed before it.
+    static LiveSwitch resolveEach("REGPU_RESOLVE_EACH_QUERY");
+    if (!resolveEach && g_occlusionHeap && g_occlusionFrame == g_r.frame && g_occlusionCount > 0)
+    {
+        const UINT first = g_r.frameIndex * kOcclusionPerFrame;
+        C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, first, g_occlusionCount, g_occlusionReadback.Get(), UINT64(first) * 8);
+    }
     C().list->Close();
     ID3D12CommandList* lists[] = { C().list->Real() };
     SubmitLists(1, lists);
