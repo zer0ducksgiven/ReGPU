@@ -30,6 +30,19 @@ struct TranslatedShader
     bool memExport = false;         // a vertex shader writing eA/eM (memory export): not translated, its writes are lost
     std::vector<uint32_t> vertexFetchConstants; // vertex shaders
     std::vector<std::array<uint32_t, 4>> vertexFetchLayout; // vfl[k] for each vertex fetch (see hlsl.cpp)
+    // Vertex shaders whose vertex fetch indices are simple arithmetic on the vertex index and constants
+    // (index = (vertex + c252.x) * c251.y: four corners per particle): the index expressions, and each
+    // fetch's {constant, stride, offset, expression}, so a draw can work out how much of a buffer its
+    // vertices reach (EvalReachNode). Empty when an index depends on anything else.
+    struct ReachNode
+    {
+        uint8_t op = 0; // ReachOp
+        uint8_t comp = 0; // constants: component
+        uint16_t a = 0, b = 0; // operands (node indices)
+        uint16_t reg = 0; // constants: float constant
+    };
+    std::vector<ReachNode> reachNodes;
+    std::vector<std::array<uint32_t, 4>> vertexFetchReach;
     // Float constants the code reads: c[0] up to this (exclusive), 256 with relative
     // addressing. Only these are uploaded per draw.
     uint32_t constantsUsed = 0;
@@ -41,6 +54,30 @@ struct TranslatedShader
 };
 
 TranslatedShader TranslateShader(const ucode::Shader& shader);
+enum ReachOp : uint8_t { ReachVertex, ReachConst, ReachAdd, ReachMul, ReachMax, ReachMin, ReachFloor, ReachTrunc, ReachNeg, ReachAbs, ReachRound };
+// A reach expression's value for one vertex index; constant(reg, comp) reads a float constant.
+template <typename Constant>
+float EvalReachNode(const std::vector<TranslatedShader::ReachNode>& nodes, uint32_t n, float vertex, const Constant& constant)
+{
+    const TranslatedShader::ReachNode& r = nodes[n];
+    auto at = [&](uint32_t i) { return EvalReachNode(nodes, i, vertex, constant); };
+    auto floorf = [](float x) { const float t = float(int64_t(x)); return t > x ? t - 1.0f : t; };
+    switch (r.op)
+    {
+    case ReachVertex: return vertex;
+    case ReachConst: return constant(r.reg, r.comp);
+    case ReachAdd: return at(r.a) + at(r.b);
+    case ReachMul: { const float x = at(r.a), y = at(r.b); return x == 0.0f || y == 0.0f ? 0.0f : x * y; }
+    case ReachMax: { const float x = at(r.a), y = at(r.b); return x > y ? x : y; }
+    case ReachMin: { const float x = at(r.a), y = at(r.b); return x < y ? x : y; }
+    case ReachFloor: return floorf(at(r.a));
+    case ReachTrunc: return float(int64_t(at(r.a)));
+    case ReachNeg: return -at(r.a);
+    case ReachAbs: { const float x = at(r.a); return x < 0 ? -x : x; }
+    case ReachRound: return floorf(at(r.a) + 0.5f);
+    }
+    return 0.0f;
+}
 // Only the vertex fetch layout and constants of a vertex shader, without generating HLSL:
 // for copies of an already translated shader that differ only in their fetch fields (see
 // VFetchK). False when a fetch would have to be baked into the code (translate in full).

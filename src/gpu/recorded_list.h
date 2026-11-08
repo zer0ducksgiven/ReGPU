@@ -206,6 +206,16 @@ private:
             Replay(m_current.data(), m_current.size());
             m_current.clear();
         }
+        else if (op == kCreateRtv || op == kCreateDsv)
+        {
+            // Hands what precedes a new view to the replay thread at once: views come with a new render
+            // target, ahead of the main pass's draws and the drain before its parallel pieces (PGR4 on an
+            // FX-8350: 52.8 -> 54.8 fps parked). REGPU_NO_VIEW_SUBMIT=1: at the chunk size only (A/B).
+            static const bool noViewSubmit = getenv("REGPU_NO_VIEW_SUBMIT") != nullptr;
+            if (noViewSubmit && m_current.size() < kChunk)
+                return;
+            Submit();
+        }
         else if (m_current.size() >= kChunk)
             Submit();
     }

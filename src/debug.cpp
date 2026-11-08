@@ -170,7 +170,20 @@ std::string Handle(const std::string& line)
         char buf[256];
         snprintf(buf, sizeof(buf), "\"frames\":%zu,\"avg\":%.3f,\"p50\":%.3f,\"p99\":%.3f,\"p999\":%.3f,\"max\":%.3f,\"over20\":%zu,\"over33\":%zu",
             v.size(), sum / double(v.size()), pct(0.5), pct(0.99), pct(0.999), sorted.back(), over20, over33);
-        return Ok(buf);
+        // frametimes list: also every frame's time, in order (to see when spikes come)
+        std::string arg;
+        in >> arg;
+        if (arg != "list")
+            return Ok(buf);
+        std::string list = buf;
+        list += ",\"list\":[";
+        for (size_t i = 0; i < v.size(); i++)
+        {
+            char n[16];
+            snprintf(n, sizeof(n), i ? ",%.1f" : "%.1f", v[i]);
+            list += n;
+        }
+        return Ok(list + "]");
     }
     // press A [ms]   press A+B 200   (held for ms, default 120, then released)
     if (cmd == "press" || cmd == "hold" || cmd == "release")

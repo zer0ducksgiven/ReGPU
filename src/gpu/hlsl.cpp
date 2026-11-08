@@ -869,9 +869,175 @@ struct Emitter
         }
     }
 
+    // Whether every vertex fetch index is simple arithmetic on the vertex index (r0.x at the start) and
+    // constants: adds, multiplies, min/max, floor and trunc in straight-line code (loops, jumps, calls,
+    // relative addressing and fetched values end it; conditional or predicated writes make what they
+    // write unknown; an index that isn't leaves its fetch constant unbounded). Then a draw of n vertices reads only what those indices reach, however large its
+    // fetch constant says the buffer is (a particle ring's constant spans to the ring's end: 2.4 MB for
+    // 8 vertices). Fills reachNodes and vertexFetchReach; leaves them empty otherwise.
+    void ScanVertexReach()
+    {
+        if (pixel)
+            return;
+        using Node = TranslatedShader::ReachNode;
+        std::vector<Node> nodes;
+        constexpr int kUnknown = -1;
+        int regs[64][4];
+        for (auto& r : regs)
+            r[0] = r[1] = r[2] = r[3] = kUnknown;
+        auto add = [&](Node n) -> int {
+            if (nodes.size() >= 128)
+                return kUnknown;
+            nodes.push_back(n);
+            return int(nodes.size() - 1);
+        };
+        auto op2 = [&](uint8_t op, int x, int y) -> int {
+            if (x == kUnknown || y == kUnknown)
+                return kUnknown;
+            return add({ op, 0, uint16_t(x), uint16_t(y), 0 });
+        };
+        auto op1 = [&](uint8_t op, int x) -> int { return op2(op, x, x); };
+        regs[0][0] = add({ ReachVertex });
+        // A source's component c (after its swizzle, abs and negate).
+        auto src = [&](const Source& s, int c) -> int {
+            const int comp = s.swizzle[c];
+            int n;
+            if (s.isConstant)
+                n = s.relative || s.reg > 255 ? kUnknown : add({ ReachConst, uint8_t(comp), 0, 0, uint16_t(s.reg) });
+            else
+                n = regs[s.reg & 63][comp];
+            if (s.abs)
+                n = op1(ReachAbs, n);
+            if (s.negate)
+                n = op1(ReachNeg, n);
+            return n;
+        };
+        std::vector<std::array<uint32_t, 4>> reach;
+        uint32_t stride = 0, constIndex = 0;
+        int index = kUnknown, ps = kUnknown;
+        for (const Cf& cf : shader.cf)
+        {
+            const CfOp op = cf.op();
+            if (op == CfOp::LoopStart || op == CfOp::LoopEnd || op == CfOp::CondCall || op == CfOp::Return || op == CfOp::CondJmp)
+                return;
+            if (!cf.IsExec())
+                continue;
+            const bool conditional = op != CfOp::Exec && op != CfOp::ExecEnd;
+            for (uint32_t k = 0; k < cf.count(); k++)
+            {
+                const uint32_t at = cf.address() + k;
+                if ((at + 1) * 3 > shader.words.size())
+                    return;
+                const uint32_t* w = &shader.words[at * 3];
+                if ((cf.sequence() >> (2 * k)) & 1)
+                {
+                    const Fetch f = DecodeFetch(w);
+                    if (f.opcode == 0)
+                    {
+                        if (!f.isMini)
+                        {
+                            const int i = regs[f.src & 63][f.srcSwizzle & 3];
+                            index = i == kUnknown ? kUnknown : op1(uint8_t(f.roundIndex ? ReachRound : ReachFloor), i);
+                            stride = f.stride;
+                            constIndex = f.constIndex;
+                        }
+                        // (An index from fetched data: that constant is copied in full, ~0u.)
+                        reach.push_back({ constIndex, stride, f.offset, index == kUnknown ? ~0u : uint32_t(index) });
+                    }
+                    // The fetched components are data.
+                    for (int c = 0; c < 4; c++)
+                        if (((f.destSwizzle >> (3 * c)) & 7) != 7)
+                            regs[f.dest & 63][c] = kUnknown;
+                    continue;
+                }
+                const Alu a = DecodeAlu(w);
+                // (Bit 6: the vector destination's relative flag.)
+                if (!a.exportData && ((((w[0] >> 6) & 1) && a.vectorMask) || (a.scalarDestRelative && a.scalarMask)))
+                    return;
+                int v[4] = { kUnknown, kUnknown, kUnknown, kUnknown };
+                if (a.vectorMask && !a.exportData && !a.vectorClamp)
+                    for (int c = 0; c < 4; c++)
+                    {
+                        if (!((a.vectorMask >> c) & 1))
+                            continue;
+                        switch (a.vectorOp)
+                        {
+                        case 0: v[c] = op2(ReachAdd, src(a.src[0], c), src(a.src[1], c)); break;
+                        case 1: v[c] = op2(ReachMul, src(a.src[0], c), src(a.src[1], c)); break;
+                        case 2: case 29: v[c] = op2(ReachMax, src(a.src[0], c), src(a.src[1], c)); break;
+                        case 3: v[c] = op2(ReachMin, src(a.src[0], c), src(a.src[1], c)); break;
+                        case 9: v[c] = op1(ReachTrunc, src(a.src[0], c)); break;
+                        case 10: v[c] = op1(ReachFloor, src(a.src[0], c)); break;
+                        case 11: v[c] = op2(ReachAdd, op2(ReachMul, src(a.src[0], c), src(a.src[1], c)), src(a.src[2], c)); break;
+                        default: break;
+                        }
+                    }
+                int s = kUnknown;
+                if (a.scalarOp == 50)
+                    s = ps;
+                else if (!a.scalarClamp)
+                {
+                    const int A = src(a.src[2], 3), B = src(a.src[2], 0);
+                    switch (a.scalarOp)
+                    {
+                    case 0: s = op2(ReachAdd, A, B); break;
+                    case 1: s = op2(ReachAdd, A, ps); break;
+                    case 2: s = op2(ReachMul, A, B); break;
+                    case 3: case 4: s = op2(ReachMul, A, ps); break;
+                    case 5: s = op2(ReachMax, A, B); break;
+                    case 6: s = op2(ReachMin, A, B); break;
+                    case 12: s = op1(ReachTrunc, A); break;
+                    case 13: s = op1(ReachFloor, A); break;
+                    case 25: s = op2(ReachAdd, A, op1(ReachNeg, B)); break;
+                    case 26: s = op2(ReachAdd, A, op1(ReachNeg, ps)); break;
+                    case 42: case 43: case 44: case 45: case 46: case 47:
+                    {
+                        // (As ScalarCode: the constant's component W of src3's swizzle, the temp spread over
+                        // the opcode and swizzle bits, the negate on both unless REGPU_SC_NEG says otherwise.)
+                        static const bool scNeg = getenv("REGPU_SC_NEG") != nullptr;
+                        if (scNeg)
+                            break;
+                        const uint32_t temp = (a.scalarOp & 1) | (uint32_t(a.src3IsTemp) << 1) | (a.src3RawSwizzle & 0x3C);
+                        int ca = add({ ReachConst, uint8_t(((a.src3RawSwizzle >> 6) + 3) & 3), 0, 0, uint16_t(a.src3RawReg & 255) });
+                        int tb = regs[temp & 63][a.src3RawSwizzle & 3];
+                        if (a.src[2].negate)
+                            ca = op1(ReachNeg, ca), tb = op1(ReachNeg, tb);
+                        s = op2(a.scalarOp <= 43 ? ReachMul : ReachAdd, ca, a.scalarOp <= 45 ? tb : op1(ReachNeg, tb));
+                        break;
+                    }
+                    default: break;
+                    }
+                }
+                if (a.predicated || conditional)
+                {
+                    // May or may not happen: what it writes is unknown.
+                    for (int c = 0; c < 4; c++)
+                        v[c] = kUnknown;
+                    s = kUnknown;
+                }
+                ps = s;
+                if (a.exportData)
+                    continue;
+                for (int c = 0; c < 4; c++)
+                    if ((a.vectorMask >> c) & 1)
+                        regs[a.vectorDest & 63][c] = v[c];
+                for (int c = 0; c < 4; c++)
+                    if ((a.scalarMask >> c) & 1)
+                        regs[a.scalarDest & 63][c] = s;
+            }
+            if (cf.IsEnd())
+                break;
+        }
+        result.reachNodes = std::move(nodes);
+        result.vertexFetchReach = std::move(reach);
+    }
+
     void EmitProgram()
     {
         ScanFetchIndex();
+        static const bool noReach = getenv("REGPU_NO_VERTEX_REACH") != nullptr;
+        if (!noReach)
+            ScanVertexReach();
         bool linear = true, loops = false;
         for (const Cf& cf : shader.cf)
         {

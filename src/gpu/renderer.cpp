@@ -9897,7 +9897,52 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 Log("midsize: %08X %u bytes changed since frame %llu (vs %016llx ps %016llx)", address, bytes, (unsigned long long)e.first, (unsigned long long)C().vsHash, (unsigned long long)C().psHash);
             e = { g_r.frame, h };
         }
-        const UINT64 dataOffset = UploadGuest(GpuPhysToGuest(address), bytes);
+        // A draw without an index buffer (auto index) reads vertices first to first+count-1 (first: the
+        // index offset). Where the shader's fetch indices are simple arithmetic on that (ScanVertexReach),
+        // they are worked out for each vertex with this draw's constants, and only what they reach is
+        // copied. A particle ring's fetch constant spans to the ring's end, and each of its draws (8-64
+        // vertices, one particle per 4) copied 2.4 MB: 120 MB a frame, 12 fps on an FX-8350 when PGR4's
+        // cars threw sparks. Draws over 4096 vertices copy in full. REGPU_NO_VERTEX_REACH=1: always in
+        // full (read at translation).
+        uint32_t copyBytes = bytes;
+        if (indexSource == 2 && !vs.info.vertexFetchReach.empty() && bytes > 16384 && indexCount <= 4096)
+        {
+            const uint32_t first = gpureg::Get(VGT_INDX_OFFSET) & 0xFFFFFF;
+            auto constant = [](uint32_t reg, uint32_t comp) { return RegFloat(gpureg::AluConstants + reg * 4 + comp); };
+            uint64_t reach = 0;
+            bool bounded = true;
+            for (const auto& [c, stride, offset, node] : vs.info.vertexFetchReach)
+            {
+                if (c != k)
+                    continue;
+                if (node == ~0u)
+                {
+                    bounded = false;
+                    break;
+                }
+                float most = 0.0f;
+                for (uint32_t i = 0; i < std::max(indexCount, 1u); i++)
+                    most = std::max(most, EvalReachNode(vs.info.reachNodes, node, float(first + i), constant));
+                // (Not a number or past the buffer: copy it all.)
+                if (!(most >= 0.0f && most < 16777216.0f))
+                {
+                    bounded = false;
+                    break;
+                }
+                // One vertex more than the most reached, for float rounding.
+                reach = std::max<uint64_t>(reach, ((uint64_t(most) + 1) * stride + offset + 4) * 4);
+            }
+            if (bounded && reach && reach < bytes)
+                copyBytes = uint32_t(reach);
+        }
+        if (static LiveSwitch traceBig("REGPU_TRACE_BIGCOPY"); traceBig && copyBytes >= (256u << 10))
+        {
+            static std::atomic<uint32_t> n{ 0 };
+            if (n++ < 600)
+                Log("bigcopy: vf%u %08X %u bytes vs %016llx prim %u count %u src %u dma %08X size %u", k, address, copyBytes,
+                    (unsigned long long)C().vsHash, prim, indexCount, indexSource, dmaBase, dmaSize & 0xFFFFFF);
+        }
+        const UINT64 dataOffset = UploadGuest(GpuPhysToGuest(address), copyBytes);
         if (dataOffset == ~0ull)
         {
             TraceSkip("ring full", initiator);
