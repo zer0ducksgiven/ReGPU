@@ -4865,7 +4865,13 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     // Faces the title resolved into?
     const ResolvedTexture* faces[6]{};
     bool resolved = false;
-    for (uint32_t i = 0; i < 6; i++)
+    // A compressed cube is never a resolve (the console can't resolve to DXT): a DXT5 reflection cube that landed
+    // where an old render target was resolved reflected that (FM2 report #56). REGPU_OLD_CUBE_FACES=1: any format.
+    static LiveSwitch oldCubeFaces("REGPU_OLD_CUBE_FACES");
+    const char* cubeFormat = TextureFormatName(fetch.Format());
+    const bool compressed = !oldCubeFaces && cubeFormat &&
+        (strncmp(cubeFormat, "DXT", 3) == 0 || strncmp(cubeFormat, "DXN", 3) == 0 || strncmp(cubeFormat, "CTX", 3) == 0);
+    for (uint32_t i = 0; i < 6 && !compressed; i++)
     {
         // (Through the stale check: a face address the title reused for a texture of its own.)
         const ResolvedTexture* r = ResolveCurrent(fetch.Address() + i * stride);
