@@ -5423,11 +5423,13 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         return cached.resource.Get();
     }
     cached.checkedFrame = g_r.frame;
-    // DXT formats stay compressed on the GPU (BC1-BC4): no decode, a quarter to an eighth of
-    // the upload. D3D12 needs block-aligned sizes; others are decoded to RGBA8.
+    // DXT formats stay compressed on the GPU (BC1-BC5), and R16/half-float data stays native.
+    // D3D12 needs block-aligned sizes for BC; other formats are decoded to RGBA8.
     LiveSwitch &noNativeBC = g_sw_REGPU_NO_NATIVE_BC;
+    static LiveSwitch noNativeR16("REGPU_NO_NATIVE_R16");
     const uint32_t kind = TextureBCKind(fetch.Format());
-    const uint32_t bc = !noNativeBC && ((w % 4 == 0 && h % 4 == 0) || kind == 6) && !forceDecode ? kind : 0;
+    const uint32_t bc = !noNativeBC && !(kind == 7 && noNativeR16) &&
+        ((w % 4 == 0 && h % 4 == 0) || kind >= 6) && !forceDecode ? kind : 0;
     const uint8_t* source;
     size_t sourceBytes, hashStride;
     TextureHashSpan(fetch, w, h, source, sourceBytes, hashStride);
@@ -5479,10 +5481,10 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     if (bc)
     {
         static const DXGI_FORMAT bcFormats[] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM,
-            DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT };
+            DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16_UNORM };
         const DXGI_FORMAT bcFormat = bcFormats[bc];
-        // Kind 6 (16_16_16_16_FLOAT) is uncompressed: blocks of one texel, 8 bytes.
-        const uint32_t blockBytes = bc == 1 || bc == 4 || bc == 6 ? 8 : 16, bs = bc == 6 ? 1 : 4;
+        // Kinds 6 and 7 are uncompressed: one-texel blocks of 8 or 2 bytes.
+        const uint32_t blockBytes = bc == 7 ? 2 : bc == 1 || bc == 4 || bc == 6 ? 8 : 16, bs = bc >= 6 ? 1 : 4;
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
