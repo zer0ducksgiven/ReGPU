@@ -13,10 +13,12 @@
 #include <deque>
 #include <chrono>
 #include <thread>
+#include <utility>
 
 #include <intrin.h>
 #include <windows.h>
 
+#include "lifecycle.h"
 #include "render/presenter.h"
 #include "live_switch.h"
 #include "settings.h"
@@ -117,9 +119,20 @@ struct Gpu
 
 Gpu g_gpu;
 bool g_trace = getenv("REGPU_GPUTRACE") != nullptr;
+ReGpuOwnedThread g_vblankThread;
+ReGpuOwnedThread g_drawThread;
+ReGpuOwnedThread g_drawPerfThread;
+ReGpuOwnedThread g_watchdogThread;
+std::mutex g_watchdogMutex;
+HANDLE g_drawWorkerHandle = nullptr;
+std::mutex g_guestThreadMutex;
+std::condition_variable g_guestThreadCv;
+uint32_t g_guestThreads = 0;
 
 void RaiseInterrupt(uint32_t source, uint32_t cpu)
 {
+    if (ReGpuStopping())
+        return;
     {
         std::lock_guard lock(g_gpu.interruptMutex);
         g_gpu.pendingInterrupts.push_back({ source, cpu });
@@ -148,6 +161,7 @@ std::vector<uint8_t> g_file(0x8000 * 4);       // the worker's register file (re
 // Read when the command processor starts (a host may set REGPU_DRAW_THREAD before regpu::Start).
 bool g_enabled = false;
 std::atomic<bool> g_started{ false };
+std::atomic<bool> g_stop{ false };
 
 // Space for a record of `words` payload words; returns where to write it.
 uint32_t* Begin(uint32_t type, uint32_t words)
@@ -196,7 +210,7 @@ void Drain()
         g_tail.wait(tail, std::memory_order_acquire);
 }
 
-bool Active() { return g_enabled && g_started.load(std::memory_order_relaxed); }
+bool Active() { return !ReGpuStopping() && g_enabled && g_started.load(std::memory_order_relaxed); }
 
 void LogRegs(uint32_t index, const uint32_t* valuesBE, uint32_t count)
 {
@@ -555,8 +569,11 @@ void WorkerLoop()
     {
         uint64_t tail = work::g_tail.load(std::memory_order_relaxed);
         uint64_t head;
-        while ((head = work::g_head.load(std::memory_order_acquire)) == tail)
+        while ((head = work::g_head.load(std::memory_order_acquire)) == tail &&
+               !work::g_stop.load(std::memory_order_acquire))
             work::g_head.wait(head, std::memory_order_acquire);
+        if (head == tail && work::g_stop.load(std::memory_order_acquire))
+            break;
         // Everything published so far, then let the command processor know.
         while (tail != head)
         {
@@ -629,11 +646,22 @@ void InterruptLoop(PPCContext& ctx)
         std::vector<std::pair<uint32_t, uint32_t>> sources;
         {
             std::unique_lock lock(g_gpu.interruptMutex);
-            g_gpu.interruptCv.wait(lock, [] { return !g_gpu.pendingInterrupts.empty(); });
+            g_gpu.interruptCv.wait(lock, [] {
+                return ReGpuStopping() || !g_gpu.pendingInterrupts.empty();
+            });
+            if (ReGpuStopping())
+            {
+                g_gpu.pendingInterrupts.clear();
+                return;
+            }
             sources.swap(g_gpu.pendingInterrupts);
         }
         for (auto [source, cpu] : sources)
+        {
+            if (ReGpuStopping())
+                return;
             DispatchInterrupt(ctx, source, cpu);
+        }
     }
 }
 
@@ -668,6 +696,9 @@ struct Write
 std::mutex g_mutex;
 std::condition_variable g_cv, g_done;
 std::deque<Write> g_queue;
+bool g_started = false;
+bool g_stopping = false;
+ReGpuOwnedThread g_thread;
 
 void Main()
 {
@@ -675,7 +706,9 @@ void Main()
     std::unique_lock lock(g_mutex);
     for (;;)
     {
-        g_cv.wait(lock, [] { return !g_queue.empty(); });
+        g_cv.wait(lock, [] { return g_stopping || !g_queue.empty(); });
+        if (g_stopping && g_queue.empty())
+            break;
         const Write w = g_queue.front();
         lock.unlock();
         RendererFenceWait(w.fence, event);
@@ -688,11 +721,14 @@ void Main()
         g_queue.pop_front(); // after the write: Add sees it pending until then, keeping the order
         g_done.notify_all();
     }
+    CloseHandle(event);
 }
 
 void Add(uint64_t fence, uint32_t address, uint32_t value, bool raw)
 {
     std::lock_guard lock(g_mutex);
+    if (g_stopping)
+        return;
     if (!fence && g_queue.empty())
     {
         if (raw)
@@ -701,8 +737,11 @@ void Add(uint64_t fence, uint32_t address, uint32_t value, bool raw)
             WriteBackNow(address, value);
         return;
     }
-    static std::once_flag started;
-    std::call_once(started, [] { std::thread(Main).detach(); });
+    if (!g_started)
+    {
+        g_started = true;
+        g_thread = std::thread(Main);
+    }
     if (!fence)
         fence = g_queue.back().fence;
     g_queue.push_back({ fence, address, value, raw });
@@ -714,6 +753,18 @@ void Drain()
 {
     std::unique_lock lock(g_mutex);
     g_done.wait(lock, [] { return g_queue.empty(); });
+}
+
+void Stop()
+{
+    Drain();
+    {
+        std::lock_guard lock(g_mutex);
+        g_stopping = true;
+    }
+    g_cv.notify_all();
+    if (g_thread.joinable())
+        g_thread.join();
 }
 }
 
@@ -1170,6 +1221,8 @@ uint32_t ExecutePacket(uint32_t ptr)
         static const int spinMs = getenv("REGPU_CP_SPIN_MS") ? atoi(getenv("REGPU_CP_SPIN_MS")) : 100;
         for (int tries = 0;; tries++)
         {
+            if (ReGpuStopping())
+                break;
             const uint32_t value = (info & 0x10) ? ReadBack(arg(1)) : Reg(arg(1));
             if (WaitCompare(info & 7, value & arg(3), arg(2)))
                 break;
@@ -1489,31 +1542,28 @@ void CommandProcessorLoop(PPCContext& ctx)
     if (work::g_enabled)
     {
         memcpy(work::g_file.data(), gpureg::LiveFile(), work::g_file.size());
-        std::thread worker(WorkerLoop);
-        static HANDLE workerHandle = nullptr;
-        DuplicateHandle(GetCurrentProcess(), worker.native_handle(), GetCurrentProcess(), &workerHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
-        worker.detach();
+        g_drawThread = std::thread(WorkerLoop);
+        DuplicateHandle(GetCurrentProcess(), g_drawThread.native_handle(), GetCurrentProcess(), &g_drawWorkerHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
         work::g_started.store(true, std::memory_order_release);
         Log("gpu: draw worker thread started");
-        std::thread([] {
-            for (;;)
+        g_drawPerfThread = std::thread([] {
+            while (!ReGpuWaitForStop(std::chrono::milliseconds(2000)))
             {
-                Sleep(2000);
                 if (getenv("REGPU_PERF"))
                 {
                     static uint64_t lastBusy = 0;
                     FILETIME c, e, k, u;
                     uint64_t busy = 0;
-                    if (workerHandle && GetThreadTimes(workerHandle, &c, &e, &k, &u))
+                    if (g_drawWorkerHandle && GetThreadTimes(g_drawWorkerHandle, &c, &e, &k, &u))
                         busy = (uint64_t(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (uint64_t(u.dwHighDateTime) << 32 | u.dwLowDateTime);
                     Log("perf: draw worker: %.0f%% busy, %llu drains (%llu waited) in 2 s", (busy - lastBusy) / 1e7 / 2.0 * 100.0,
                         (unsigned long long)work::g_drains.exchange(0), (unsigned long long)work::g_drainWaits.exchange(0));
                     lastBusy = busy;
                 }
             }
-        }).detach();
+        });
     }
-    for (;;)
+    while (!ReGpuStopping())
     {
         uint32_t base, size, generation;
         {
@@ -1524,7 +1574,7 @@ void CommandProcessorLoop(PPCContext& ctx)
         }
         if (!base || !size)
         {
-            Sleep(1);
+            ReGpuWaitForStop(std::chrono::milliseconds(1));
             continue;
         }
         const uint32_t wptr = Reg(CP_RB_WPTR) % size;
@@ -1543,7 +1593,8 @@ void CommandProcessorLoop(PPCContext& ctx)
                 idle = true;
                 idleSince = std::chrono::steady_clock::now();
             }
-            Sleep(0);
+            if (!ReGpuStopping())
+                Sleep(0);
             continue;
         }
         if (perf)
@@ -1560,7 +1611,7 @@ void CommandProcessorLoop(PPCContext& ctx)
             }
         }
         bool replaced = false;
-        while (!replaced && g_gpu.rptr != wptr)
+        while (!ReGpuStopping() && !replaced && g_gpu.rptr != wptr)
         {
 
             // A packet may wrap past the end of the ring: run it from a
@@ -1604,6 +1655,27 @@ void CommandProcessorLoop(PPCContext& ctx)
     }
 }
 
+void GuestThreadFinished()
+{
+    {
+        std::lock_guard lock(g_guestThreadMutex);
+        g_guestThreads--;
+    }
+    g_guestThreadCv.notify_all();
+}
+
+void InterruptThreadEntry(PPCContext& ctx)
+{
+    InterruptLoop(ctx);
+    GuestThreadFinished();
+}
+
+void CommandProcessorThreadEntry(PPCContext& ctx)
+{
+    CommandProcessorLoop(ctx);
+    GuestThreadFinished();
+}
+
 // Frames per second the game may present: max FPS, or the display's refresh rate if lower
 // and vsync is on.
 // Follows the settings as they change (regpu::SetFrameLimit: a host's options screen).
@@ -1625,7 +1697,7 @@ void VblankLoop()
 {
     SetThreadDescription(GetCurrentThread(), L"gpu vblank");
     auto next = Clock::now();
-    for (;;)
+    while (!ReGpuStopping())
     {
         // The title presents on vblanks: every one in gameplay, often every second one in menus. It
         // keeps game time by the clock, not by frames, so vblanks run at twice the frame cap
@@ -1641,6 +1713,8 @@ void VblankLoop()
             std::this_thread::sleep_until(next);
         else
             PreciseSleepUntil(next, 200);
+        if (ReGpuStopping())
+            break;
         RaiseInterrupt(0, 2);
     }
 }
@@ -1656,16 +1730,71 @@ void GpuInit()
     SetReg(0x194C, 0x000002D0); // D1MODE_V_COUNTER
     SetReg(0x1961, 0x050002D0); // D1MODE_VIEWPORT_SIZE 1280x720
     SetReg(0x0F01, 0x0000200E); // RB_BC_CONTROL
-    std::thread(VblankLoop).detach();
+    g_vblankThread = std::thread(VblankLoop);
 }
 
 void GpuStartInterruptThread()
 {
-    if (g_gpu.interruptThread)
+    std::lock_guard lock(g_guestThreadMutex);
+    if (g_gpu.interruptThread || ReGpuStopping())
         return;
     g_gpu.interruptThread = true;
-    regpu::GetHost().createThread("gpu vblank irq", InterruptLoop);
-    regpu::GetHost().createThread("gpu command processor", CommandProcessorLoop);
+    g_guestThreads = 2;
+    regpu::GetHost().createThread("gpu vblank irq", InterruptThreadEntry);
+    regpu::GetHost().createThread("gpu command processor", CommandProcessorThreadEntry);
+}
+
+void GpuStop()
+{
+    g_gpu.interruptCv.notify_all();
+
+    bool guestThreadsStarted = false;
+    {
+        std::lock_guard lock(g_guestThreadMutex);
+        guestThreadsStarted = g_gpu.interruptThread;
+    }
+    if (guestThreadsStarted && regpu::GetHost().joinThreads)
+        regpu::GetHost().joinThreads();
+    {
+        std::unique_lock lock(g_guestThreadMutex);
+        g_guestThreadCv.wait(lock, [] { return g_guestThreads == 0; });
+    }
+    if (guestThreadsStarted && !regpu::GetHost().joinThreads)
+        Log("lifecycle: host did not provide joinThreads; guest GPU threads stopped but their host handles were not joined");
+
+    work::g_stop.store(true, std::memory_order_release);
+    const uint64_t head = work::g_head.load(std::memory_order_acquire);
+    if (work::g_tail.load(std::memory_order_acquire) == head)
+    {
+        work::g_ring[head % work::kWords] = 0;
+        work::g_head.store(head + 1, std::memory_order_release);
+    }
+    work::g_head.notify_all();
+    work::g_tail.notify_all();
+    if (g_drawThread.joinable())
+        g_drawThread.join();
+    work::g_started.store(false, std::memory_order_release);
+    std::vector<uint32_t>().swap(work::g_ring);
+    std::vector<uint8_t>().swap(work::g_file);
+
+    PendingWrites::Stop();
+
+    if (g_vblankThread.joinable())
+        g_vblankThread.join();
+    ReGpuOwnedThread watchdog;
+    {
+        std::lock_guard lock(g_watchdogMutex);
+        watchdog = std::move(g_watchdogThread);
+    }
+    if (watchdog.joinable())
+        watchdog.join();
+    if (g_drawPerfThread.joinable())
+        g_drawPerfThread.join();
+    if (g_drawWorkerHandle)
+    {
+        CloseHandle(g_drawWorkerHandle);
+        g_drawWorkerHandle = nullptr;
+    }
 }
 
 uint64_t GpuSwapCount() { return g_gpu.swaps; }
@@ -1696,6 +1825,8 @@ namespace
 // The command processor reached a swap: the frame so far goes to the screen.
 void PresentSwap(uint64_t frame, uint32_t frontBuffer)
 {
+    if (ReGpuStopping())
+        return;
     seg::Flush();
     seg::EndFrame();
     seg::g_tile = RendererTile{};
@@ -1715,6 +1846,8 @@ void PresentSwap(uint64_t frame, uint32_t frontBuffer)
 // XE_SWAP): the hang watchdog and the frame limiter.
 void PaceSwap(uint64_t frame)
 {
+    if (ReGpuStopping())
+        return;
     if (frame == 1 || (frame & (frame - 1)) == 0 || frame % 60 == 0)
         Log("gpu: swap #%llu", (unsigned long long)frame);
     // Watchdog: no swap for 10 s once the title has started presenting logs every thread's stack
@@ -1723,13 +1856,15 @@ void PaceSwap(uint64_t frame)
     lastSwap.store(frame, std::memory_order_relaxed);
     static std::once_flag watchdog;
     std::call_once(watchdog, [] {
-        std::thread([] {
+        std::lock_guard lock(g_watchdogMutex);
+        if (ReGpuStopping())
+            return;
+        g_watchdogThread = std::thread([] {
             uint64_t seen = 0;
             int still = 0;
             bool logged = false;
-            for (;;)
+            while (!ReGpuWaitForStop(std::chrono::milliseconds(1000)))
             {
-                Sleep(1000);
                 const uint64_t now = lastSwap.load(std::memory_order_relaxed);
                 still = now == seen ? still + 1 : 0;
                 if (now != seen)
@@ -1744,7 +1879,7 @@ void PaceSwap(uint64_t frame)
                     regpu::GetHost().logThreadStacks("no swap for 10 s");
                 }
             }
-        }).detach();
+        });
     });
     // Frame limiter (settings: max FPS, the display's refresh with vsync): the title's render
     // thread waits for its next frame slot. Vblanks run faster than the cap, so menus (which
@@ -1778,6 +1913,8 @@ void regpu::SetFrameLimit(uint32_t maxFps, bool vsync)
 
 void regpu::driver::SetInterruptCallback(uint32_t callback, uint32_t userData)
 {
+    if (ReGpuStopping())
+        return;
     g_gpu.interruptCallback = callback;
     g_gpu.interruptData = userData;
     Log("gpu: interrupt callback %08X data %08X", callback, userData);
@@ -1786,6 +1923,8 @@ void regpu::driver::SetInterruptCallback(uint32_t callback, uint32_t userData)
 
 void regpu::driver::InitializeRingBuffer(uint32_t ptr, uint32_t sizeLog2)
 {
+    if (ReGpuStopping())
+        return;
     // (physical address, log2 of size in qwords? - size = 1 << (log2 + 3) bytes)
     // A new ring starts empty: both pointers back to 0, as the kernel resets the CP. Without the
     // write pointer reset, the CP would run the new ring's stale contents up to the old one's.
@@ -1803,6 +1942,8 @@ void regpu::driver::InitializeRingBuffer(uint32_t ptr, uint32_t sizeLog2)
 
 void regpu::driver::EnableReadPointerWriteBack(uint32_t ptr, uint32_t blockSizeLog2)
 {
+    if (ReGpuStopping())
+        return;
     g_gpu.rptrWriteback = PhysToGuest(ptr & 0x1FFFFFFF);
     Log("gpu: rptr writeback at %08X (from %08X), block log2 %u", g_gpu.rptrWriteback.load(), ptr, blockSizeLog2);
 }
@@ -1828,6 +1969,8 @@ uint32_t regpu::driver::ReadRegister(uint32_t index)
 
 void regpu::driver::WriteRegister(uint32_t index, uint32_t value)
 {
+    if (ReGpuStopping())
+        return;
     index &= 0x7FFF;
     SetReg(index, value);
     // The display's gamma table, which a title can write directly (FH1 does, after its brightness

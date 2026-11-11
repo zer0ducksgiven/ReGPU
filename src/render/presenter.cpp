@@ -6,6 +6,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <new>
 #include <thread>
 
 #include <d3d12.h>
@@ -13,6 +14,7 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+#include "lifecycle.h"
 #include "log.h"
 #include "render/presenter.h"
 #include "settings.h"
@@ -53,6 +55,8 @@ struct Presenter
 };
 
 Presenter g_p;
+ReGpuOwnedThread g_presenterThread;
+bool g_classRegistered = false;
 }
 
 // The size the game renders at (settings: resolution and forced aspect ratio).
@@ -77,7 +81,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (msg == WM_CHAR)
     {
-        if (regpu::GetHost().onChar)
+        if (!ReGpuStopping() && regpu::GetHost().onChar)
             regpu::GetHost().onChar(wchar_t(wp));
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -200,7 +204,7 @@ void CreateWindowAndDevice()
     wc.lpszClassName = L"regpu";
     wc.hbrBackground = HBRUSH(GetStockObject(BLACK_BRUSH));
     wc.hIcon = HICON(LoadImageW(wc.hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
-    RegisterClassW(&wc);
+    g_classRegistered = RegisterClassW(&wc) != 0;
     // The swap chain is the chosen resolution (the game's image is centred in it with black
     // bars when an aspect ratio is forced). Windowed: the client area is exactly that size
     // (SizeWindow). Fullscreen: a borderless window over the primary display. Either way the
@@ -375,7 +379,7 @@ void RenderThread()
     CreateWindowAndDevice();
     g_p.ready = true;
     Log("presenter: window and D3D12 swap chain ready");
-    for (;;)
+    while (!ReGpuStopping())
     {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
@@ -386,13 +390,35 @@ void RenderThread()
         uint64_t frame;
         {
             std::unique_lock lock(g_p.mutex);
-            g_p.cv.wait_for(lock, std::chrono::milliseconds(16), [] { return g_p.pendingFrame != g_p.presentedFrame; });
+            g_p.cv.wait_for(lock, std::chrono::milliseconds(16), [] {
+                return ReGpuStopping() || g_p.pendingFrame != g_p.presentedFrame;
+            });
+            if (ReGpuStopping())
+                break;
             frame = g_p.pendingFrame;
             if (frame == g_p.presentedFrame || g_rendererActive)
                 continue;
             g_p.presentedFrame = frame;
         }
         DrawFrame(frame);
+    }
+    g_p.ready = false;
+    if (g_p.queue && g_p.fence)
+    {
+        const UINT64 value = g_p.nextFence++;
+        g_p.queue->Signal(g_p.fence.Get(), value);
+        if (g_p.fence->GetCompletedValue() < value)
+        {
+            g_p.fence->SetEventOnCompletion(value, g_p.fenceEvent);
+            WaitForSingleObject(g_p.fenceEvent, INFINITE);
+        }
+    }
+    if (!GetSettings().hostWindow && g_p.window)
+        DestroyWindow(g_p.window);
+    if (g_classRegistered)
+    {
+        UnregisterClassW(L"regpu", GetModuleHandleW(nullptr));
+        g_classRegistered = false;
     }
 }
 }
@@ -401,11 +427,33 @@ void PresenterInit()
 {
     if (getenv("REGPU_HEADLESS"))
         return;
-    std::thread(RenderThread).detach();
+    g_presenterThread = std::thread(RenderThread);
+}
+
+void PresenterStop()
+{
+    g_p.cv.notify_all();
+    if (g_presenterThread.joinable())
+        g_presenterThread.join();
+    if (g_p.fenceEvent)
+    {
+        CloseHandle(g_p.fenceEvent);
+        g_p.fenceEvent = nullptr;
+    }
+    g_p.~Presenter();
+    new (&g_p) Presenter();
+    {
+        std::lock_guard lock(g_deviceMutex);
+        g_queue.Reset();
+        g_device.Reset();
+    }
+    g_rendererActive = false;
 }
 
 void PresenterSubmitFrame(uint64_t frame)
 {
+    if (ReGpuStopping())
+        return;
     {
         std::lock_guard lock(g_p.mutex);
         g_p.pendingFrame = frame;
@@ -473,7 +521,7 @@ void regpu::SetWindowSize(uint32_t width, uint32_t height)
 
 void PresenterSubmitImage(uint32_t width, uint32_t height, std::vector<uint8_t> rgba)
 {
-    if (width != kWidth || height != kHeight)
+    if (ReGpuStopping() || width != kWidth || height != kHeight)
         return;
     {
         std::lock_guard lock(g_p.mutex);
@@ -502,7 +550,7 @@ void PresenterUseRenderer()
 
 bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay, uint32_t overlayW, uint32_t overlayH)
 {
-    if (!g_p.ready)
+    if (ReGpuStopping() || !g_p.ready)
         return false;
     const UINT i = g_p.swapChain->GetCurrentBackBufferIndex();
     ID3D12Resource* backBuffer = g_p.backBuffers[i].Get();
@@ -559,7 +607,7 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
 void PresenterPresent()
 {
     // Vsync: wait for the display's refresh; off: present at once (tearing allowed).
-    if (g_p.ready)
+    if (!ReGpuStopping() && g_p.ready)
     {
         if (GetSettings().vsync)
             g_p.swapChain->Present(1, 0);

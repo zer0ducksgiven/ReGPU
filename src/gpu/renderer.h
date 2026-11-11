@@ -18,6 +18,9 @@ void RendererPredictDraw(uint32_t initiator);
 bool RendererCompileIdle();
 // Flushes the pipeline library to disk (called when the tour finishes).
 void RendererSaveCaches();
+// Stops renderer workers after callers have stopped submitting GPU work, saves caches, and
+// waits for the D3D12 queue to become idle.
+void RendererStop();
 // From the port's crash handler: a crash inside the driver's pipeline compiler is logged and that pipeline is
 // refused from the next start on (regpu-bad-pipelines.txt).
 void RendererLogCrashContext();

@@ -11,12 +11,16 @@
 #include <thread>
 #include <vector>
 
+#include "lifecycle.h"
+
 namespace
 {
 std::mutex g_logMutex;
 std::condition_variable g_logCv;
 std::deque<std::string> g_queue; // lines waiting for the writer thread
 bool g_writerStarted = false;
+bool g_writerStopping = false;
+ReGpuOwnedThread g_writer;
 FILE* g_logFile = nullptr;
 const auto g_start = std::chrono::steady_clock::now();
 std::deque<std::string> g_recent; // the last lines, for the debug server's log command
@@ -54,7 +58,9 @@ void WriterLoop()
     {
         {
             std::unique_lock lock(g_logMutex);
-            g_logCv.wait(lock, [] { return !g_queue.empty(); });
+            g_logCv.wait(lock, [] { return g_writerStopping || !g_queue.empty(); });
+            if (g_writerStopping && g_queue.empty())
+                break;
             batch.swap(g_queue);
         }
         WriteLines(batch);
@@ -82,10 +88,15 @@ void Write(const char* prefix, const char* fmt, va_list args)
         WriteLines({ line });
         return;
     }
-    if (!g_writerStarted)
+    if (!g_writerStarted && !g_writerStopping)
     {
         g_writerStarted = true;
-        std::thread(WriterLoop).detach();
+        g_writer = std::thread(WriterLoop);
+    }
+    if (g_writerStopping)
+    {
+        WriteLines({ line });
+        return;
     }
     if (g_queue.size() < 200000)
         g_queue.emplace_back(line);
@@ -112,7 +123,26 @@ void LogFlush()
         }
         Sleep(50);
     }
-    Sleep(50); // (the batch the writer took may still be in flight)
+    if (g_writerStarted)
+        Sleep(50); // (the batch the writer took may still be in flight)
+}
+
+void LogStop()
+{
+    {
+        std::lock_guard lock(g_logMutex);
+        g_writerStopping = true;
+    }
+    g_logCv.notify_all();
+    if (g_writer.joinable())
+        g_writer.join();
+    std::lock_guard lock(g_logMutex);
+    g_writerStarted = false;
+    if (g_logFile)
+    {
+        fclose(g_logFile);
+        g_logFile = nullptr;
+    }
 }
 
 void Fatal(const char* fmt, ...)

@@ -26,3 +26,4 @@ struct DlssFrame
 bool DlssInit(ID3D12Device* device);
 // Records the upscale into `list` (the real command list).
 bool DlssEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const DlssFrame& frame);
+void DlssShutdown();

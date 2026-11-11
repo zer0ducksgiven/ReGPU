@@ -19,6 +19,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <chrono>
 #include <cmath>
@@ -49,6 +50,7 @@
 #include "kernel/runtime.h"
 #include "kernel/thread.h"
 #include "debug.h"
+#include "lifecycle.h"
 #include "log.h"
 #include "png.h"
 #include "render/presenter.h"
@@ -387,6 +389,18 @@ struct Range
 std::mutex g_mutex;
 std::vector<Range> g_ranges[8];
 std::unordered_set<uint64_t> g_seen[8];
+struct Job
+{
+    std::vector<Range> ranges;
+    UINT64 fence;
+    uint64_t frame;
+};
+std::mutex g_queueMutex;
+std::condition_variable g_wake;
+std::deque<Job> g_queue;
+bool g_started = false;
+bool g_stopping = false;
+ReGpuOwnedThread g_thread;
 }
 
 struct CachedTexture
@@ -1354,6 +1368,8 @@ std::atomic<uint32_t> g_cursor{ 0 }, g_busy{ 0 };
 std::atomic<uint64_t> g_generation{ 0 };
 std::mutex g_mutex;
 std::condition_variable g_cv;
+bool g_stopping = false;
+std::vector<ReGpuOwnedThread> g_workers;
 
 uint64_t Spots(const uint8_t* data, size_t bytes)
 {
@@ -1386,11 +1402,13 @@ void Worker()
     {
         {
             std::unique_lock lock(g_mutex);
-            g_cv.wait(lock, [&] { return g_generation.load() != seen; });
+            g_cv.wait(lock, [&] { return g_stopping || g_generation.load() != seen; });
+            if (g_stopping)
+                return;
             seen = g_generation.load();
             g_busy++;
         }
-        for (uint32_t i; (i = g_cursor.fetch_add(1)) < g_count;)
+        for (uint32_t i; !ReGpuStopping() && (i = g_cursor.fetch_add(1)) < g_count;)
             Work(g_jobs[i]);
         g_busy--;
     }
@@ -1408,7 +1426,7 @@ void StartFrame()
     static std::once_flag started;
     std::call_once(started, [] {
         for (int i = 0; i < 3; i++)
-            std::thread(Worker).detach();
+            g_workers.emplace_back(Worker);
     });
     // The workers stop taking jobs and finish the one in hand before the jobs are replaced.
     g_cursor.store(~0u >> 1);
@@ -1433,6 +1451,22 @@ void StartFrame()
         g_generation++;
     }
     g_cv.notify_all();
+}
+
+void Stop()
+{
+    {
+        std::lock_guard lock(g_mutex);
+        g_stopping = true;
+    }
+    g_cv.notify_all();
+    for (auto& worker : g_workers)
+        if (worker.joinable())
+            worker.join();
+    g_workers.clear();
+    g_jobs.reset();
+    g_index.clear();
+    g_next.clear();
 }
 
 LiveSwitch g_noAhead("REGPU_NO_TEXTURE_AHEAD");
@@ -2500,11 +2534,35 @@ void EvictTextures()
 
 // Waits for the queue fence to reach a value, on an event of the calling thread: one shared event let two waiting
 // threads steal each other's wake-up, and the loser sat out its whole timeout (FM4 port: 2 s stalls in a race).
+struct ThreadFenceEvent
+{
+    HANDLE handle = nullptr;
+    ~ThreadFenceEvent() { Reset(); }
+    HANDLE Get()
+    {
+        if (!handle)
+            handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        return handle;
+    }
+    void Reset()
+    {
+        if (handle)
+            CloseHandle(handle);
+        handle = nullptr;
+    }
+};
+
+ThreadFenceEvent& FenceWaitEvent()
+{
+    thread_local ThreadFenceEvent event;
+    return event;
+}
+
 void WaitFenceValue(UINT64 value, DWORD timeoutMs)
 {
-    thread_local HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (g_r.fence->GetCompletedValue() >= value)
         return;
+    const HANDLE event = FenceWaitEvent().Get();
     g_r.fence->SetEventOnCompletion(value, event);
     if (WaitForSingleObject(event, timeoutMs) == WAIT_TIMEOUT && timeoutMs != INFINITE)
         Log("perf: a fence wait timed out after %lu ms (value %llu, completed %llu)", timeoutMs, (unsigned long long)value,
@@ -3119,18 +3177,35 @@ bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D
 
 namespace overwrite
 {
+void Run()
+{
+    for (;;)
+    {
+        Job job;
+        {
+            std::unique_lock lock(g_queueMutex);
+            g_wake.wait(lock, [] { return g_stopping || !g_queue.empty(); });
+            if (g_stopping && g_queue.empty())
+                return;
+            job = std::move(g_queue.front());
+            g_queue.pop_front();
+        }
+        WaitFenceValue(job.fence, INFINITE);
+        uint32_t changed = 0;
+        for (const Range& r : job.ranges)
+        {
+            if (ReGpuStopping())
+                break;
+            if (FullHash(GuestPtr<uint8_t>(GpuPhysToGuest(r.address)), r.bytes) != r.hash && changed++ < 8)
+                Log("overwrite: %s %08X %u bytes rewritten before the GPU finished (vs %016llx, frame %llu)", r.index ? "indices" : "vertices",
+                    r.address, r.bytes, (unsigned long long)r.vs, (unsigned long long)job.frame);
+        }
+    }
+}
+
 // Checked the moment the frame's fence completes, on a thread of its own: a rewrite after that is legitimate.
 void EndFrame(UINT slot, UINT64 fence, uint64_t frame)
 {
-    struct Job
-    {
-        std::vector<Range> ranges;
-        UINT64 fence;
-        uint64_t frame;
-    };
-    static std::mutex queueMutex;
-    static std::condition_variable wake;
-    static std::deque<Job> queue;
     std::vector<Range> ranges;
     {
         std::lock_guard lock(g_mutex);
@@ -3139,29 +3214,30 @@ void EndFrame(UINT slot, UINT64 fence, uint64_t frame)
     }
     if (ranges.empty())
         return;
-    static std::once_flag started;
-    std::call_once(started, [] {
-        std::thread([] {
-            for (;;)
-            {
-                Job job;
-                {
-                    std::unique_lock lock(queueMutex);
-                    wake.wait(lock, [] { return !queue.empty(); });
-                    job = std::move(queue.front());
-                    queue.pop_front();
-                }
-                WaitFenceValue(job.fence, INFINITE);
-                uint32_t changed = 0;
-                for (const Range& r : job.ranges)
-                    if (FullHash(GuestPtr<uint8_t>(GpuPhysToGuest(r.address)), r.bytes) != r.hash && changed++ < 8)
-                        Log("overwrite: %s %08X %u bytes rewritten before the GPU finished (vs %016llx, frame %llu)", r.index ? "indices" : "vertices", r.address, r.bytes, (unsigned long long)r.vs, (unsigned long long)job.frame);
-            }
-        }).detach();
-    });
-    std::lock_guard lock(queueMutex);
-    queue.push_back({ std::move(ranges), fence, frame });
-    wake.notify_one();
+    {
+        std::lock_guard lock(g_queueMutex);
+        if (g_stopping)
+            return;
+        if (!g_started)
+        {
+            g_started = true;
+            g_thread = std::thread(Run);
+        }
+        g_queue.push_back({ std::move(ranges), fence, frame });
+    }
+    g_wake.notify_one();
+}
+
+void Stop()
+{
+    {
+        std::lock_guard lock(g_queueMutex);
+        g_stopping = true;
+        g_queue.clear();
+    }
+    g_wake.notify_all();
+    if (g_thread.joinable())
+        g_thread.join();
 }
 }
 
@@ -3325,19 +3401,29 @@ struct DiskWriter
     std::condition_variable cv, idle;
     std::deque<std::function<void()>> queue;
     bool busy = false;
+    bool started = false;
+    bool stopping = false;
+    ReGpuOwnedThread worker;
 
     void Push(std::function<void()> job)
     {
-        static std::once_flag started;
-        std::call_once(started, [this] {
-            std::thread([this] {
+        {
+            std::lock_guard lock(mutex);
+            if (stopping)
+                return;
+            if (!started)
+            {
+                started = true;
+                worker = std::thread([this] {
                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                 for (;;)
                 {
                     std::function<void()> next;
                     {
                         std::unique_lock lock(mutex);
-                        cv.wait(lock, [this] { return !queue.empty(); });
+                        cv.wait(lock, [this] { return stopping || !queue.empty(); });
+                        if (stopping && queue.empty())
+                            return;
                         next = std::move(queue.front());
                         queue.pop_front();
                         busy = true;
@@ -3348,10 +3434,8 @@ struct DiskWriter
                     if (queue.empty())
                         idle.notify_all();
                 }
-            }).detach();
-        });
-        {
-            std::lock_guard lock(mutex);
+                });
+            }
             queue.push_back(std::move(job));
         }
         cv.notify_one();
@@ -3361,6 +3445,17 @@ struct DiskWriter
     {
         std::unique_lock lock(mutex);
         idle.wait_for(lock, std::chrono::seconds(5), [this] { return queue.empty() && !busy; });
+    }
+
+    void Stop()
+    {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        cv.notify_all();
+        if (worker.joinable())
+            worker.join();
     }
 } g_diskWriter;
 
@@ -3567,22 +3662,25 @@ struct ShaderOptimizer
     std::deque<Job> jobs;
     std::unordered_set<uint64_t> queued;
     std::atomic<uint32_t> built{ 0 };
+    bool started = false;
+    bool stopping = false;
+    std::vector<ReGpuOwnedThread> workers;
 
     void Push(uint64_t key, bool pixel, const std::string& hlsl)
     {
         {
             std::lock_guard lock(mutex);
-            if (!queued.insert(key).second)
+            if (stopping || !queued.insert(key).second)
                 return;
             jobs.push_back({ key, pixel, hlsl });
+            if (!started)
+            {
+                started = true;
+                const int n = getenv("REGPU_OPTIMIZE_THREADS") ? std::clamp(atoi(getenv("REGPU_OPTIMIZE_THREADS")), 1, 16) : 1;
+                for (int i = 0; i < n; i++)
+                    workers.emplace_back([this] { Run(); });
+            }
         }
-        static std::once_flag started;
-        // REGPU_OPTIMIZE_THREADS=n: n builders (default 1, at the lowest priority).
-        std::call_once(started, [this] {
-            const int n = getenv("REGPU_OPTIMIZE_THREADS") ? std::clamp(atoi(getenv("REGPU_OPTIMIZE_THREADS")), 1, 16) : 1;
-            for (int i = 0; i < n; i++)
-                std::thread([this] { Run(); }).detach();
-        });
         cv.notify_one();
     }
 
@@ -3594,7 +3692,9 @@ struct ShaderOptimizer
             Job job;
             {
                 std::unique_lock lock(mutex);
-                cv.wait(lock, [this] { return !jobs.empty(); });
+                cv.wait(lock, [this] { return stopping || !jobs.empty(); });
+                if (stopping && jobs.empty())
+                    return;
                 job = std::move(jobs.front());
                 jobs.pop_front();
             }
@@ -3614,6 +3714,21 @@ struct ShaderOptimizer
             if (const uint32_t n = ++built; n == 1 || n % 100 == 0)
                 Log("renderer: %u shaders optimised in the background", n);
         }
+    }
+
+    void Stop()
+    {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+            jobs.clear();
+            queued.clear();
+        }
+        cv.notify_all();
+        for (auto& worker : workers)
+            if (worker.joinable())
+                worker.join();
+        workers.clear();
     }
 } g_optimizer;
 
@@ -3646,13 +3761,14 @@ struct ShaderCompiler
     std::condition_variable cv;
     std::deque<CompiledShader*> queue;
     std::deque<CompiledShader*> background; // static shaders: compiled when nothing urgent waits
-    std::vector<std::thread> workers;
+    std::vector<ReGpuOwnedThread> workers;
     std::atomic<int> jobs{ 0 };   // urgent, queued or compiling (holds wait for these)
     std::atomic<int> waiting{ 0 }; // background, queued or parked
     // Once the game runs, background pushes (memory-scan finds: mostly stale copies the
     // game never draws) are parked instead: translated, compiled only if a draw promotes them.
     std::atomic<bool> park{ false };
     std::unordered_set<const CompiledShader*> parked;
+    bool stopping = false;
 
     void Start()
     {
@@ -3661,14 +3777,14 @@ struct ShaderCompiler
         const unsigned n = std::max(2u, std::thread::hardware_concurrency() - 1);
         for (unsigned i = 0; i < n; i++)
             workers.emplace_back([this] { Run(); });
-        for (auto& w : workers)
-            w.detach();
     }
 
     void Push(CompiledShader* cs, bool later = false)
     {
         {
             std::lock_guard lock(mutex);
+            if (stopping)
+                return;
             if (later)
             {
                 waiting++;
@@ -3689,7 +3805,7 @@ struct ShaderCompiler
     // Moves a background shader something now needs to the front of the urgent queue.
     void Promote(const CompiledShader& cs)
     {
-        if (cs.state.load(std::memory_order_relaxed) != CompiledShader::Pending || !waiting.load(std::memory_order_relaxed))
+        if (stopping || cs.state.load(std::memory_order_relaxed) != CompiledShader::Pending || !waiting.load(std::memory_order_relaxed))
             return;
         std::lock_guard lock(mutex);
         bool found = false;
@@ -3718,7 +3834,9 @@ struct ShaderCompiler
             bool urgent;
             {
                 std::unique_lock lock(mutex);
-                cv.wait(lock, [this] { return !queue.empty() || !background.empty(); });
+                cv.wait(lock, [this] { return stopping || !queue.empty() || !background.empty(); });
+                if (stopping && queue.empty() && background.empty())
+                    return;
                 urgent = !queue.empty();
                 auto& from = urgent ? queue : background;
                 cs = from.front();
@@ -3738,6 +3856,24 @@ struct ShaderCompiler
             else
                 Compile(*cs);
         }
+    }
+
+    void Stop()
+    {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+            queue.clear();
+            background.clear();
+            parked.clear();
+        }
+        cv.notify_all();
+        for (auto& worker : workers)
+            if (worker.joinable())
+                worker.join();
+        workers.clear();
+        jobs = 0;
+        waiting = 0;
     }
 
     static void Compile(CompiledShader& cs)
@@ -4413,26 +4549,34 @@ struct PipelineLibrary
     // there stalled the command processor for one frame every 10 s of gameplay. force (exit)
     // writes synchronously.
     std::atomic<bool> saving{ false };
+    ReGpuOwnedThread saver;
 
     void MaybeSave(bool force = false)
     {
-        if (!library || !stored.load())
-            return;
         if (force)
         {
+            if (saver.joinable())
+                saver.join();
+            saving = false;
+            if (!library || !stored.load())
+                return;
             SaveNow();
             return;
         }
+        if (!library || !stored.load())
+            return;
         if (std::chrono::steady_clock::now() - lastSave < std::chrono::seconds(10) || saving.exchange(true))
             return;
         lastSave = std::chrono::steady_clock::now();
-        std::thread([this] {
+        if (saver.joinable())
+            saver.join();
+        saver = std::thread([this] {
             // Not lower: it holds the library alone while serializing, and starving it then
             // would stall every pipeline build.
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             SaveNow();
             saving = false;
-        }).detach();
+        });
     }
 
     void SaveNow()
@@ -4464,6 +4608,15 @@ struct PipelineLibrary
                 std::chrono::duration<double, std::milli>(serialized - start).count(),
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - serialized).count());
     }
+
+    void Shutdown()
+    {
+        MaybeSave(true);
+        std::unique_lock lock(access);
+        fresh.Reset();
+        library.Reset();
+        loaded.clear();
+    }
 } g_pipelineLibrary;
 
 void InitPipelineLibrary(ID3D12Device* device)
@@ -4478,17 +4631,21 @@ struct PipelinePool
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<std::function<void()>> queue;
+    std::vector<ReGpuOwnedThread> workers;
+    bool stopping = false;
 
     PipelinePool()
     {
         const unsigned n = std::clamp(std::thread::hardware_concurrency() * 3 / 4, 2u, 12u);
         for (unsigned i = 0; i < n; i++)
-            std::thread([this] { Run(); }).detach();
+            workers.emplace_back([this] { Run(); });
     }
     void Push(std::function<void()> job)
     {
         {
             std::lock_guard lock(mutex);
+            if (stopping)
+                return;
             queue.push_back(std::move(job));
         }
         cv.notify_one();
@@ -4501,14 +4658,33 @@ struct PipelinePool
             std::function<void()> job;
             {
                 std::unique_lock lock(mutex);
-                cv.wait(lock, [this] { return !queue.empty(); });
+                cv.wait(lock, [this] { return stopping || !queue.empty(); });
+                if (stopping && queue.empty())
+                    return;
                 job = std::move(queue.front());
                 queue.pop_front();
             }
             job();
         }
     }
+
+    void Stop()
+    {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+            queue.clear();
+        }
+        cv.notify_all();
+        for (auto& worker : workers)
+            if (worker.joinable())
+                worker.join();
+        workers.clear();
+    }
 };
+
+std::unique_ptr<PipelinePool> g_pipelinePool;
+std::once_flag g_pipelinePoolStarted;
 
 std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const CompiledShader& ps, const PipelineKey& key)
 {
@@ -4613,7 +4789,9 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         g_manifest.RecordShader(true, key.ps, ps.ucodeBE);
         g_manifest.RecordPipeline(key);
     }
-    static PipelinePool pool;
+    std::call_once(g_pipelinePoolStarted, [] {
+        g_pipelinePool = std::make_unique<PipelinePool>();
+    });
     char label[64];
     snprintf(label, sizeof(label), "pipeline %08llx/%08llx", (unsigned long long)(key.vs >> 32), (unsigned long long)(key.ps >> 32));
     g_stats.Begin(label);
@@ -4632,7 +4810,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         entry->state.store(FAILED(hr) ? 2 : 1, std::memory_order_release);
         g_stats.End(!hit);
     };
-    pool.Push([entry] { entry->Build(); });
+    g_pipelinePool->Push([entry] { entry->Build(); });
     g_pipelinesCreated++;
     g_frameEvents.pipelines++;
     return entry;
@@ -7476,6 +7654,12 @@ struct Hold
     std::chrono::steady_clock::time_point lastPresent{};
 } g_hold;
 
+struct BootResources
+{
+    ComPtr<ID3D12Resource> texture, upload;
+    uint8_t* uploadCpu = nullptr;
+} g_boot;
+
 void HoldPresent();
 void SubmitLists(UINT n, ID3D12CommandList* const* lists);
 
@@ -7510,6 +7694,8 @@ void WaitHoldingImpl(const std::function<bool()>& done)
     }
     for (;;)
     {
+        if (ReGpuStopping())
+            break;
         const auto now = std::chrono::steady_clock::now();
         if (now - lastLook > std::chrono::milliseconds(400))
         {
@@ -7910,8 +8096,6 @@ void BootPresent(const std::vector<uint8_t>& rgba)
 {
     constexpr uint32_t gw = 1280, gh = 720;
     const uint32_t w = OutputWidth(), h = OutputHeight(); // the swap chain size
-    static ComPtr<ID3D12Resource> texture, upload;
-    static uint8_t* uploadCpu = nullptr;
     if (!g_r.device || rgba.size() != size_t(gw) * gh * 4)
         return;
     if (!g_hold.list)
@@ -7926,7 +8110,7 @@ void BootPresent(const std::vector<uint8_t>& rgba)
         g_hold.upload->Map(0, nullptr, &mapped);
         g_hold.uploadCpu = static_cast<uint8_t*>(mapped);
     }
-    if (!texture)
+    if (!g_boot.texture)
     {
         D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
         D3D12_RESOURCE_DESC desc{};
@@ -7937,12 +8121,13 @@ void BootPresent(const std::vector<uint8_t>& rgba)
         desc.MipLevels = 1;
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = 1;
-        if (FAILED(g_r.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture))))
+        if (FAILED(g_r.device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_boot.texture))))
             return;
-        upload = CreateBuffer(UINT64((w * 4 + 255) & ~255u) * h, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        g_boot.upload = CreateBuffer(UINT64((w * 4 + 255) & ~255u) * h, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         void* mapped = nullptr;
-        upload->Map(0, nullptr, &mapped);
-        uploadCpu = static_cast<uint8_t*>(mapped);
+        g_boot.upload->Map(0, nullptr, &mapped);
+        g_boot.uploadCpu = static_cast<uint8_t*>(mapped);
     }
     // Nearest-neighbour to the output size, centred at 16:9 on wider outputs with the
     // background's edge columns carried out to the sides.
@@ -7951,7 +8136,7 @@ void BootPresent(const std::vector<uint8_t>& rgba)
     for (uint32_t y = 0; y < h; y++)
     {
         const uint32_t* in = reinterpret_cast<const uint32_t*>(rgba.data()) + size_t(y * gh / h) * gw;
-        uint32_t* out = reinterpret_cast<uint32_t*>(uploadCpu + size_t(y) * pitch);
+        uint32_t* out = reinterpret_cast<uint32_t*>(g_boot.uploadCpu + size_t(y) * pitch);
         for (uint32_t x = 0; x < w; x++)
         {
             const uint32_t cx = x < left ? 0 : std::min(contentW - 1, x - left);
@@ -7961,19 +8146,19 @@ void BootPresent(const std::vector<uint8_t>& rgba)
     g_hold.allocator->Reset();
     g_hold.list->Reset(g_hold.allocator.Get(), nullptr);
     D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
-    dst.pResource = texture.Get();
+    dst.pResource = g_boot.texture.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.pResource = upload.Get();
+    src.pResource = g_boot.upload.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, (w * 4 + 255) & ~255u };
     g_hold.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = texture.Get();
+    b.Transition.pResource = g_boot.texture.Get();
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     g_hold.list->ResourceBarrier(1, &b);
-    const bool ok = PresenterRecordCopy(g_hold.list.Get(), texture.Get());
+    const bool ok = PresenterRecordCopy(g_hold.list.Get(), g_boot.texture.Get());
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     g_hold.list->ResourceBarrier(1, &b);
     g_hold.list->Close();
@@ -8065,6 +8250,8 @@ void RendererSaveCaches()
 
 void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash)
 {
+    if (ReGpuStopping())
+        return;
     std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
     uint64_t& current = type == 0 ? C().vsHash : C().psHash;
     // Titles reload the bound shader before most draws: the same hash is the same used microcode, so
@@ -8078,6 +8265,8 @@ void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t used
 
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
+    if (ReGpuStopping())
+        return;
     std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
     code.assign(microcodeBE, microcodeBE + ucode::UsedDwords(microcodeBE, dwords));
     (type == 0 ? C().vsHash : C().psHash) = Fnv(code.data(), code.size() * 4) ^ type;
@@ -8315,7 +8504,7 @@ void QueueInStream(std::vector<ID3D12CommandList*> lists)
 }
 
 // Waits until everything submitted to the queue so far has finished.
-void WaitForQueueIdle()
+void WaitForQueueIdle(DWORD timeoutMs = 2000)
 {
     g_r.recorder.Real(); // (hand-offs still in the replay stream queue their lists first)
     SubmitLists(0, nullptr); // (queued lists first: the signal follows them)
@@ -8323,7 +8512,7 @@ void WaitForQueueIdle()
     g_r.queue->Signal(g_r.fence.Get(), value);
     if (g_r.fence->GetCompletedValue() < value)
     {
-        WaitFenceValue(value, 2000);
+        WaitFenceValue(value, timeoutMs);
     }
 }
 
@@ -8688,6 +8877,8 @@ struct Workers
     std::vector<ID3D12GraphicsCommandList*> lists;
     std::vector<uint64_t> pieceNs; // REGPU_TRACE_PIECES
     std::vector<uint32_t> pieceThread;
+    std::vector<HANDLE> threads;
+    bool stopping = false;
 } g_workers;
 
 // One piece on this thread, with a worker context of its own.
@@ -8732,7 +8923,11 @@ void WorkerMain()
     {
         {
             std::unique_lock lock(g_workers.mutex);
-            g_workers.start.wait(lock, [&] { return g_workers.generation != seen; });
+            g_workers.start.wait(lock, [&] {
+                return g_workers.stopping || g_workers.generation != seen;
+            });
+            if (g_workers.stopping)
+                return;
             seen = g_workers.generation;
         }
         for (uint32_t i; (i = g_workers.next.fetch_add(1)) < g_workers.count;)
@@ -8776,6 +8971,21 @@ uint32_t RendererDrawWorkers()
         return v ? std::min<uint32_t>(uint32_t(atoi(v)), hw) : 0u;
     }();
     return n;
+}
+
+void StopDrawWorkers()
+{
+    {
+        std::lock_guard lock(g_workers.mutex);
+        g_workers.stopping = true;
+    }
+    g_workers.start.notify_all();
+    for (HANDLE thread : g_workers.threads)
+    {
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+    }
+    g_workers.threads.clear();
 }
 
 bool RendererParallelReady()
@@ -9263,7 +9473,7 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
             // compiler can run on these threads, and they need far more than 1 MB.
             for (uint32_t i = 0; i < RendererDrawWorkers(); i++)
                 if (HANDLE h = CreateThread(nullptr, 16u << 20, [](void*) -> DWORD { WorkerMain(); return 0; }, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr))
-                    CloseHandle(h);
+                    g_workers.threads.push_back(h);
         }
         g_workers.job = &translate;
         g_workers.count = n;
@@ -9313,6 +9523,8 @@ void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translat
 
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    if (ReGpuStopping())
+        return;
     if (g_gpuShaders)
         PassMark("vs %08X ps %08X", uint32_t(C().vsHash), uint32_t(C().psHash));
     if (!g_perfTiming)
@@ -11078,8 +11290,12 @@ void BenchmarkWriteReport(const char* path)
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer);
 void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
 {
+    if (ReGpuStopping())
+        return;
     const auto t0 = std::chrono::steady_clock::now();
     RendererOnSwapImpl(frameNumber, frontBuffer);
+    if (ReGpuStopping())
+        return;
     const auto now = std::chrono::steady_clock::now();
     g_perf.swapSeconds += std::chrono::duration<double>(now - t0).count();
     g_perf.frames++;
@@ -11228,13 +11444,13 @@ bool g_precompileDone = false;
 void BuildSeedPipelines()
 {
     const regpu::Host& host = regpu::GetHost();
-    if (!host.pipelineSeed || getenv("REGPU_NO_SEED_PIPELINES"))
+    if (ReGpuStopping() || !host.pipelineSeed || getenv("REGPU_NO_SEED_PIPELINES"))
         return;
     const auto start = std::chrono::steady_clock::now();
     std::vector<std::pair<PipelineKey, std::pair<const CompiledShader*, const CompiledShader*>>> todo;
     size_t listed = 0, known = 0, missing = 0;
     std::unordered_set<uint64_t> missingShaders, seen;
-    for (const char* p = host.pipelineSeed(); p && *p;)
+    for (const char* p = host.pipelineSeed(); p && *p && !ReGpuStopping();)
     {
         const char* end = strchr(p, '\n');
         const std::string line(p, end ? end : p + strlen(p));
@@ -11273,16 +11489,19 @@ void BuildSeedPipelines()
     std::vector<uint8_t> frame;
     size_t next = 0, failed = 0;
     auto lastShown = std::chrono::steady_clock::time_point{};
-    for (;;)
+    while (!ReGpuStopping())
     {
         // A few at a time: the pool works through them while the screen updates.
-        while (next < todo.size() &&
+        while (!ReGpuStopping() && next < todo.size() &&
                building.size() - size_t(std::count_if(building.begin(), building.end(), [](const auto& e) { return e->state.load() != 0; })) < 32)
         {
             const auto& [key, shaders] = todo[next++];
             const auto [vs, ps] = shaders;
-            while (vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending)
+            while (!ReGpuStopping() &&
+                   (vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending))
                 Sleep(1);
+            if (ReGpuStopping())
+                break;
             if (vs->IsReady() && ps->IsReady())
                 building.push_back(EnsurePipeline(*vs, *ps, key));
             else
@@ -11295,7 +11514,8 @@ void BuildSeedPipelines()
         if (now - lastShown > std::chrono::milliseconds(100))
         {
             lastShown = now;
-            if (host.bootScreen && host.bootScreen(L"BUILDING PIPELINES", uint32_t(done + failed), uint32_t(todo.size()), frame))
+            if (!ReGpuStopping() && host.bootScreen &&
+                host.bootScreen(L"BUILDING PIPELINES", uint32_t(done + failed), uint32_t(todo.size()), frame))
                 BootPresent(frame);
             else
             {
@@ -11306,6 +11526,8 @@ void BuildSeedPipelines()
         Sleep(5);
     }
     g_hold.active = false;
+    if (ReGpuStopping())
+        return;
     g_lastLongHold = std::chrono::steady_clock::now();
     Log("seed pipelines: %zu built in %.1f s (%zu skipped: a shader didn't compile)", building.size(),
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), failed);
@@ -11313,7 +11535,7 @@ void BuildSeedPipelines()
 
 void PrecompileAll()
 {
-    if (g_precompileDone)
+    if (g_precompileDone || ReGpuStopping())
         return;
     g_precompileDone = true;
     // From here on the game runs: speculative finds wait for a draw that needs them.
@@ -11340,10 +11562,10 @@ void PrecompileAll()
     size_t nextShader = 0, nextKey = 0;
     size_t shadersInstalled = 0, pipelinesStarted = 0;
     auto lastPresent = std::chrono::steady_clock::time_point{};
-    for (;;)
+    while (!ReGpuStopping())
     {
         // Phase 1: load and translate shaders a batch at a time (compiles run on worker threads).
-        for (int batch = 0; batch < 64 && nextShader < shaders.size(); batch++, nextShader++)
+        for (int batch = 0; batch < 64 && nextShader < shaders.size() && !ReGpuStopping(); batch++, nextShader++)
         {
             const auto [pixel, hash] = shaders[nextShader];
             if (g_r.shaders.count(hash))
@@ -11356,7 +11578,7 @@ void PrecompileAll()
             }
         }
         // Phase 2: start pipelines whose shaders are ready.
-        for (int batch = 0; batch < 256 && nextKey < keys.size(); batch++)
+        for (int batch = 0; batch < 256 && nextKey < keys.size() && !ReGpuStopping(); batch++)
         {
             const PipelineKey key = keys[nextKey];
             const CompiledShader* vs = nullptr;
@@ -11407,7 +11629,7 @@ void PrecompileAll()
             // phase's progress, not a held black frame.
             const regpu::Host& host = regpu::GetHost();
             std::vector<uint8_t> frame;
-            if (now - start > std::chrono::seconds(2) && host.bootScreen &&
+            if (!ReGpuStopping() && now - start > std::chrono::seconds(2) && host.bootScreen &&
                 host.bootScreen(L"COMPILING SHADERS", uint32_t(nextKey), uint32_t(keys.size()), frame))
                 BootPresent(frame);
             else
@@ -11419,6 +11641,8 @@ void PrecompileAll()
         Sleep(1);
     }
     g_hold.active = false;
+    if (ReGpuStopping())
+        return;
     // A warm start never has a long loading hold, so without this settled skipping
     // never arms and each first-time effect stalls for its compile.
     if (!keys.empty())
@@ -11435,7 +11659,7 @@ void PrecompileAll()
     // run on the background workers and the game doesn't wait for them; cached bytecode loads
     // straight away, so only the first boot pays (REGPU_NO_STATIC_SHADERS=1 skips this).
     const regpu::Host& host = regpu::GetHost();
-    if (getenv("REGPU_NO_STATIC_SHADERS") || !host.staticShaders)
+    if (ReGpuStopping() || getenv("REGPU_NO_STATIC_SHADERS") || !host.staticShaders)
         return;
     auto BootScreenCompose = [&](const wchar_t* title, uint32_t done, uint32_t total, std::vector<uint8_t>& rgba) {
         return host.bootScreen && host.bootScreen(title, done, total, rgba);
@@ -11445,10 +11669,13 @@ void PrecompileAll()
     std::vector<const CompiledShader*> compiling;
     // The first boot's search of the game files takes a few seconds: say so on screen.
     std::vector<uint8_t> bootFrame;
-    if (!(host.staticShadersSaved && host.staticShadersSaved()) && BootScreenCompose(L"PREPARING SHADERS", 0, 0, bootFrame))
+    if (!ReGpuStopping() && !(host.staticShadersSaved && host.staticShadersSaved()) &&
+        BootScreenCompose(L"PREPARING SHADERS", 0, 0, bootFrame))
         BootPresent(bootFrame);
     for (const regpu::ScannedShader& s : host.staticShaders())
     {
+        if (ReGpuStopping())
+            break;
         // The scanner accepts a candidate on control flow alone, and a few of what it finds in
         // the mesh files is not a shader (ucode::Plausible). Translating one fails on an opcode
         // the ISA doesn't define, after paying a translation on every boot.
@@ -11467,8 +11694,8 @@ void PrecompileAll()
     }
     // The vertex shaders the game makes from them (VertexPatch), as the seed lists them.
     size_t variants = 0, variantLines = 0, fitting = 0;
-    if (host.pipelineSeed && !getenv("REGPU_NO_SEED_PIPELINES"))
-        for (const char* p = host.pipelineSeed(); p && *p;)
+    if (!ReGpuStopping() && host.pipelineSeed && !getenv("REGPU_NO_SEED_PIPELINES"))
+        for (const char* p = host.pipelineSeed(); p && *p && !ReGpuStopping();)
         {
             const char* end = strchr(p, '\n');
             const std::string line(p, end ? end : p + strlen(p));
@@ -11492,6 +11719,8 @@ void PrecompileAll()
     if (variantLines)
         Log("static shaders: vertex shader variants in the seed: %zu, %zu rebuilt from the shipped shaders, %zu new to compile", variantLines, fitting,
             variants);
+    if (ReGpuStopping())
+        return;
     // Compiling them while the game runs halves the frame rate for minutes, so the first
     // boot waits here with the overlay up; later boots find the bytecode cached and
     // queue nothing.
@@ -11504,7 +11733,7 @@ void PrecompileAll()
     g_stats.staticDone = 0;
     const auto compileStart = std::chrono::steady_clock::now();
     auto lastShown = std::chrono::steady_clock::time_point{}, lastScan = std::chrono::steady_clock::now();
-    for (size_t next = 0;;)
+    for (size_t next = 0; !ReGpuStopping();)
     {
         while (next < compiling.size() && compiling[next]->state.load() != CompiledShader::Pending)
             next++;
@@ -11526,7 +11755,8 @@ void PrecompileAll()
             lastShown = now;
             g_stats.staticDone = uint32_t(std::count_if(compiling.begin(), compiling.end(),
                 [](const CompiledShader* cs) { return cs->state.load() != CompiledShader::Pending; }));
-            if (BootScreenCompose(L"COMPILING SHADERS", g_stats.staticDone.load(), g_stats.staticTotal.load(), bootFrame))
+            if (!ReGpuStopping() &&
+                BootScreenCompose(L"COMPILING SHADERS", g_stats.staticDone.load(), g_stats.staticTotal.load(), bootFrame))
                 BootPresent(bootFrame);
             else
             {
@@ -11538,17 +11768,23 @@ void PrecompileAll()
     }
     g_hold.active = false;
     g_stats.staticTotal = 0;
+    if (ReGpuStopping())
+        return;
     g_lastLongHold = std::chrono::steady_clock::now();
     Log("static shaders: %zu compiled in %.1f s (%zu found in memory meanwhile)", compiling.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - compileStart).count(), compiling.size() - size_t(toCompile));
 }
 
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
 {
+    if (ReGpuStopping())
+        return;
     if (regpu::GetHost().onSwap)
         regpu::GetHost().onSwap(g_r.frame);
-    if (!g_r.ok)
+    if (ReGpuStopping() || !g_r.ok)
         return;
     PrecompileAll();
+    if (ReGpuStopping())
+        return;
     WarmupStep();
     BeginFrameIfNeeded();
     // A frame that rendered small but never resolved a scene (a menu): upscale what it shows
@@ -12019,7 +12255,7 @@ std::string RendererDrawStats()
         g_drawStatsCounts.clear();
     }
     g_drawStats = 1;
-    for (int i = 0; i < 400 && g_drawStats.load() != 0; i++)
+    for (int i = 0; i < 400 && g_drawStats.load() != 0 && !ReGpuStopping(); i++)
         Sleep(5);
     std::lock_guard lock(g_drawStatsMutex);
     std::string out;
@@ -12031,6 +12267,73 @@ std::string RendererDrawStats()
         out += buf;
     }
     return out;
+}
+
+void ReleaseRendererResources()
+{
+    DlssShutdown();
+    Fsr3Shutdown();
+
+    g_mainContext = DrawContext{};
+    g_upscale = Upscale{};
+    g_texturePool = TexturePool{};
+    g_indexArena = IndexArena{};
+    g_hold = Hold{};
+    g_boot = BootResources{};
+    g_overlay = Overlay{};
+
+    g_timestamps.Reset();
+    g_passQueries.Reset();
+    g_passReadback.Reset();
+    g_occlusionHeap.Reset();
+    g_occlusionReadback.Reset();
+    g_timestampReadback.Reset();
+    g_gammaOut.Reset();
+    g_enhanceOut.Reset();
+
+    g_motionShaders.clear();
+    g_bytecode.clear();
+    g_pendingLists.clear();
+    g_fenced.clear();
+    for (auto& writebacks : g_deferredWritebacks)
+        writebacks.clear();
+}
+
+void RendererStop()
+{
+    StopDrawWorkers();
+    prehash::Stop();
+    g_compiler.Stop();
+    if (g_pipelinePool)
+    {
+        g_pipelinePool->Stop();
+        g_pipelinePool.reset();
+    }
+    g_optimizer.Stop();
+    g_diskWriter.Stop();
+    g_pipelineLibrary.MaybeSave(true);
+
+    if (g_r.ok)
+        WaitForQueueIdle(INFINITE);
+    overwrite::Stop();
+    g_r.recorder.Stop();
+    if (g_r.fenceEvent)
+    {
+        CloseHandle(g_r.fenceEvent);
+        g_r.fenceEvent = nullptr;
+    }
+    g_r.ok = false;
+    g_pipelineLibrary.Shutdown();
+    ReleaseRendererResources();
+    g_r.~Renderer();
+    new (&g_r) Renderer();
+    FenceWaitEvent().Reset();
+
+    if (g_profiledWorker)
+    {
+        CloseHandle(g_profiledWorker);
+        g_profiledWorker = nullptr;
+    }
 }
 
 void regpu::SetGameWidescreen(bool on) { g_gameWidescreen.store(on, std::memory_order_relaxed); }

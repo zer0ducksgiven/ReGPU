@@ -6,4 +6,5 @@ int main()
 {
     regpu::Start();
     regpu::SaveCaches();
+    regpu::Stop();
 }

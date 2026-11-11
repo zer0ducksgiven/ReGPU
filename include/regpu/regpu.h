@@ -139,6 +139,9 @@ struct Host
     void (*logThreadStacks)(const char* why) = nullptr;
     std::string (*currentStack)(int maxFrames) = nullptr;
     void (*slowFrame)(double ms) = nullptr;
+    // Optional: waits for and releases every thread created through createThread. Stop calls this
+    // after asking those threads to exit and before releasing renderer state.
+    void (*joinThreads)() = nullptr;
 };
 
 Config& GetConfig();
@@ -147,6 +150,10 @@ Host& GetHost();
 // Opens the window and the D3D12 device, and starts the command processor. Call once, after filling
 // in Config and Host, before the game calls VdInitializeRingBuffer.
 void Start();
+// Call from a host thread after the game stops submitting GPU work. Stops accepting new work,
+// wakes and joins ReGPU-owned threads, asks the host to join its guest threads, saves caches,
+// and releases resources. Idempotent; ReGPU cannot be started again.
+void Stop();
 // The debug server's controller (REGPU_DEBUG=1; tools/regpuctl.py press/hold/stick/trigger): the game
 // merges it into player 1's pad where it reads XInput (XInputGetState / XamInputGetState). False when
 // nothing is held. Buttons use the XInput bits.
@@ -173,7 +180,7 @@ void LogCrashContext();
 // The game draws its 3D view wider than 16:9 itself (a widescreen patch): ReGPU then leaves its
 // field of view alone instead of widening it (Hor+) at wide resolutions.
 void SetGameWidescreen(bool on);
-// Call when the game has stopped drawing (the window is closing): flushes the shader and pipeline caches.
+// Flushes the shader and pipeline caches without stopping ReGPU.
 void SaveCaches();
 // The output (drawing) resolution while the game runs: Config's width and height at start. Taken at
 // the start of the next frame (the host GPU idle; surfaces, upscaler and swap chain rebuilt). The

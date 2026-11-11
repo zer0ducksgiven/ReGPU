@@ -82,3 +82,10 @@ bool Fsr3Evaluate(ID3D12Device* device, ID3D12GraphicsCommandList* list, const D
     }
     return true;
 }
+
+void Fsr3Shutdown()
+{
+    if (g_fsr3.context)
+        ffxDestroyContext(&g_fsr3.context, nullptr);
+    g_fsr3 = {};
+}

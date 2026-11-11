@@ -86,6 +86,9 @@ endif()
 add_executable(regpu_linkcheck EXCLUDE_FROM_ALL tests/linkcheck.cpp)
 target_link_libraries(regpu_linkcheck PRIVATE regpu)
 
+add_executable(regpu_lifecycle_test EXCLUDE_FROM_ALL tests/lifecycle.cpp)
+target_link_libraries(regpu_lifecycle_test PRIVATE regpu)
+
 # Xenos shader disassembler / translator check (xenos_dis --hlsl <ucode files>).
 add_executable(regpu_dis EXCLUDE_FROM_ALL tools/xenos_dis.cpp)
 target_include_directories(regpu_dis PRIVATE src)

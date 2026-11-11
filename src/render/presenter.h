@@ -4,6 +4,7 @@
 
 // Window + D3D12 swap chain (REGPU_HEADLESS=1 disables it).
 void PresenterInit();
+void PresenterStop();
 // The size the game renders at (settings.h: resolution and forced aspect ratio). The swap
 // chain is the resolution; the image is centred in it and the swap chain stretches to the
 // window.

@@ -10,6 +10,7 @@ using ScannedShader = regpu::ScannedShader;
 void ShaderScanNow(unsigned threads);
 // Starts a low-priority thread that rescans every 1.5 s.
 void ShaderScanStart();
+void ShaderScanStop();
 // Moves up to maxCount queued shaders into out; false when none were queued.
 bool ShaderScanTake(std::vector<ScannedShader>& out, size_t maxCount);
 // Shaders found so far.
