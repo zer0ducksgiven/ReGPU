@@ -7450,9 +7450,21 @@ void Resolve()
         // the image at its row (BlitResolve's destRow). REGPU_NO_RESOLVE_BANDS=1: as before (A/B).
         static LiveSwitch noBands("REGPU_NO_RESOLVE_BANDS");
         LONG destRow = 0;
-        if (!noBands && !placedInImage && rect.top == 0 && rect.bottom > 0)
+        // (A zero pitch has no rows to find a band in: the copy stays an image of its own, as before.)
+        if (!noBands && !placedInImage && rect.top == 0 && rect.bottom > 0 && pitch != 0)
         {
             const uint32_t rowBytes = pitch * guestBpp;
+            // Every image the destination is a row of. Two can hold it (images that overlap in memory,
+            // one inside the other's rows); the map's order between them is arbitrary, so the band goes to
+            // the one only when it is the image the previous resolve wrote (the band before this one, or
+            // the image itself): bands of one target are copied one after another. Otherwise it is
+            // ambiguous and the copy stays an image of its own, as before.
+            struct Band
+            {
+                uint32_t base = 0, row = 0;
+                const ResolvedTexture* image = nullptr;
+            } any, last;
+            uint32_t candidates = 0;
             for (const auto& [imageBase, image] : g_r.resolved)
             {
                 if (!image.resource || imageBase >= destBase || image.width != width || image.format != format || image.frame == ~0ull ||
@@ -7463,12 +7475,22 @@ void Resolve()
                 const uint32_t row = (destBase - imageBase) / rowBytes;
                 if (row >= image.height)
                     continue;
+                candidates++;
+                any = { imageBase, row, &image };
+                if (image.serial == g_resolveSerial)
+                    last = any;
+            }
+            if (candidates > 1 && RendererTracing())
+                Log("resolve: %08X is a row of %u recent images: %s", destBase, candidates,
+                    last.image ? "the band goes to the one resolved last" : "ambiguous, kept as an image of its own");
+            if (const Band band = candidates == 1 ? any : last; band.image)
+            {
                 if (RendererTracing())
-                    Log("resolve: %08X is rows %u-%u of the %ux%u image at %08X", destBase, row, row + uint32_t(rect.bottom), image.width, image.height, imageBase);
-                base = imageBase;
-                height = image.height;
-                destRow = LONG(row);
-                break;
+                    Log("resolve: %08X is rows %u-%u of the %ux%u image at %08X", destBase, band.row, band.row + uint32_t(rect.bottom), band.image->width,
+                        band.image->height, band.base);
+                base = band.base;
+                height = band.image->height;
+                destRow = LONG(band.row);
             }
         }
         // The band's rows in the image (what the write-backs copy).
