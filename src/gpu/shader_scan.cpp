@@ -18,6 +18,7 @@
 #include <windows.h>
 
 #include "gpu/ucode.h"
+#include "lifecycle.h"
 #include "live_switch.h"
 #include "log.h"
 #include "memory.h"
@@ -31,6 +32,7 @@ std::mutex g_mutex;
 std::unordered_set<uint64_t> g_seen;
 std::vector<ScannedShader> g_found;
 std::atomic<uint64_t> g_totalFound{ 0 };
+ReGpuOwnedThread g_scanThread;
 
 uint64_t Fnv(const uint32_t* p, size_t n)
 {
@@ -67,7 +69,7 @@ void ScanWords(uint32_t first, uint32_t last, std::vector<ScannedShader>& out);
 // Scans [begin, end) (byte offsets into the view) and reports valid shaders.
 void ScanRange(uint32_t begin, uint32_t end, std::vector<ScannedShader>& out)
 {
-    for (uint32_t offset = begin; offset < end;)
+    for (uint32_t offset = begin; offset < end && !ReGpuStopping();)
     {
         uint32_t next = end;
         const uint32_t stop = ReadableEnd(offset, end, &next);
@@ -84,7 +86,7 @@ void ScanWords(uint32_t first, uint32_t runEnd, std::vector<ScannedShader>& out)
     const uint32_t* words = GuestPtr<uint32_t>(kBase);
     const uint32_t count = runEnd;
     const uint32_t last = count >= 3 ? count - 3 : 0;
-    for (uint32_t i = first; i < last; i++)
+    for (uint32_t i = first; i < last && !ReGpuStopping(); i++)
     {
         const uint32_t w = words[i];
         // Big-endian bytes C0..C3, count low, 2B, 00 read as a little-endian word.
@@ -116,6 +118,8 @@ void ScanWords(uint32_t first, uint32_t runEnd, std::vector<ScannedShader>& out)
 
 void ShaderScanNow(unsigned threads)
 {
+    if (ReGpuStopping())
+        return;
     threads = std::clamp(threads, 1u, 16u);
     std::vector<std::vector<ScannedShader>> results(threads);
     std::vector<std::thread> workers;
@@ -136,16 +140,26 @@ void ShaderScanNow(unsigned threads)
 void ShaderScanStart()
 {
     static LiveSwitch off("REGPU_NO_SHADER_SCAN");
-    if (off)
+    if (off || ReGpuStopping())
         return;
-    std::thread([] {
+    g_scanThread = std::thread([] {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        for (;;)
+        while (!ReGpuStopping())
         {
-            Sleep(1500);
+            if (ReGpuWaitForStop(std::chrono::milliseconds(1500)))
+                break;
             ShaderScanNow(1);
         }
-    }).detach();
+    });
+}
+
+void ShaderScanStop()
+{
+    if (g_scanThread.joinable())
+        g_scanThread.join();
+    std::lock_guard lock(g_mutex);
+    g_found.clear();
+    g_seen.clear();
 }
 
 bool ShaderScanTake(std::vector<ScannedShader>& out, size_t maxCount)

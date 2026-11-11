@@ -5,7 +5,9 @@
 #ifndef REGPU_DLSS
 bool DlssInit(ID3D12Device*) { return false; }
 bool DlssEvaluate(ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&) { return false; }
+void DlssShutdown() {}
 #endif
 #ifndef REGPU_FSR3
 bool Fsr3Evaluate(ID3D12Device*, ID3D12GraphicsCommandList*, const DlssSetup&, const DlssFrame&, float) { return false; }
+void Fsr3Shutdown() {}
 #endif

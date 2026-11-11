@@ -20,6 +20,7 @@
 #include "gpu/renderer.h"
 #include "gpu/texture.h"
 #include "kernel/runtime.h"
+#include "lifecycle.h"
 #include "live_switch.h"
 #include "log.h"
 #include "png.h"
@@ -123,6 +124,8 @@ std::mutex g_mutex;
 std::condition_variable g_cv;
 std::vector<TextureFetch> g_pending;
 bool g_hasPending = false;
+bool g_stopping = false;
+ReGpuOwnedThread g_compositorThread;
 
 constexpr uint32_t kCanvasW = 1280, kCanvasH = 720;
 
@@ -154,7 +157,9 @@ void CompositorLoop()
         std::vector<TextureFetch> textures;
         {
             std::unique_lock lock(g_mutex);
-            g_cv.wait(lock, [] { return g_hasPending; });
+            g_cv.wait(lock, [] { return g_stopping || g_hasPending; });
+            if (g_stopping)
+                return;
             textures.swap(g_pending);
             g_hasPending = false;
         }
@@ -167,12 +172,14 @@ void CompositorLoop()
         std::vector<uint8_t> canvas(size_t(kCanvasW) * kCanvasH * 4, 20);
         const uint32_t cols = 4, rows = 3, cellW = kCanvasW / cols, cellH = kCanvasH / rows;
         std::vector<uint8_t> image;
-        for (size_t i = 0; i < textures.size(); i++)
+        for (size_t i = 0; i < textures.size() && !ReGpuStopping(); i++)
         {
             if (DecodeTexture(textures[i], image))
                 Blit(canvas, image, textures[i].Width(), textures[i].Height(), uint32_t(i % cols) * cellW + 2,
                     uint32_t(i / cols) * cellH + 2, cellW - 4, cellH - 4);
         }
+        if (ReGpuStopping())
+            return;
         static const uint64_t dumpFrame = getenv("REGPU_DUMP_FRAME") ? strtoull(getenv("REGPU_DUMP_FRAME"), nullptr, 10) : 0;
         static uint64_t composed = 0;
         if (++composed == dumpFrame)
@@ -189,7 +196,7 @@ const bool g_textureView = getenv("REGPU_TEXVIEW") != nullptr;
 
 void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
 {
-    if (!dwords || dwords > 0x10000)
+    if (ReGpuStopping() || !dwords || dwords > 0x10000)
         return;
     const uint64_t at = uint64_t(guestAddress) << 32 ^ uint64_t(dwords) << 2 ^ uint32_t(type);
     if (g_uploads.bucket_count() < kUploadGeneration * 2)
@@ -258,6 +265,8 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
 
 void FrameOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    if (ReGpuStopping())
+        return;
     g_frameDraws++;
     if (!g_textureView)
     {
@@ -275,6 +284,8 @@ void FrameOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 
 void FrameOnSwap(uint64_t frame, uint32_t frontBuffer)
 {
+    if (ReGpuStopping())
+        return;
     if (!g_textureView)
     {
         RendererOnSwap(frame, frontBuffer);
@@ -282,7 +293,7 @@ void FrameOnSwap(uint64_t frame, uint32_t frontBuffer)
         return;
     }
     static std::once_flag started;
-    std::call_once(started, [] { std::thread(CompositorLoop).detach(); });
+    std::call_once(started, [] { g_compositorThread = std::thread(CompositorLoop); });
     {
         std::lock_guard lock(g_mutex);
         g_pending.clear();
@@ -295,4 +306,23 @@ void FrameOnSwap(uint64_t frame, uint32_t frontBuffer)
         Log("gpu: frame %llu: %u draws, %zu textures bound", (unsigned long long)frame, g_frameDraws, g_frameTextures.size());
     g_frameTextures.clear();
     g_frameDraws = 0;
+}
+
+void FrameStop()
+{
+    {
+        std::lock_guard lock(g_mutex);
+        g_stopping = true;
+        g_pending.clear();
+        g_hasPending = false;
+    }
+    g_cv.notify_all();
+    if (g_compositorThread.joinable())
+        g_compositorThread.join();
+    g_shaders.clear();
+    g_uploads.clear();
+    g_uploadsOld.clear();
+    for (UploadAt& upload : g_uploadsAt)
+        upload = {};
+    g_frameTextures.clear();
 }

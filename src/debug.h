@@ -5,6 +5,7 @@
 #include <string>
 
 void DebugServerStart();
+void DebugServerStop();
 
 #include "regpu/regpu.h"
 

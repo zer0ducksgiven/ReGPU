@@ -20,8 +20,11 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "lifecycle.h"
 #include "live_switch.h"
 #include "log.h"
 #include "memory.h"
@@ -51,6 +54,13 @@ uint64_t g_swaps = 0; // swaps seen, for the waits
 std::deque<Clock::time_point> g_swapTimes; // the last second's swaps (fps)
 std::vector<float> g_frameMs; // frame times (ms) since the last "frametimes"
 Clock::time_point g_lastSwap{};
+std::mutex g_serverMutex;
+SOCKET g_listener = INVALID_SOCKET;
+std::unordered_set<SOCKET> g_clients;
+ReGpuOwnedThread g_serverThread;
+std::vector<ReGpuOwnedThread> g_clientThreads;
+bool g_wsaStarted = false;
+std::atomic<bool> g_quitRequested{ false };
 
 // Input: buttons held until released, and timed presses/sticks/triggers.
 struct Timed
@@ -113,7 +123,9 @@ uint64_t WaitFrames(uint64_t n, double timeoutSeconds)
 {
     std::unique_lock lock(g_mutex);
     const uint64_t target = g_swaps + n;
-    g_swapped.wait_for(lock, std::chrono::duration<double>(timeoutSeconds), [&] { return g_swaps >= target; });
+    g_swapped.wait_for(lock, std::chrono::duration<double>(timeoutSeconds), [&] {
+        return ReGpuStopping() || g_swaps >= target;
+    });
     return g_frame;
 }
 
@@ -132,6 +144,8 @@ std::string Handle(const std::string& line)
     in >> cmd;
     for (char& c : cmd)
         c = char(tolower(uint8_t(c)));
+    if (ReGpuStopping())
+        return Error("stopping");
 
     if (cmd == "ping")
         return Ok();
@@ -263,7 +277,9 @@ std::string Handle(const std::string& line)
         in >> arg;
         if (!arg.empty() && arg.back() == 's')
         {
-            std::this_thread::sleep_for(std::chrono::duration<double>(atof(arg.c_str())));
+            const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::duration<double>(std::max(0.0, atof(arg.c_str()))));
+            ReGpuWaitForStop(delay);
             std::lock_guard lock(g_mutex);
             return Ok("\"frame\":" + std::to_string(g_frame));
         }
@@ -281,7 +297,9 @@ std::string Handle(const std::string& line)
         std::unique_lock lock(g_mutex);
         const uint64_t before = g_shotsDone;
         g_shotPath = path;
-        if (!g_swapped.wait_for(lock, std::chrono::seconds(15), [&] { return g_shotsDone != before; }))
+        if (!g_swapped.wait_for(lock, std::chrono::seconds(15), [&] {
+                return ReGpuStopping() || g_shotsDone != before;
+            }) || ReGpuStopping())
         {
             g_shotPath.clear();
             return Error("no frame came (the game may be loading or paused)");
@@ -312,7 +330,9 @@ std::string Handle(const std::string& line)
         g_burstExt = raw ? ".raw" : ".png";
         g_burstTotal = g_burstLeft = n;
         g_shotPath = dir + "/s0" + g_burstExt;
-        if (!g_swapped.wait_for(lock, std::chrono::seconds(60), [&] { return g_shotsDone - before >= n; }))
+        if (!g_swapped.wait_for(lock, std::chrono::seconds(60), [&] {
+                return ReGpuStopping() || g_shotsDone - before >= n;
+            }) || ReGpuStopping())
         {
             g_shotPath.clear();
             g_burstLeft = 0;
@@ -412,7 +432,7 @@ std::string Handle(const std::string& line)
         // (and a few frames later, so the next shot has it everywhere).
         bool ready = !alias;
         const auto deadline = Clock::now() + std::chrono::seconds(30); // vertex shaders take ~5 s
-        while (!ready && Clock::now() < deadline)
+        while (!ready && !ReGpuStopping() && Clock::now() < deadline)
         {
             WaitFrames(1, 0.1);
             ready = RendererPsEditReady(alias);
@@ -491,7 +511,7 @@ std::string Handle(const std::string& line)
         }
         std::string out;
         int found = 0;
-        for (uint64_t a = 0x10000; a < 0x100000000ull && found < 64;)
+        for (uint64_t a = 0x10000; a < 0x100000000ull && found < 64 && !ReGpuStopping();)
         {
             MEMORY_BASIC_INFORMATION mi{};
             if (!VirtualQuery(g_base + a, &mi, sizeof(mi)))
@@ -501,7 +521,8 @@ std::string Handle(const std::string& line)
             {
                 const std::string_view region(reinterpret_cast<const char*>(g_base + start), size_t(end - start));
                 for (const auto& [kind, n] : needles)
-                    for (size_t at = region.find(n); at != std::string_view::npos && found < 64; at = region.find(n, at + 1), found++)
+                    for (size_t at = region.find(n); at != std::string_view::npos && found < 64 && !ReGpuStopping();
+                         at = region.find(n, at + 1), found++)
                     {
                         char buf[48];
                         snprintf(buf, sizeof(buf), "%s{\"address\":\"%08llX\",\"as\":\"%s\"}", out.empty() ? "" : ",", (unsigned long long)(start + at), kind.c_str());
@@ -528,10 +549,7 @@ std::string Handle(const std::string& line)
     {
         Log("debug: quit requested");
         fflush(nullptr);
-        std::thread([] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            ExitProcess(0);
-        }).detach();
+        g_quitRequested = true;
         return Ok();
     }
     return Error("unknown command: " + cmd);
@@ -541,10 +559,10 @@ void Serve(SOCKET client)
 {
     std::string pending;
     char buf[4096];
-    for (;;)
+    while (!ReGpuStopping())
     {
         const int n = recv(client, buf, sizeof(buf), 0);
-        if (n <= 0)
+        if (n <= 0 || ReGpuStopping())
             break;
         pending.append(buf, size_t(n));
         for (size_t nl; (nl = pending.find('\n')) != std::string::npos;)
@@ -557,7 +575,16 @@ void Serve(SOCKET client)
                 continue;
             const std::string reply = Handle(line) + "\n";
             send(client, reply.data(), int(reply.size()), 0);
+            if (g_quitRequested.exchange(false))
+            {
+                if (!ReGpuWaitForStop(std::chrono::milliseconds(200)))
+                    ExitProcess(0);
+            }
         }
+    }
+    {
+        std::lock_guard lock(g_serverMutex);
+        g_clients.erase(client);
     }
     closesocket(client);
 }
@@ -569,11 +596,20 @@ void DebugServerStart()
     if (!on || !*on || *on == '0')
         return;
     const int port = getenv("REGPU_DEBUG_PORT") ? atoi(getenv("REGPU_DEBUG_PORT")) : 7341;
-    std::thread([port] {
+    g_serverThread = std::thread([port] {
         SetThreadDescription(GetCurrentThread(), L"debug server");
         WSADATA wsa;
-        WSAStartup(MAKEWORD(2, 2), &wsa);
+        if (WSAStartup(MAKEWORD(2, 2), &wsa))
+            return;
+        {
+            std::lock_guard lock(g_serverMutex);
+            g_wsaStarted = true;
+        }
         SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        {
+            std::lock_guard lock(g_serverMutex);
+            g_listener = listener;
+        }
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(uint16_t(port));
@@ -581,22 +617,91 @@ void DebugServerStart()
         if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) || listen(listener, 4))
         {
             Log("debug: can't listen on 127.0.0.1:%d", port);
+            bool closeListener = false;
+            {
+                std::lock_guard lock(g_serverMutex);
+                if (g_listener == listener)
+                {
+                    g_listener = INVALID_SOCKET;
+                    closeListener = true;
+                }
+            }
+            if (closeListener)
+                closesocket(listener);
             return;
         }
         Log("debug: listening on 127.0.0.1:%d (tools/regpuctl.py)", port);
-        for (;;)
+        while (!ReGpuStopping())
         {
             SOCKET client = accept(listener, nullptr, nullptr);
             if (client == INVALID_SOCKET)
                 break;
-            std::thread(Serve, client).detach();
+            std::lock_guard lock(g_serverMutex);
+            if (ReGpuStopping())
+            {
+                closesocket(client);
+                break;
+            }
+            g_clients.insert(client);
+            g_clientThreads.emplace_back(Serve, client);
         }
-    }).detach();
+        bool closeListener = false;
+        {
+            std::lock_guard lock(g_serverMutex);
+            if (g_listener == listener)
+            {
+                g_listener = INVALID_SOCKET;
+                closeListener = true;
+            }
+        }
+        if (closeListener)
+            closesocket(listener);
+    });
+}
+
+void DebugServerStop()
+{
+    SOCKET listener = INVALID_SOCKET;
+    {
+        std::lock_guard lock(g_serverMutex);
+        listener = std::exchange(g_listener, INVALID_SOCKET);
+    }
+    if (listener != INVALID_SOCKET)
+        closesocket(listener);
+    if (g_serverThread.joinable())
+        g_serverThread.join();
+
+    g_swapped.notify_all();
+    {
+        std::lock_guard lock(g_serverMutex);
+        for (SOCKET client : g_clients)
+            shutdown(client, SD_BOTH);
+    }
+    for (auto& thread : g_clientThreads)
+        if (thread.joinable())
+            thread.join();
+    g_clientThreads.clear();
+
+    bool cleanup = false;
+    {
+        std::lock_guard lock(g_serverMutex);
+        cleanup = std::exchange(g_wsaStarted, false);
+    }
+    if (cleanup)
+        WSACleanup();
+
+    std::lock_guard lock(g_mutex);
+    g_held = {};
+    g_timed.clear();
+    g_inputActive = false;
+    g_shotPath.clear();
+    g_burstDir.clear();
+    g_burstLeft = g_burstTotal = 0;
 }
 
 bool regpu::DebugPadState(DebugPad& pad)
 {
-    if (!g_inputActive.load(std::memory_order_relaxed))
+    if (ReGpuStopping() || !g_inputActive.load(std::memory_order_relaxed))
         return false;
     std::lock_guard lock(g_mutex);
     const auto now = Clock::now();

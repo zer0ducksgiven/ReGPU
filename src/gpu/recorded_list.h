@@ -19,6 +19,8 @@
 
 #include <d3d12.h>
 
+#include "lifecycle.h"
+
 // REGPU_PERF: calls recorded, by op (RecordedList::Op), and resource barriers in them (counted only then:
 // an atomic increment per recorded call was ~1% of the command processor).
 inline std::atomic<uint64_t> g_recordedOps[32];
@@ -56,7 +58,22 @@ public:
         m_real = real;
         m_direct = direct || getenv("REGPU_NO_RECORD_THREAD") != nullptr;
         if (!m_direct)
-            std::thread([this] { Worker(); }).detach();
+            m_thread = std::thread([this] { Worker(); });
+    }
+
+    void Stop()
+    {
+        if (m_direct)
+            return;
+        Drain();
+        {
+            std::lock_guard lock(m_mutex);
+            m_stopping = true;
+        }
+        m_work.notify_all();
+        if (m_thread.joinable())
+            m_thread.join();
+        m_direct = true;
     }
 
     // Records into another list from now on (after replaying everything so far).
@@ -184,6 +201,8 @@ private:
     std::condition_variable m_work, m_idle;
     std::deque<RecordBytes> m_queue, m_spare;
     bool m_busy = false;
+    bool m_stopping = false;
+    ReGpuOwnedThread m_thread;
 
     void Put(Op op, const void* a, size_t na, const void* b = nullptr, size_t nb = 0)
     {
@@ -253,7 +272,9 @@ private:
             RecordBytes chunk;
             {
                 std::unique_lock lock(m_mutex);
-                m_work.wait(lock, [this] { return !m_queue.empty(); });
+                m_work.wait(lock, [this] { return m_stopping || !m_queue.empty(); });
+                if (m_stopping && m_queue.empty())
+                    break;
                 chunk = std::move(m_queue.front());
                 m_queue.pop_front();
                 m_busy = true;

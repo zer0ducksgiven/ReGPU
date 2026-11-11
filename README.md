@@ -63,6 +63,7 @@ regpu::Host& host = regpu::GetHost();
 host.base = guestMemoryBase;                 // the guest's 4 GB address space
 host.alloc = [](bool physical, uint32_t size, uint32_t align) { return MyGuestAlloc(physical, size, align); };
 host.createThread = [](const char* name, void (*body)(PPCContext&)) { MyCreateHostGuestThread(name, body); };
+host.joinThreads = [] { MyJoinHostGuestThreads(); }; // optional; lets Stop wait for createThread work
 host.currentPcr = [] { return MyCurrentThread().pcr; };
 host.guestCall = [](PPCContext& ctx, uint32_t address) { MyGuestCall(ctx, address); };
 host.interruptLockAcquire = [](int cpu) { MyInterruptLock(cpu); };
@@ -73,6 +74,9 @@ regpu::Start();   // window, device, command processor
 
 Your runtime already has these: they are the pieces any XenonRecomp port builds for its own threads
 and memory. ReGPU never touches the rest of the kernel (files, threads, XAM, audio), which stays yours.
+After the game has stopped submitting graphics work, call `regpu::Stop()` from a host thread. It is
+idempotent, saves the caches, joins ReGPU's workers, calls `joinThreads` when supplied, and releases
+graphics resources. A stopped ReGPU instance cannot be started again.
 
 The renderer currently assumes the game draws at 1280x720, as most Xbox 360 games do (see
 [`docs/xenos-notes.md`](docs/xenos-notes.md)).

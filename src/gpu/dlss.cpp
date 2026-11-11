@@ -15,7 +15,7 @@ namespace
 {
 struct Dlss
 {
-    bool tried = false, available = false;
+    bool tried = false, initialized = false, available = false;
     ID3D12Device* device = nullptr;
     NVSDK_NGX_Parameter* params = nullptr;
     NVSDK_NGX_Handle* feature = nullptr;
@@ -40,6 +40,7 @@ bool DlssInit(ID3D12Device* device)
         Log("dlss: NGX init failed (%08X): not an NVIDIA RTX GPU or driver, or nvngx_dlss.dll missing", unsigned(r));
         return false;
     }
+    g_dlss.initialized = true;
     r = NVSDK_NGX_D3D12_GetCapabilityParameters(&g_dlss.params);
     int supported = 0, needsUpdate = 0;
     if (NVSDK_NGX_SUCCEED(r))
@@ -112,4 +113,21 @@ bool DlssEvaluate(ID3D12GraphicsCommandList* list, const DlssSetup& setup, const
         return false;
     }
     return true;
+}
+
+void DlssShutdown()
+{
+    if (g_dlss.feature)
+    {
+        NVSDK_NGX_D3D12_ReleaseFeature(g_dlss.feature);
+        g_dlss.feature = nullptr;
+    }
+    if (g_dlss.params)
+    {
+        NVSDK_NGX_D3D12_DestroyParameters(g_dlss.params);
+        g_dlss.params = nullptr;
+    }
+    if (g_dlss.initialized)
+        NVSDK_NGX_D3D12_Shutdown1(g_dlss.device);
+    g_dlss = {};
 }
