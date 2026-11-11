@@ -24,8 +24,11 @@ struct Config
     bool enhance = false;                // enhanced lighting post pass (experimental)
     uint32_t msaa = 1;                   // samples per pixel: 1 (off), 2, 4 or 8
     // Upscaling: the 3D scene renders smaller and is upscaled before post-processing and the
-    // HUD, which stay at full resolution. Fsr3 and Dlss need REGPU_FSR3 / REGPU_DLSS builds.
-    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss };
+    // HUD, which stay at full resolution. Fsr3, Fsr4 and Dlss need REGPU_FSR3 / REGPU_DLSS builds.
+    // Fsr4: the FidelityFX ML upscaler where the GPU lists it, and only with REGPU_FSR4=1 (it hung some
+    // RDNA 2/3 devices in the FM4 port); FSR 3 otherwise. The temporal ones (Fsr3, Fsr4, Dlss) run only on
+    // frames with a 3D scene of their own, and need MSAA off: with one chosen the scene draws at 1x.
+    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss, Fsr4 };
     Upscaler upscaler = Upscaler::Off;
     uint32_t quality = 1;   // 0 native (anti-aliasing only), 1 quality, 2 balanced, 3 performance, 4 ultra performance
     float sharpness = 0.5f; // 0-1

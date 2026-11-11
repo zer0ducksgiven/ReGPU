@@ -101,22 +101,48 @@ float g_sceneScale = 1.0f;
 bool g_scenePhase = false;
 // A temporal upscaler this frame: the scene's main view draws with motion vectors and jitter.
 bool g_temporal = false;
+// What reaches the temporal upscaler's motion and depth paths, summed and logged once a second while
+// REGPU_TEMPORAL_STATS is on (BeginTemporalFrame): which of the conditions for a draw's motion vectors and
+// for the scene's depth copy holds, and how often (from the FM4 and FM2 ports).
+struct TemporalStats
+{
+    std::atomic<uint32_t> frames{ 0 }, draws{ 0 }, edram4{ 0 }, widePass{ 0 }, wantMotion{ 0 }, shaderMissing{ 0 }, shaderNotReady{ 0 }, noPipeline{ 0 },
+        motion{ 0 }, known{ 0 }, resolves{ 0 }, resolveFullWidth{ 0 }, sceneDone{ 0 }, evaluated{ 0 }, depthCopies{ 0 }, depthNoTarget{ 0 }, depthEmpty{ 0 }, cuts{ 0 },
+        cutSamples{ 0 }, cutHits{ 0 };
+} g_tstat;
 struct Upscale
 {
     bool tried = false, ready = false;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> easu, rcas, depthCopy, gamma, enhance;
+    ComPtr<ID3D12PipelineState> easu, rcas, depthCopy, gamma, enhance, view;
+    // This frame's motion and depth were handed to the upscaler, at this render size (ViewFrontBuffer).
+    bool viewValid = false;
+    uint32_t viewWidth = 0, viewHeight = 0;
     ComPtr<ID3D12Resource> dlaaOut; // DLAA output (scene size), copied back into the scene image
     ComPtr<ID3D12Resource> depth; // temporal: the scene's depth as R32 (render size, top left)
     ComPtr<ID3D12Resource> temp; // EASU output (RGBA16F)
     uint32_t tempWidth = 0, tempHeight = 0;
     bool switchedThisFrame = false;
     uint64_t retryFrame = 0; // after a frame with no scene to upscale (menus): native until then
+    // Temporal upscalers only run on frames with a 3D scene of their own: one whose first full-screen colour
+    // resolve is not the front buffer. A title that draws a screen (a menu, a showroom) straight into the
+    // front buffer, HUD and all, has no separate scene to reconstruct, and that frame stays at full size.
+    // fullResolveBase: this frame's first full-screen colour resolve; sceneOk: last frame had such a scene,
+    // so this one may use the scene phase (decided at each swap, from the FM2 port).
+    // REGPU_TEMPORAL_ANY_FRAME=1: every frame tries, as before.
+    uint32_t fullResolveBase = ~0u;
+    bool sceneOk = false;
     // Temporal upscalers: the motion target (RG16F, output size; UV offsets to last frame),
     // this frame's jitter (pixels and NDC) and the scene's render size.
     ComPtr<ID3D12Resource> motion;
     ComPtr<ID3D12DescriptorHeap> motionRtvHeap;
     D3D12_CPU_DESCRIPTOR_HANDLE motionRtv{};
+    // The reactive mask for FSR 3/4 (R8, output size, the motion pipelines' third target): blended draws that
+    // were not found in last frame (dynamic geometry: smoke, dust, sparks, particles) write how much they
+    // cover; opaque draws leave it alone. The upscaler then trusts the new frame there instead of smearing
+    // its history: those draws have no motion of their own.
+    ComPtr<ID3D12Resource> reactive;
+    D3D12_CPU_DESCRIPTOR_HANDLE reactiveRtv{};
     float jitterPx[2] = {}, jitterNdc[2] = {};
     uint32_t renderWidth = 0, renderHeight = 0;
     bool reset = true; // no usable history (first frame, after menus)
@@ -126,7 +152,14 @@ struct Upscale
     {
         uint32_t frame = 0;                    // the temporal frame that last drew it
         D3D12_GPU_VIRTUAL_ADDRESS address[2]{}; // its vertex constants in that frame's ring, by frame parity
+        float first[16]{};                      // its c0-c3 that frame (camera cut detection; set for sampled draws)
+        uint32_t firstFrame = 0;
     };
+    // Camera cuts: the frame's first draws with motion compare their c0-c3 (a transform, in most scene
+    // shaders) with last frame's; when most of them turned a long way at once the view was cut, and the
+    // upscaler drops its history (EvaluateTemporal). cutSamples/cutHits count this frame's comparisons.
+    uint32_t cutSamples = 0, cutHits = 0;
+    bool cut = false;
     std::unordered_map<uint64_t, DrawConstants> constants;
     std::unordered_map<uint64_t, uint32_t> occurrences;
     uint32_t constantsFrame = 0;
@@ -1560,8 +1593,14 @@ bool PhysicalHeapAliasesGuest(ID3D12Device* d, ID3D12Resource* physical)
 // Depth resolves: a depth-stencil buffer can only be copied whole, so the
 // resolve rectangle is drawn into an R32_FLOAT texture by a tiny pass that
 // reads the depth buffer at the same pixel.
-// The highest sample count up to want that the device supports for both the colour and depth formats (1 when none).
-uint32_t SupportedMsaa(uint32_t want)
+// DLSS, FSR 3 or FSR 4: the scene is reconstructed over several frames (motion vectors, jitter).
+bool TemporalUpscalerChosen(const Settings& st)
+{
+    return st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3 || st.upscaler == Settings::Upscaler::Fsr4;
+}
+
+// The highest sample count up to `want` the device supports for the colour and depth formats (1 when none).
+uint32_t DeviceMsaa(uint32_t want)
 {
     for (want = want > 8 ? 8 : want; want > 1; want /= 2)
     {
@@ -1571,6 +1610,17 @@ uint32_t SupportedMsaa(uint32_t want)
             return want;
     }
     return 1;
+}
+
+// The scene surfaces' sample count for the setting `want`: as the device allows, and 1 while a temporal
+// upscaler is chosen (they anti-alias themselves; MSAA under them removed the device in FM2, and FSR 4
+// crashed creating its context with 4x in FM4). REGPU_TEMPORAL_MSAA=1: as set (A/B).
+uint32_t SupportedMsaa(uint32_t want)
+{
+    static const bool keep = getenv("REGPU_TEMPORAL_MSAA") != nullptr;
+    if (!keep && TemporalUpscalerChosen(GetSettings()))
+        return 1;
+    return DeviceMsaa(want);
 }
 
 void InitDepthBlit()
@@ -1695,7 +1745,7 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     // change it while the game runs): depth takes sample 0, colour averages all samples.
     for (uint32_t samples = 2; samples <= 8; samples *= 2)
     {
-        if (SupportedMsaa(samples) != samples)
+        if (DeviceMsaa(samples) != samples)
             continue;
         const std::string msSource = "#define SAMPLES " + std::to_string(samples) + R"(
 Texture2DMS<float, SAMPLES> depthMs : register(t0);
@@ -2129,6 +2179,7 @@ void ApplyOutputSize()
     g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     g_upscale.depth.Reset();
     g_upscale.motion.Reset();
+    g_upscale.reactive.Reset();
     g_upscale.dlaaOut.Reset();
     g_upscale.renderWidth = g_upscale.renderHeight = 0;
     g_upscale.reset = true;
@@ -2646,11 +2697,19 @@ void BeginFrameIfNeeded()
     // This frame's scene phase and scale (see UpscaleScene).
     {
         const Settings& st = GetSettings();
-        const bool temporalUpscaler = st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3;
+        const bool temporalChosen = TemporalUpscalerChosen(st);
+        // DLSS and FSR 3/4 anti-alias the image themselves; with MSAA as well the device was removed at the first
+        // scene resolve (FM2), and FSR 4 crashed at context creation with 4x (FM4). The scene surfaces are 1x
+        // while one is chosen at the start or with SetMsaa; one chosen live with MSAA on waits for that.
+        const bool temporalUpscaler = temporalChosen && g_msaa == 1;
+        if (temporalChosen && g_msaa > 1)
+            LOG_ONCE("upscale: a temporal upscaler needs MSAA off (%ux now): FSR 1 until the anti-aliasing is set again", g_msaa);
         const float scale = st.SceneScale();
         g_upscale.switchedThisFrame = false;
+        g_upscale.fullResolveBase = ~0u;
+        static LiveSwitch anyFrame("REGPU_TEMPORAL_ANY_FRAME");
         g_scenePhase = st.upscaler != Settings::Upscaler::Off && (temporalUpscaler || scale < 1.0f) && g_r.frame >= g_upscale.retryFrame &&
-            (!temporalUpscaler || TemporalInit());
+            (!temporalUpscaler || ((g_upscale.sceneOk || anyFrame) && TemporalInit()));
         g_temporal = g_scenePhase && temporalUpscaler;
         g_sceneScale = g_scenePhase ? scale : 1.0f;
         if (g_temporal)
@@ -3686,6 +3745,18 @@ struct ShaderCompiler
         cv.notify_one();
     }
 
+    // A shader no draw waits for (the motion-vector variants: draws go without motion until theirs is
+    // ready): compiled when nothing urgent is queued, parked or not, and never part of what a hold waits for.
+    void PushQuiet(CompiledShader* cs)
+    {
+        {
+            std::lock_guard lock(mutex);
+            waiting++;
+            background.push_back(cs);
+        }
+        cv.notify_one();
+    }
+
     // Moves a background shader something now needs to the front of the urgent queue.
     void Promote(const CompiledShader& cs)
     {
@@ -4115,7 +4186,7 @@ std::string MotionVariant(const std::string& hlsl, bool pixel)
         return {};
     if (pixel)
     {
-        if (!replace("float4 main(VSOut input) : SV_Target0\n{", "struct PSMotionOut { float4 c : SV_Target0; float2 mv : SV_Target1; };\n"
+        if (!replace("float4 main(VSOut input) : SV_Target0\n{", "struct PSMotionOut { float4 c : SV_Target0; float2 mv : SV_Target1; float reactive : SV_Target2; };\n"
                                                                     "PSMotionOut main(VSOut input)\n{"))
             return {};
         const size_t at = h.rfind("    return oC[0];\n}");
@@ -4126,6 +4197,10 @@ std::string MotionVariant(const std::string& hlsl, bool pixel)
             "    motionOut.c = oC[0];\n"
             "    float2 cur = input.mcur.xy / input.mcur.w, prev = input.mprev.xy / input.mprev.w;\n"
             "    motionOut.mv = (prev - cur) * float2(0.5, -0.5);\n"
+            // The reactive mask: how much this draw covers: its alpha (scaled by mcur.z, set for draws that blend
+            // by their alpha) or its brightness (by mprev.z, for the others: additive light). Both are 0 unless
+            // the draw is dynamic geometry (see Upscale::reactive).
+            "    motionOut.reactive = saturate(input.mcur.z * oC[0].a + input.mprev.z * max(oC[0].r, max(oC[0].g, oC[0].b)));\n"
             "    return motionOut;\n}");
         return h;
     }
@@ -4161,7 +4236,9 @@ std::string MotionVariant(const std::string& hlsl, bool pixel)
         "        GuestVSPrev(e, q, qo, qpts);\n"
         "        r.mprev = ToClip(q, pointOffset);\n"
         "    }\n"
-        "    r.pos.xy += vjitter.xy * r.pos.w;\n");
+        "    r.pos.xy += vjitter.xy * r.pos.w;\n"
+        "    r.mcur.z = vjitter.z;\n" // (the pixel shader uses xy and w only of these two: their z carry the reactive scales)
+        "    r.mprev.z = vjitter.w;\n");
     h.insert(mainAt, fn);
     // VSOut members the original code never sets.
     return h;
@@ -4210,7 +4287,13 @@ const CompiledShader* MotionShaderLookup(const CompiledShader& base)
         g_bytecode.emplace(cs.cacheKey, cs.code);
         return &cs;
     }
-    g_compiler.Push(&cs, false);
+    // Not urgent: as urgent jobs they made any hold wait for every variant (FM2's first FSR 3 race on an FX-8350
+    // froze for most of a minute: ~130 variants at 2 s each). REGPU_MOTION_URGENT=1: as before.
+    static const bool urgent = getenv("REGPU_MOTION_URGENT") != nullptr;
+    if (urgent)
+        g_compiler.Push(&cs, false);
+    else
+        g_compiler.PushQuiet(&cs);
     return &cs;
 }
 
@@ -4597,13 +4680,24 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     if (motion)
     {
         pd.pRootSignature = g_r.motionRootSignature.Get();
-        pd.NumRenderTargets = 2;
+        pd.NumRenderTargets = 3;
         pd.RTVFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
+        pd.RTVFormats[2] = DXGI_FORMAT_R8_UNORM;
         pd.BlendState.IndependentBlendEnable = TRUE;
         auto& mv = pd.BlendState.RenderTarget[1];
         mv = D3D12_RENDER_TARGET_BLEND_DESC{};
         // Blended draws (glass, smoke) keep the motion of what is behind them.
         mv.RenderTargetWriteMask = rt.BlendEnable ? 0 : D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
+        // The reactive mask (Upscale::reactive): blended draws keep the larger of what is there and what they
+        // write. Opaque draws leave it alone: the dynamic blended draws come late in a scene, and a full-screen
+        // opaque pass after them would otherwise wipe it.
+        auto& re = pd.BlendState.RenderTarget[2];
+        re = D3D12_RENDER_TARGET_BLEND_DESC{};
+        re.BlendEnable = TRUE;
+        re.SrcBlend = re.SrcBlendAlpha = D3D12_BLEND_ONE;
+        re.DestBlend = re.DestBlendAlpha = D3D12_BLEND_ONE;
+        re.BlendOp = re.BlendOpAlpha = D3D12_BLEND_OP_MAX;
+        re.RenderTargetWriteMask = rt.BlendEnable ? D3D12_COLOR_WRITE_ENABLE_RED : 0;
     }
     auto entry = std::make_shared<PipelineEntry>();
     g_r.pipelines[key] = entry;
@@ -4807,6 +4901,11 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         }
         entry = EnsurePipeline(vs, ps, key);
     }
+    // A motion pipeline is never waited for: the draw uses its plain pipeline (no motion) until this one is built
+    // (REGPU_MOTION_URGENT=1: waited for, as before).
+    static const bool motionWaits = getenv("REGPU_MOTION_URGENT") != nullptr;
+    if (motion && !motionWaits && entry->state.load(std::memory_order_acquire) != 1)
+        return nullptr;
     if (SkippableDraw(depthOnly, key.blend) && entry->state.load(std::memory_order_acquire) == 0)
     {
         g_skippedPipeline++;
@@ -6425,11 +6524,18 @@ bool TemporalInit()
             return false;
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 1;
+        hd.NumDescriptors = 2;
         if (FAILED(g_r.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_upscale.motionRtvHeap))))
             return false;
         g_upscale.motionRtv = g_upscale.motionRtvHeap->GetCPUDescriptorHandleForHeapStart();
         g_r.device->CreateRenderTargetView(g_upscale.motion.Get(), nullptr, g_upscale.motionRtv);
+        td.Format = cv.Format = DXGI_FORMAT_R8_UNORM;
+        if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
+                IID_PPV_ARGS(&g_upscale.reactive))))
+            return false;
+        g_upscale.reactiveRtv = g_upscale.motionRtv;
+        g_upscale.reactiveRtv.ptr += g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        g_r.device->CreateRenderTargetView(g_upscale.reactive.Get(), nullptr, g_upscale.reactiveRtv);
         td.Format = DXGI_FORMAT_R32_FLOAT;
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
@@ -6444,8 +6550,16 @@ void CopySceneDepth(const D3D12_RECT& gameRect)
 {
     const D3D12_RECT r = ToHost(gameRect);
     FrameResources& f = Frame();
-    if (!g_upscale.depth || !C().depth || r.right <= r.left || r.bottom <= r.top || f.descriptorsUsed + 2 > kDescriptorsPerFrame)
+    if (!g_upscale.depth || !C().depth)
+    {
+        g_tstat.depthNoTarget++;
         return;
+    }
+    if (r.right <= r.left || r.bottom <= r.top || f.descriptorsUsed + 2 > kDescriptorsPerFrame)
+    {
+        g_tstat.depthEmpty++;
+        return;
+    }
     const UINT slots = f.descriptorBase + f.descriptorsUsed;
     f.descriptorsUsed += 2;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -6479,6 +6593,7 @@ void CopySceneDepth(const D3D12_RECT& gameRect)
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     C().list->ResourceBarrier(1, &b);
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
+    g_tstat.depthCopies++;
 }
 
 float Halton(uint32_t index, uint32_t base)
@@ -6495,6 +6610,26 @@ float Halton(uint32_t index, uint32_t base)
 // Start of a temporal frame: jitter, a cleared motion target, the next constants map.
 void BeginTemporalFrame()
 {
+    g_tstat.frames++;
+    g_upscale.cutSamples = g_upscale.cutHits = 0;
+    static auto statsLogged = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now(); now - statsLogged >= std::chrono::seconds(1))
+    {
+        statsLogged = now;
+        auto take = [](std::atomic<uint32_t>& v) { return v.exchange(0); };
+        const uint32_t frames = take(g_tstat.frames), draws = take(g_tstat.draws), edram4 = take(g_tstat.edram4), wide = take(g_tstat.widePass),
+            want = take(g_tstat.wantMotion), missing = take(g_tstat.shaderMissing), notReady = take(g_tstat.shaderNotReady), noPso = take(g_tstat.noPipeline),
+            motion = take(g_tstat.motion), known = take(g_tstat.known), resolves = take(g_tstat.resolves), fullWidth = take(g_tstat.resolveFullWidth),
+            done = take(g_tstat.sceneDone), evaluated = take(g_tstat.evaluated), copies = take(g_tstat.depthCopies), noTarget = take(g_tstat.depthNoTarget),
+            empty = take(g_tstat.depthEmpty), cuts = take(g_tstat.cuts), cutSamples = take(g_tstat.cutSamples), cutHits = take(g_tstat.cutHits);
+        static LiveSwitch stats("REGPU_TEMPORAL_STATS");
+        if (stats)
+            Log("temporal: %u frames: scene draws %u (edram mode 4: %u, wide pass: %u, want motion: %u; motion shader missing %u, not ready %u, no pipeline %u; "
+                "writing motion %u, known from last frame %u); colour resolves %u (full width %u), scenes done %u (upscaler ran %u), depth copies %u (skipped: no target %u, empty %u); "
+                "camera cuts %u (%u of %u sampled transforms turned)",
+                frames, draws, edram4, wide, want, missing, notReady, noPso, motion, known, resolves, fullWidth, done, evaluated, copies, noTarget, empty,
+                cuts, cutHits, cutSamples);
+    }
     g_upscale.renderWidth = uint32_t(std::lround(OutputWidth() * double(g_sceneScale)));
     g_upscale.renderHeight = uint32_t(std::lround(OutputHeight() * double(g_sceneScale)));
     // Phases: 8 per pixel of upscale area (DLSS guidance), at most 64.
@@ -6512,6 +6647,7 @@ void BeginTemporalFrame()
         std::erase_if(g_upscale.constants, [](const auto& e) { return e.second.frame + 2 < g_upscale.constantsFrame; });
     const float zero[4] = {};
     C().list->ClearRenderTargetView(g_upscale.motionRtv, zero, 0, nullptr);
+    C().list->ClearRenderTargetView(g_upscale.reactiveRtv, zero, 0, nullptr);
 }
 
 void UpscaleResolved(uint32_t base);
@@ -6527,7 +6663,10 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
         return false;
     ResolvedTexture& dest = it->second;
     if (dest.format != DXGI_FORMAT_R8G8B8A8_UNORM && dest.format != DXGI_FORMAT_R16G16B16A16_FLOAT)
+    {
+        LOG_ONCE("upscale: the scene image's format %d is not one the temporal upscalers take (FSR 1 instead)", int(dest.format));
         return false;
+    }
     const ComPtr<ID3D12Resource> color = dest.resource;
     const uint32_t inWidth = dest.hostWidth, inHeight = dest.hostHeight;
     const float savedScale = g_sceneScale;
@@ -6576,6 +6715,8 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     in.color = color.Get();
     in.depth = g_upscale.depth.Get();
     in.motion = g_upscale.motion.Get();
+    static LiveSwitch noReactiveInput("REGPU_NO_REACTIVE_INPUT"); // A/B: the mask is drawn but not given to the upscaler
+    in.reactive = noReactiveInput ? nullptr : g_upscale.reactive.Get();
     in.output = dlaa ? g_upscale.dlaaOut.Get() : dest.resource.Get();
     static const float jitterSign = getenv("REGPU_DLSS_JITTER_FLIP") ? -1.0f : 1.0f;
     in.jitterX = g_upscale.jitterPx[0] * jitterSign;
@@ -6583,7 +6724,20 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     in.motionScaleX = float(inWidth);
     in.motionScaleY = float(inHeight);
     in.frameTimeMs = float(std::chrono::duration<double, std::milli>(now - last).count());
-    in.reset = g_upscale.reset;
+    // A camera cut (see Upscale::cut): most of the sampled draws' transforms turned a long way since last frame.
+    static LiveSwitch noCutReset("REGPU_NO_CUT_RESET");
+    g_upscale.cut = g_upscale.cutSamples >= 8 && g_upscale.cutHits * 2 > g_upscale.cutSamples;
+    g_tstat.cutSamples += g_upscale.cutSamples;
+    g_tstat.cutHits += g_upscale.cutHits;
+    if (g_upscale.cut)
+    {
+        g_tstat.cuts++;
+        static uint32_t logged = 0;
+        if (logged++ < 20)
+            Log("temporal: camera cut at frame %llu (%u of %u sampled draws)%s", (unsigned long long)g_r.frame, g_upscale.cutHits, g_upscale.cutSamples,
+                noCutReset ? ", history kept (REGPU_NO_CUT_RESET)" : ": upscaler history dropped");
+    }
+    in.reset = g_upscale.reset || (g_upscale.cut && !noCutReset);
     last = now;
 
     auto barrier = [](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
@@ -6598,10 +6752,17 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    barrier(g_upscale.reactive.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(in.output, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NGX records into the real command list (after everything recorded so far).
     const bool ok = dlss ? DlssEvaluate(C().list->Real(), setup, in)
-                         : Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
+                         : GetSettings().upscaler == Settings::Upscaler::Fsr4 ? Fsr4Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness)
+                                                                             : Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
+    if (ok)
+        g_tstat.evaluated++;
+    g_upscale.viewValid = ok; // (REGPU_VIEW_MOTION / _DEPTH / _REACTIVE show them at the end of the frame)
+    g_upscale.viewWidth = inWidth;
+    g_upscale.viewHeight = inHeight;
     barrier(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     if (dlaa && ok)
     {
@@ -6612,6 +6773,7 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
         barrier(in.output, D3D12_RESOURCE_STATE_COPY_SOURCE, read);
     }
     barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    barrier(g_upscale.reactive.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NGX may have changed the list's heaps, root signatures and pipeline: set ours again.
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get(), g_r.samplerHeap.Get() };
@@ -6696,6 +6858,9 @@ bool InitUpscale()
         return false;
     pd.CS = { kEnhanceMain, sizeof(kEnhanceMain) };
     if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.enhance))))
+        return false;
+    pd.CS = { kViewMain, sizeof(kViewMain) };
+    if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.view))))
         return false;
     g_upscale.ready = true;
     Log("upscale: FSR 1 ready (scene at %.0f%% of %ux%u)", GetSettings().SceneScale() * 100.0f, OutputWidth(), OutputHeight());
@@ -6868,6 +7033,84 @@ ID3D12Resource* EnhanceFrontBuffer(ID3D12Resource* image)
     C().list->ResourceBarrier(2, b);
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
     return g_enhanceOut.Get();
+}
+
+// REGPU_VIEW_MOTION / REGPU_VIEW_DEPTH / REGPU_VIEW_REACTIVE (live): the temporal upscaler's motion, depth or
+// reactive input of this frame in place of the finished frame (the overlay stays), to tune the motion path
+// (from the FM4 and FM2 ports). Motion: grey is still, red and green are motion (about +-8 render pixels over
+// the full range); depth: the stored value; reactive: white where set. REGPU_VIEW_TURNED=1 (live): turned by
+// half a turn, for a title that draws its scene upside down. `shown` gives the size; the result is in
+// COPY_SOURCE. Null when off, or this frame had no temporal scene.
+ComPtr<ID3D12Resource> g_viewOut;
+ID3D12Resource* ViewFrontBuffer(ID3D12Resource* shown)
+{
+    static LiveSwitch viewMotion("REGPU_VIEW_MOTION"), viewDepth("REGPU_VIEW_DEPTH"), viewReactive("REGPU_VIEW_REACTIVE"), turned("REGPU_VIEW_TURNED");
+    if (!shown || !g_upscale.viewValid || !(viewMotion || viewDepth || viewReactive) || !InitUpscale() || !g_upscale.view || !g_upscale.motion ||
+        !g_upscale.depth || !g_upscale.reactive)
+        return nullptr;
+    g_upscale.viewValid = false;
+    FrameResources& f = Frame();
+    if (f.descriptorsUsed + 2 > kDescriptorsPerFrame)
+        return nullptr;
+    const D3D12_RESOURCE_DESC desc = shown->GetDesc();
+    if (!g_viewOut || g_viewOut->GetDesc().Width != desc.Width || g_viewOut->GetDesc().Height != desc.Height)
+    {
+        D3D12_RESOURCE_DESC td = desc;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        RetireTexture(std::move(g_viewOut));
+        g_viewOut = CreateTexture(td, D3D12_RESOURCE_STATE_COPY_SOURCE, "view");
+        if (!g_viewOut)
+            return nullptr;
+    }
+    const bool motion = viewMotion;
+    const bool reactive = !motion && viewReactive;
+    ID3D12Resource* source = motion ? g_upscale.motion.Get() : reactive ? g_upscale.reactive.Get() : g_upscale.depth.Get();
+    // Motion and the reactive mask rest as render targets, depth as UAV.
+    const D3D12_RESOURCE_STATES sourceRest = motion || reactive ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    auto barrier = [](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = r;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = from;
+        b.Transition.StateAfter = to;
+        C().list->ResourceBarrier(1, &b);
+    };
+    barrier(source, sourceRest, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    barrier(g_viewOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const UINT slots = f.descriptorBase + f.descriptorsUsed;
+    f.descriptorsUsed += 2;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = motion ? DXGI_FORMAT_R16G16_FLOAT : reactive ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R32_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    g_r.device->CreateShaderResourceView(source, &srv, Cpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_r.device->CreateUnorderedAccessView(g_viewOut.Get(), nullptr, &uav, Cpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    uint32_t c[24] = {};
+    c[16] = motion ? 0u : 1u;                              // rcasCon.x
+    const float gain = float(g_upscale.viewWidth) / 16.0f; // one render pixel of motion is 1/width: +-8 px fills the range
+    memcpy(&c[17], &gain, sizeof(gain));                   // rcasCon.y
+    c[18] = g_upscale.viewWidth;                           // rcasCon.zw
+    c[19] = g_upscale.viewHeight;
+    c[20] = uint32_t(desc.Width);
+    c[21] = desc.Height;
+    c[22] = turned ? 1u : 0u; // outSize.z
+    C().list->SetComputeRootSignature(g_upscale.root.Get());
+    C().list->SetComputeRoot32BitConstants(0, 24, c, 0);
+    C().list->SetPipelineState(g_upscale.view.Get());
+    C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    C().list->Dispatch((c[20] + 7) / 8, (c[21] + 7) / 8, 1);
+    barrier(g_viewOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    barrier(source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceRest);
+    g_drawState.Invalidate();
+    return g_viewOut.Get();
 }
 
 // Upscales the resolved image at `base` (rendered at the scene scale) to the output size in
@@ -7227,12 +7470,25 @@ void Resolve()
         static LiveSwitch noAlpha2("REGPU_NO_RESOLVE_ALPHA2");
         const uint32_t blitFlags = (toGamma ? 1u : 0u) | (!depth && destFormat == 7 && !noAlpha2 ? 2u : 0u);
         BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias), false, destRange, blitFlags);
+        // This frame's first full-screen colour resolve (see Upscale::sceneOk).
+        if (!depth && g_upscale.fullResolveBase == ~0u && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
+            g_upscale.fullResolveBase = base;
         // Temporal upscaling: each tile of the main view keeps its depth before it is cleared.
+        if (g_temporal && g_scenePhase && !depth)
+        {
+            g_tstat.resolves++;
+            if (width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth))
+                g_tstat.resolveFullWidth++;
+        }
         if (g_temporal && g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth))
             CopySceneDepth(rect);
         // The main view's full image (its last tile reaches the bottom): the scene is done.
         if (g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
+        {
+            if (g_temporal)
+                g_tstat.sceneDone++;
             UpscaleScene(base);
+        }
         g_r.resolved[base].swapped = swapRB;
         g_r.resolved[base].guestFormat = depth ? 0u : destFormat;
         g_r.resolved[base].plain8888 = !depth && destFormat == 6 && ((gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF) == 0;
@@ -9744,8 +10000,24 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const CompiledShader* mvs = wantMotion ? MotionShader(vs) : nullptr;
     const CompiledShader* mps = wantMotion ? MotionShader(ps) : nullptr;
     bool motion = mvs && mps && mvs->IsReady() && mps->IsReady();
+    if (g_temporal && g_scenePhase)
+    {
+        g_tstat.draws++;
+        if (edramMode == 4)
+            g_tstat.edram4++;
+        if (WidePass())
+            g_tstat.widePass++;
+        if (wantMotion)
+            g_tstat.wantMotion++;
+        if (wantMotion && !(mvs && mps))
+            g_tstat.shaderMissing++;
+        else if (wantMotion && !motion)
+            g_tstat.shaderNotReady++;
+    }
     D3D12_GPU_VIRTUAL_ADDRESS motionPrevious = 0; // last frame's vertex constants of this draw (b2)
     ID3D12PipelineState* pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true, stripCut && directIndex) : nullptr;
+    if (wantMotion && motion && !pso)
+        g_tstat.noPipeline++;
     if (!pso)
     {
         motion = false;
@@ -9899,11 +10171,47 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             const D3D12_GPU_VIRTUAL_ADDRESS now = f.ring->GetGPUVirtualAddress() + vsOffset;
             const bool known = entry.frame + 1 == g_upscale.constantsFrame && !g_upscale.reset;
             motionPrevious = known ? entry.address[parity ^ 1] : now;
+            g_tstat.motion++;
+            if (known)
+                g_tstat.known++;
+            // Camera cut detection (see Upscale::cut): the frame's first kCutSamples draws with motion.
+            constexpr uint32_t kCutSamples = 48;
+            if (g_upscale.cutSamples < kCutSamples && nv >= 4)
+            {
+                float cur[16];
+                for (uint32_t i = 0; i < 4; i++)
+                    _mm_storeu_ps(cur + i * 4, _mm_castsi128_ps(_mm_shuffle_epi8(_mm_loadu_si128(src + i), swap)));
+                if (known && entry.firstFrame + 1 == g_upscale.constantsFrame)
+                {
+                    float dot = 0, a2 = 0, b2 = 0;
+                    for (uint32_t i = 0; i < 16; i++)
+                    {
+                        dot += cur[i] * entry.first[i];
+                        a2 += cur[i] * cur[i];
+                        b2 += entry.first[i] * entry.first[i];
+                    }
+                    if (a2 > 0 && b2 > 0 && std::isfinite(dot))
+                    {
+                        g_upscale.cutSamples++;
+                        if (dot < 0.9f * std::sqrt(a2 * b2))
+                            g_upscale.cutHits++;
+                    }
+                }
+                memcpy(entry.first, cur, sizeof(cur));
+                entry.firstFrame = g_upscale.constantsFrame;
+            }
             entry.address[parity] = now;
             entry.frame = g_upscale.constantsFrame;
             vc->vjitter[0] = g_upscale.jitterNdc[0];
             vc->vjitter[1] = g_upscale.jitterNdc[1];
-            vc->vjitter[2] = vc->vjitter[3] = 0;
+            // Reactive scale (Upscale::reactive): draws not found in last frame are dynamic geometry. Not on the
+            // first frame after a reset, when nothing is found. REGPU_NO_REACTIVE=1 (live): no mask (A/B).
+            static LiveSwitch noReactive("REGPU_NO_REACTIVE");
+            const float reactive = !known && !g_upscale.reset && !noReactive ? 0.9f : 0.0f;
+            const uint32_t srcBlend = gpureg::Get(RB_BLENDCONTROL0) & 31; // 6, 7: source alpha and its inverse
+            const bool byAlpha = srcBlend == 6 || srcBlend == 7;
+            vc->vjitter[2] = byAlpha ? reactive : 0.0f; // by the draw's alpha
+            vc->vjitter[3] = byAlpha ? 0.0f : reactive; // by its brightness
         }
     }
     Sub(0); // index list, ring allocations, float constants
@@ -10602,8 +10910,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (motion != ds.motionTargets)
     {
         ds.motionTargets = motion;
-        const D3D12_CPU_DESCRIPTOR_HANDLE targets[2] = { C().rtv, g_upscale.motionRtv };
-        C().list->OMSetRenderTargets(motion ? 2 : 1, targets, FALSE, &C().dsv);
+        const D3D12_CPU_DESCRIPTOR_HANDLE targets[3] = { C().rtv, g_upscale.motionRtv, g_upscale.reactiveRtv };
+        C().list->OMSetRenderTargets(motion ? 3 : 1, targets, FALSE, &C().dsv);
     }
     if (pso != ds.pso)
     {
@@ -11009,9 +11317,9 @@ void BenchmarkWriteReport(const char* path)
         }
     }
     const Settings& st = GetSettings();
-    static const char* upscalers[] = { "off", "FSR 1", "FSR 3", "DLSS" };
+    static const char* upscalers[] = { "off", "FSR 1", "FSR 3", "DLSS", "FSR 4" };
     static const char* qualities[] = { "native (AA)", "quality", "balanced", "performance", "ultra performance" };
-    std::string upscaler = upscalers[std::min<uint32_t>(uint32_t(st.upscaler), 3)];
+    std::string upscaler = upscalers[std::min<uint32_t>(uint32_t(st.upscaler), 4)];
     if (st.upscaler != Settings::Upscaler::Off)
         upscaler += std::string(", ") + qualities[std::min<uint32_t>(st.quality, 4)];
 
@@ -11551,6 +11859,20 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     PrecompileAll();
     WarmupStep();
     BeginFrameIfNeeded();
+    // Temporal upscalers: whether this frame had a 3D scene of its own (see Upscale::sceneOk).
+    if (TemporalUpscalerChosen(GetSettings()))
+    {
+        const bool sceneOk = g_upscale.fullResolveBase != ~0u && g_upscale.fullResolveBase != frontBuffer;
+        if (sceneOk != g_upscale.sceneOk)
+        {
+            static uint32_t logged = 0;
+            if (logged++ < 20)
+                Log("temporal: frame %llu %s: the temporal upscaler is %s from the next frame", (unsigned long long)g_r.frame,
+                    sceneOk ? "has a 3D scene of its own" : "draws straight into the front buffer", sceneOk ? "on" : "off (full size)");
+            g_upscale.reset = true; // no usable history across the change
+        }
+        g_upscale.sceneOk = sceneOk;
+    }
     // A frame that rendered small but never resolved a scene (a menu): upscale what it shows
     // and stay at full size for a while (menus are drawn sharp at full size).
     if (g_scenePhase && !g_upscale.switchedThisFrame)
@@ -11590,6 +11912,9 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (fromResolve)
         if (ID3D12Resource* enhanced = EnhanceFrontBuffer(shown))
             shown = enhanced;
+    if (fromResolve)
+        if (ID3D12Resource* view = ViewFrontBuffer(shown))
+            shown = view;
     const bool presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH);
     {
         const uint64_t traceFrame = TraceFrame();

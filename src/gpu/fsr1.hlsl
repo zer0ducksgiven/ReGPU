@@ -78,6 +78,30 @@ void GammaMain(uint3 id : SV_DispatchThreadID)
     dst[id.xy] = float4(GammaCurve(c.r, p), GammaCurve(c.g, p), GammaCurve(c.b, p), c.a);
 }
 
+// Debug view of a temporal upscaler input, written at the output's size (from the FM4 and FM2 ports).
+// rcasCon.x: 0 motion (RG, UV offsets to last frame; grey is still, red and green are motion), 1 depth or
+// the reactive mask (R, as stored); rcasCon.y (float bits): the motion gain, how much one UV unit moves the
+// colour; rcasCon.zw the size of the scene (the render size): the input holds its data in that top left
+// part only, so each output pixel reads the one it covers. outSize.z: turn the view by half a turn (a title
+// that draws its scene upside down and turns it back in post-processing; REGPU_VIEW_TURNED).
+[numthreads(8, 8, 1)]
+void ViewMain(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= outSize.xy))
+        return;
+    uint2 p = min(uint2((float2(id.xy) + 0.5) * float2(rcasCon.zw) / float2(outSize.xy)), rcasCon.zw - 1);
+    const bool turned = outSize.z != 0u;
+    if (turned)
+        p = rcasCon.zw - 1 - p;
+    float4 s = src.Load(int3(p, 0));
+    if (turned && rcasCon.x == 0u)
+        s.rg = -s.rg;
+    if (rcasCon.x == 0u)
+        dst[id.xy] = float4(saturate(0.5 + s.rg * asfloat(rcasCon.y)), 0.5, 1.0);
+    else
+        dst[id.xy] = float4(saturate(s.rrr), 1.0);
+}
+
 // Enhanced lighting (experimental): local contrast on the finished frame. rcasCon.x is the
 // strength (float bits). Each pixel is pushed away from the average of its four neighbours,
 // so shading steps, edges and highlights read more clearly.
