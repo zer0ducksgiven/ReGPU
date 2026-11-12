@@ -6383,7 +6383,6 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     if (dest.frame != g_r.frame && (baselineEveryFrame || !continuing))
         NoteResolvedMemory(base, dest);
     dest.frame = g_r.frame;
-    dest.serial = ++g_resolveSerial;
     // The image rectangle written (the surface's rect, destRow rows down).
     const D3D12_RECT sr{ rect.left, rect.top + destRow, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom + destRow, height) };
     FrameResources& f = Frame();
@@ -6437,6 +6436,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     C().list->RSSetViewports(1, &vp);
     C().list->RSSetScissorRects(1, &hostRect);
     C().list->DrawInstanced(3, 1, 0, 0);
+    dest.serial = ++g_resolveSerial;
     // Depth resolves also keep the guest's D24S8 words (RGBA8: stencil, depth low to high byte), for
     // fetches of the depth image with a colour format: FH1's speed blur reads the stencil that way to
     // pick each pixel's reprojection, and with depth alone every pixel took object 0's and the whole
