@@ -23,7 +23,7 @@ enum Format : uint32_t
     k_DXT1 = 18,
     k_DXT2_3 = 19,
     k_DXT4_5 = 20,
-    k_16 = 24, // one channel, 8-bit fallback (FH1's headlight falloff table)
+    k_16 = 24, // one channel; native R16 upload, rounded 8-bit fallback
     k_16_16_16_16_FLOAT = 32, // half floats; uploaded as they are (lookup tables, HDR data)
     k_DXN = 49,   // two interpolated channels (BC5): normal maps
     k_DXT5A = 59, // one interpolated channel (BC4-like), 8-byte blocks
@@ -227,12 +227,16 @@ void DecodeTexel(uint32_t format, const uint8_t* t, uint8_t* out)
             out[c] = (h & 0x8000) ? 0 : uint8_t(std::min(f, 1.0f) * 255.0f + 0.5f);
         }
         break;
-    case k_8:
-        out[0] = out[1] = out[2] = t[0];
+    case k_16:
+    {
+        const uint16_t value = uint16_t(t[0] | (t[1] << 8));
+        const uint8_t normalized = uint8_t((uint32_t(value) * 255 + 32767) / 65535);
+        out[0] = out[1] = out[2] = normalized;
         out[3] = 255;
         break;
-    case k_16:
-        out[0] = out[1] = out[2] = t[1]; // the high byte (little-endian after the swap)
+    }
+    case k_8:
+        out[0] = out[1] = out[2] = t[0];
         out[3] = 255;
         break;
     case k_8_8:
@@ -538,6 +542,7 @@ uint32_t TextureBCKind(uint32_t format)
     case k_DXT5A: return 4;
     case k_DXN: return 5;
     case k_16_16_16_16_FLOAT: return 6; // not compressed: 1x1 "blocks" of 8 bytes
+    case k_16: return 7; // not compressed: 1x1 "blocks" of 2 bytes
     default: return 0;
     }
 }

@@ -50,10 +50,12 @@ bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector
 bool DecodeTexture3D(const TextureFetch& fetch, std::vector<uint8_t>& rgba);
 
 // Block-compressed formats the GPU samples natively: 1-4 for BC1-BC4 (DXT1, DXT3, DXT5,
-// DXT5A), 0 for formats that are decoded to RGBA8.
+// DXT5A), 5 for BC5, and native uncompressed formats 6 for RGBA16F and 7 for R16 UNORM.
+// Zero means the format is decoded to RGBA8.
 uint32_t TextureBCKind(uint32_t format);
 // Copies mip 0 of a block-compressed texture as linear BC blocks (untiled, endian-swapped)
-// to dst, rows of blocks dstRowPitch bytes apart. No swizzle is applied (the GPU does it).
+// or a native uncompressed texture as linear texels (untiled, endian-swapped) to dst, rows
+// of blocks dstRowPitch bytes apart. No swizzle is applied (the GPU does it).
 bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowPitch);
 
 // The fetch constant of mip level `level` (its address, size and pitch), for tiled
