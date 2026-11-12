@@ -1,8 +1,8 @@
 # ReGPU on Linux (Wine, Proton and vkd3d-proton)
 
-ReGPU is a Direct3D 12 renderer, so on Linux and the Steam Deck it runs the way Windows games do:
-the Windows build under Wine or Proton, with vkd3d-proton translating Direct3D 12 to Vulkan. This
-page shows how to set that up, using Forza Horizon 1: ReImagined (FH1R, the ReXGlue port that loads
+ReGPU is a Direct3D 12 renderer, so on Linux it runs the way Windows games do: the Windows build
+under Wine or Proton, with vkd3d-proton translating Direct3D 12 to Vulkan. This page shows how to
+set that up, using Forza Horizon 1: ReImagined (FH1R, built with ReIGlue, our ReXGlue fork; it loads
 ReGPU as `rexgpu-regpu.dll`) as the example, and what we measured on one Linux PC.
 
 **Status (2026-11-03): ReGPU boots under vkd3d-proton on RADV, then hangs the GPU about 2 s after its
@@ -11,8 +11,10 @@ under Wine with FH1R's Vulkan renderer. See [Results](#results).
 
 ## What you need
 
-- A Windows build of the game with ReGPU in it. For FH1R that's the `feature/regpu-plugin` branch
-  ([FH1R PR #611](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/pull/611)), cross-built on Linux with `tools/build_windows.sh` (clang-cl and xwin).
+- A Windows build of the game with ReGPU in it. For FH1R that's its ReGPU plugin
+  ([FH1R PR #622](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/pull/622); these measurements used
+  the earlier [#611](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/pull/611)), cross-built on Linux with
+  `tools/build_windows.sh` (clang-cl and xwin).
 - Wine with vkd3d-proton and DXVK's `dxgi.dll`. A copy of a Proton install from Steam has all
   three. We used Proton 11.0 (`proton-11.0-2e`: Wine 11.0, vkd3d-proton `212991fc`, DXVK
   `v2.7.1-498`). Copy it rather than pointing a prefix at Steam's own files.
