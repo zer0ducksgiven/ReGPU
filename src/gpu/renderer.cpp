@@ -3523,6 +3523,34 @@ bool Rebuild(const char* line, uint64_t& hash, std::vector<uint32_t>& code)
 }
 }
 
+// A cache file written under a temporary name and renamed into place: a run killed mid-write (or one
+// reading the cache meanwhile) never finds half a file, which would load as a broken shader. The
+// temporary name is unique, so two threads storing the same file don't write into each other's.
+static bool WriteCacheFile(const std::filesystem::path& path, const void* data, size_t size)
+{
+    static std::atomic<uint32_t> serial{ 0 };
+    auto tmp = path;
+    tmp += "." + std::to_string(GetCurrentThreadId()) + "." + std::to_string(serial++) + ".tmp";
+    std::error_code ec;
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        out.write(static_cast<const char*>(data), std::streamsize(size));
+        out.close();
+        if (!out)
+        {
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec)
+    {
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
 struct Manifest
 {
     std::mutex mutex;
@@ -3584,7 +3612,7 @@ struct Manifest
         g_diskWriter.Push([path = UcodePath(pixel, hash), code = codeBE, patch, hash] {
             std::error_code ec;
             if (!std::filesystem::exists(path, ec))
-                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(code.data()), std::streamsize(code.size() * 4));
+                WriteCacheFile(path, code.data(), code.size() * 4);
             if (patch)
                 if (const std::string line = VertexPatch::Line(hash, code); !line.empty())
                     std::ofstream(Path(), std::ios::app) << line << '\n';
@@ -3669,13 +3697,7 @@ struct ShaderOptimizer
                     job.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0,
                     &code, &errors)))
                 continue; // the unoptimised build stays
-            // Written under a temporary name: a run that reads it never sees half a file.
-            const auto path = ShaderCachePath(job.key, true);
-            auto tmp = path;
-            tmp += ".tmp";
-            std::ofstream(tmp, std::ios::binary).write(static_cast<const char*>(code->GetBufferPointer()), std::streamsize(code->GetBufferSize()));
-            std::error_code ec;
-            std::filesystem::rename(tmp, path, ec);
+            WriteCacheFile(ShaderCachePath(job.key, true), code->GetBufferPointer(), code->GetBufferSize());
             if (const uint32_t n = ++built; n == 1 || n % 100 == 0)
                 Log("renderer: %u shaders optimised in the background", n);
         }
@@ -3839,8 +3861,7 @@ struct ShaderCompiler
         g_stats.shadersBuilt++;
         if (ms > 200)
             Log("renderer: %s %016llx compiled in %.0f ms (background)", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash, ms);
-        std::ofstream(ShaderCachePath(cs.cacheKey), std::ios::binary)
-            .write(static_cast<const char*>(cs.code->GetBufferPointer()), std::streamsize(cs.code->GetBufferSize()));
+        WriteCacheFile(ShaderCachePath(cs.cacheKey), cs.code->GetBufferPointer(), cs.code->GetBufferSize());
         if (g_optimizeShaders)
             g_optimizer.Push(cs.cacheKey, cs.pixel, cs.info.hlsl);
         cs.state.store(CompiledShader::Ready, std::memory_order_release);
