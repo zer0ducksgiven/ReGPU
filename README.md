@@ -39,6 +39,11 @@ target_link_libraries(game PRIVATE regpu)
 
 Options: `REGPU_FSR3` (with the FidelityFX signed DLLs), `REGPU_DLSS` and `REGPU_DLSS_DIR`.
 
+`REGPU_FSR1_CS` takes a pre-built `fsr1_cs.h` (the header `tools/embed_hlsl.py` writes into the build's
+`generated` folder). With it the build copies that header and needs no Python, fxc or FidelityFX headers,
+which helps cross-builds from Linux. The header has to come from the same `src/gpu/fsr1.hlsl`: rebuild it
+when that file or its entry points change.
+
 Ship Microsoft's `d3dcompiler_47.dll` (the Windows SDK's `Redist\D3D\x64`, redistributable) beside
 your executable: ReGPU loads it from there first. Under Wine/Proton the system copy is Wine's own,
 which can't compile the translated shaders.
