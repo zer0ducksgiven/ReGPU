@@ -4,9 +4,12 @@
 #include <string>
 #include <vector>
 
-// Thread-safe log to stderr and regpu.log in the working folder (REGPU_LOG_DIR: another folder).
+// Thread-safe log to stderr and regpu.log in Config::userDir (REGPU_LOG_DIR: another folder).
 // REGPU_LOG_ASYNC=1: a writer thread does the writing, so a slow drive doesn't stall the caller.
 void Log(const char* fmt, ...);
+// Opens regpu.log once the host has set Config::userDir (regpu::Start); lines logged before then are
+// written to it as it opens.
+void LogStart();
 // Waits (up to 2 s) until queued lines are written: call before the process dies (a crash handler).
 void LogFlush();
 [[noreturn]] void Fatal(const char* fmt, ...);

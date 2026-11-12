@@ -32,7 +32,7 @@ struct Config
     Upscaler upscaler = Upscaler::Off;
     uint32_t quality = 1;   // 0 native (anti-aliasing only), 1 quality, 2 balanced, 3 performance, 4 ultra performance
     float sharpness = 0.5f; // 0-1
-    std::filesystem::path userDir = "."; // shader and pipeline caches, dumps
+    std::filesystem::path userDir = "."; // shader and pipeline caches, dumps, regpu.log, regpu-bad-pipelines.txt
     std::wstring windowTitle = L"ReGPU";
     // A window the host already owns (an HWND): ReGPU presents into it instead of opening its own.
     // The host then handles closing, resizing and fullscreen; windowTitle and fullscreen are unused.
@@ -169,7 +169,7 @@ bool WindowHasFocus();
 void LogState();
 // Call from the game's crash handler, on the crashing thread: if it crashed inside the graphics driver's
 // pipeline compiler (some drivers fault on a few pipelines), the pipeline is logged and refused from the
-// next start on (regpu-bad-pipelines.txt in the working directory), so its draws are dropped instead.
+// next start on (regpu-bad-pipelines.txt in Config::userDir), so its draws are dropped instead.
 // It also writes out the log lines still queued (REGPU_LOG_ASYNC).
 void LogCrashContext();
 
