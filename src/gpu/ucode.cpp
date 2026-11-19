@@ -1,6 +1,7 @@
 #include "gpu/ucode.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace ucode
 {
@@ -174,16 +175,52 @@ Shader Parse(const uint32_t* microcodeBE, uint32_t dwords, bool pixel)
         if (ended)
         {
             shader.valid = true;
-            // Subroutines live after the end: while a call targets an instruction not parsed yet, the
-            // control flow area is read on (up to the first exec's code). Programs without calls stop
-            // at the end as before. From the FM4 port.
-            const auto unparsedCall = [&] {
-                for (const Cf& c : shader.cf)
-                    if (c.op() == CfOp::CondCall && (c.lo & 0x1FFF) >= shader.cf.size())
+            // Code lives after the end too: subroutines (from the FM4 port), and blocks a program jumps
+            // to and back from (DOA4's lit vertex shaders cjmp to instructions 69-94 behind an exece at
+            // 66, and jump back). Read only up to the end, such a jump has no block to land on: the
+            // program falls out with oPos never written. While the program can reach an instruction
+            // not parsed yet (a jump, call or loop target, or the fall-through after one), the control
+            // flow area is read on, up to the first exec's code; this is the walk EmitProgram makes
+            // for its reachable blocks. Programs that stay in front of their end stop there as before.
+            // Programs with calls can now parse (and translate) differently: a subroutine is read on
+            // through its fall-throughs up to its return, where the read used to stop once the call
+            // target's own instruction was read, and a ccall nothing reaches no longer extends the
+            // read. (For these the shader hash cannot move: UsedDwords keeps every dword of a program
+            // with calls or jumps. A program whose only flow past its end is a loop can now be read
+            // further, and its hash can then cover more dwords.) REGPU_NO_CF_PAST_END=1: only call
+            // targets, as before (A/B; read at each parse, as REGPU_NO_REACHABLE_CF is at each
+            // translation).
+            const bool callsOnly = getenv("REGPU_NO_CF_PAST_END") != nullptr;
+            const auto unparsedReachable = [&] {
+                if (callsOnly)
+                {
+                    for (const Cf& c : shader.cf)
+                        if (c.op() == CfOp::CondCall && (c.lo & 0x1FFF) >= shader.cf.size())
+                            return true;
+                    return false;
+                }
+                std::vector<bool> seen(shader.cf.size(), false);
+                std::vector<size_t> pending{ 0 };
+                while (!pending.empty())
+                {
+                    const size_t i = pending.back();
+                    pending.pop_back();
+                    if (i >= shader.cf.size())
                         return true;
+                    if (seen[i])
+                        continue;
+                    seen[i] = true;
+                    const Cf& c = shader.cf[i];
+                    const CfOp op = c.op();
+                    if (op == CfOp::CondJmp || op == CfOp::CondCall || op == CfOp::LoopStart || op == CfOp::LoopEnd)
+                        pending.push_back(c.lo & 0x1FFF);
+                    const bool unconditionalJump = op == CfOp::CondJmp && ((c.lo >> 13) & 1);
+                    if (!c.IsEnd() && op != CfOp::Return && !unconditionalJump)
+                        pending.push_back(i + 1);
+                }
                 return false;
             };
-            for (triple++; unparsedCall() && triple < cfEnd && triple * 3 + 2 < dwords; triple++)
+            for (triple++; unparsedReachable() && triple < cfEnd && triple * 3 + 2 < dwords; triple++)
             {
                 const uint32_t* v = &shader.words[triple * 3];
                 Cf more[2];
