@@ -1576,6 +1576,8 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    if (pinfo.z & 32u) oC[0].a = round(saturate(oC[0].a) * 3.0) / 3.0; // 2-bit alpha surface (k_2_10_10_10_FLOAT)\n"
              "    if (pinfo2.w > 0.0) oC[0].rgb = clamp(oC[0].rgb, 0.0, pinfo2.w); // 7e3 target range\n"
              "    else if (pinfo2.w < 0.0) oC[0] = saturate(oC[0]); // fixed-point target\n"
+             "    if (pinfo.z & 0x20000u) oC[0].rgb *= oC[0].a; // min / max blend, SRC_ALPHA source factor (renderer.cpp), colour first\n"
+             "    if (pinfo.z & 0x40000u) oC[0].a *= oC[0].a;\n"
              + std::string(e.exportsDepth ? "    PSOut o; o.c = oC[0]; o.d = saturate(oD.x); return o;\n}\n" : "    return oC[0];\n}\n");
     }
     // The colour exports as separate variables, not an array (from the FM4 port): fxc declares a local
