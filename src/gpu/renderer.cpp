@@ -12022,8 +12022,11 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     {
         // F12 in the game window: capture the next frame (frame.png, the resolves in out\res,
         // and the frame's draws in out/play.log) to report rendering bugs.
+        // REGPU_NO_CAPTURE_KEY=1: the key does nothing (a host whose game uses F12 itself); the debug
+        // server's capture still works.
+        static LiveSwitch noCaptureKey("REGPU_NO_CAPTURE_KEY");
         static bool wasDown = false;
-        const bool down = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+        const bool down = !noCaptureKey && (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
         DWORD pid = 0;
         GetWindowThreadProcessId(GetForegroundWindow(), &pid);
         if (down && !wasDown && pid == GetCurrentProcessId())

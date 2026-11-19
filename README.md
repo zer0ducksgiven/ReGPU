@@ -102,6 +102,9 @@ its shaders, use the optional hooks instead of changing ReGPU:
 Start the game with `REGPU_DEBUG=1` and drive it from outside with
 [`tools/regpuctl.py`](tools/regpuctl.py): press buttons, take screenshots, capture a frame, edit
 shaders live, flip `REGPU_*` switches. [`CLAUDE.md`](CLAUDE.md) is the playbook.
+F12 in the game window captures the next frame as `regpuctl.py capture` does (`frame.png` in the
+working directory, its textures and resolves under `out/` there); `REGPU_NO_CAPTURE_KEY=1` turns the
+key off, for a game that uses F12 itself, and leaves the debug server's capture working.
 [`tools/xbdm.py`](tools/xbdm.py) and [`tools/xbox_fb.py`](tools/xbox_fb.py) take reference
 screenshots and memory reads from a real (modded) console over XBDM.
 
