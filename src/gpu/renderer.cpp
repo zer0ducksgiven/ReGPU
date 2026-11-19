@@ -7441,7 +7441,31 @@ void Resolve()
         // FH1's scene resolves are too, at the tile's own row.)
         const bool placedInImage = imageBase && rect.top > 0 && uint32_t(rect.bottom) <= declaredHeight && uint32_t(rect.right - rect.left) < pitch;
         const uint32_t destBase = gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF;
-        uint32_t base = placedInImage ? destBase : (destBase - uint32_t(rect.top) * pitch * (noTileBpp ? 4 : guestBpp)) & 0x1FFFFFFF;
+        // Column tiles. For a tile drawn with a window offset, the destination base is the image address
+        // of the tile's origin (measured on one title, below; not on a console): a tile of a surface
+        // drawn as tiles side by side starts rect.left texels into the image's rows as well as rect.top
+        // rows down, and only the rows were removed. DOA4 draws
+        // its 1280x720 2x MSAA scene as two 640-wide tiles, the right one with a window x offset of -640;
+        // its colour copy goes to 0920E000 and the left one's to 091FA000 (depth 0B633000, 0B61F000):
+        // 0x14000 apart, the tiled offset of texel (640, 0) at 4 bytes a texel. Keyed by that address, the
+        // right half went to an image of its own that nothing fetches (the scene showed its left half
+        // only), and its write-back, sized as a whole image from the middle of one, ran past the image
+        // into the memory after it. Only for a copy whose rectangle starts where the window offset puts
+        // the tile's origin (rect.left == -x offset, on a 32-texel boundary inside the pitch): partial-
+        // width copies placed by their rectangle alone (FH1's shadow atlas quadrants) keep their base.
+        // The offset is the tiled layout's own (TextureTiledOffset, as the write-back uses). (0x14000 is
+        // also 16 whole rows of a 1280-wide image: the band search below looks for bands at the row's
+        // address, rowBase, so it does not take the right tile for a band 16 rows down.)
+        // REGPU_NO_COLUMN_TILES=1: rows only, as before (A/B).
+        static LiveSwitch noColumnTiles("REGPU_NO_COLUMN_TILES");
+        const uint32_t tileBpp = noTileBpp ? 4 : guestBpp;
+        // (Read as WindowScissor reads it: PA_SC_WINDOW_OFFSET x, 15 bits signed.)
+        const int32_t windowX = int32_t(gpureg::Get(PA_SC_WINDOW_OFFSET) << 17) >> 17;
+        const bool columnTile = !noColumnTiles && !placedInImage && windowX < 0 && rect.left == LONG(-windowX) && (rect.left & 31) == 0 &&
+            uint32_t(rect.left) < pitch;
+        const uint32_t columnBytes = columnTile ? TextureTiledOffset(uint32_t(rect.left), 0, (pitch + 31) & ~31u, uint32_t(std::countr_zero(tileBpp))) : 0;
+        const uint32_t rowBase = (destBase - columnBytes) & 0x1FFFFFFF;
+        uint32_t base = placedInImage ? destBase : (rowBase - uint32_t(rect.top) * pitch * tileBpp) & 0x1FFFFFFF;
         const uint32_t width = std::clamp<uint32_t>(pitch, 1, std::max<uint32_t>(kWidth, BigPassSize()));
         // Taller than the screen is possible: a 1024x1024 target drawn as tall passes is resolved
         // 720 rows at a time and sampled as 1024 rows. The texture keeps all its rows (clamped to
@@ -7496,12 +7520,12 @@ void Resolve()
             uint32_t candidates = 0;
             for (const auto& [imageBase, image] : g_r.resolved)
             {
-                if (!image.resource || imageBase >= destBase || image.width != width || image.format != format || image.frame == ~0ull ||
-                    image.frame + 2 < g_r.frame || (destBase - imageBase) % rowBytes != 0)
+                if (!image.resource || imageBase >= rowBase || image.width != width || image.format != format || image.frame == ~0ull ||
+                    image.frame + 2 < g_r.frame || (rowBase - imageBase) % rowBytes != 0)
                     continue;
                 // (A band may overhang the image by a few rows, into the tile padding after it: FH1's
                 // 598-row sides copy 3 x 224 rows. The blit clips it.)
-                const uint32_t row = (destBase - imageBase) / rowBytes;
+                const uint32_t row = (rowBase - imageBase) / rowBytes;
                 if (row >= image.height)
                     continue;
                 candidates++;
