@@ -1315,10 +1315,17 @@ bool TranslateVertexFetchLayout(const Shader& shader, TranslatedShader& out)
     Emitter e{ shader, shader.pixel, {}, {}, result };
     e.layoutOnly = true;
     // The same walk as EmitProgram: control flow in order, each exec once, up to the end. (A program
-    // with subroutines runs code after the end: translated in full instead.)
+    // that runs code after the end, subroutines or blocks it jumps to: translated in full instead.)
+    size_t end = shader.cf.size();
+    for (size_t i = 0; i < shader.cf.size() && end == shader.cf.size(); i++)
+        if (shader.cf[i].IsEnd())
+            end = i;
     for (const Cf& cf : shader.cf)
-        if (cf.op() == CfOp::CondCall)
+    {
+        const CfOp op = cf.op();
+        if (op == CfOp::CondCall || ((op == CfOp::CondJmp || op == CfOp::LoopStart || op == CfOp::LoopEnd) && (cf.lo & 0x1FFF) > end))
             return false;
+    }
     for (const Cf& cf : shader.cf)
     {
         if (cf.IsExec())
