@@ -37,6 +37,12 @@ struct Config
     // A window the host already owns (an HWND): ReGPU presents into it instead of opening its own.
     // The host then handles closing, resizing and fullscreen; windowTitle and fullscreen are unused.
     void* hostWindow = nullptr;
+    // A Direct3D 12 device and its direct command queue the host already has (ID3D12Device*,
+    // ID3D12CommandQueue*): ReGPU renders on them instead of creating its own, and chooses no adapter.
+    // Both or neither (one alone ends the process at Start with a FATAL line in regpu.log). ReGPU takes
+    // its own reference to each in Start: the host keeps both alive until Start has returned.
+    void* hostDevice = nullptr;
+    void* hostQueue = nullptr;
     // Upload ring per frame (constants, vertices, textures), in MB; 0 is ReGPU's default (64 with
     // direct fetch). About 11 KB a draw goes to constants alone: titles with thousands of draws need
     // more, or their last draws are dropped. REGPU_RING_MB overrides it.
@@ -79,6 +85,21 @@ struct Writeback
     Mode mode = Mode::None;
     // Deferred only: the part of the image to write (game pixels); the default is all of it.
     uint32_t x0 = 0, y0 = 0, x1 = ~0u, y1 = ~0u;
+};
+
+// A finished picture, as handed to Host::presentImage.
+struct PresentImage
+{
+    enum class Kind : uint32_t { Frame, Hold, Boot };
+    Kind kind;              // Frame: a guest swap. Hold: the last picture again, while ReGPU waits. Boot: the first-boot screen.
+    uint64_t frame;         // ReGPU's frame number
+    void* image;            // ID3D12Resource*, R8G8B8A8_UNORM, already encoded for display; null: a Frame with nothing presentable
+    uint32_t width, height; // the image's size
+    uint32_t imageState;    // the D3D12_RESOURCE_STATES it is in
+    void* overlay;          // optional ID3D12Resource*, R8G8B8A8_UNORM: ReGPU's progress text
+    uint32_t overlayWidth, overlayHeight;
+    uint32_t overlayX, overlayY; // where it goes on the image (its top left)
+    uint32_t overlayState;
 };
 
 // What ReGPU needs from the game's runtime. Required unless marked optional.
@@ -135,6 +156,28 @@ struct Host
     bool (*clearBeforeDraw)(uint64_t vs, uint64_t ps, uint32_t vsTag, uint32_t psTag, float colour[4]) = nullptr;
     // Optional: each frame the game finishes (VdSwap), on the renderer's thread.
     void (*onSwap)(uint64_t frame) = nullptr;
+    // Optional: the host presents. ReGPU then opens no window and no swap chain, and calls this instead of
+    // presenting: once for every guest swap once the renderer has started (from the first draw on; not
+    // with the REGPU_TEXVIEW debug view; Kind::Frame), after the swap's command list was submitted to
+    // the queue (ExecuteCommandLists; not waited for), and for each hold or boot screen. Frames and boot
+    // screens come on the renderer's thread
+    // (the command processor's, or the draw thread's with REGPU_DRAW_THREAD); a hold comes on whichever
+    // thread waits for a shader or pipeline, which with REGPU_DRAW_WORKERS can be a draw piece worker.
+    // The host may transition image and overlay on its own command list and must return them to the
+    // states given before it returns.
+    // That work on image and overlay is submitted on Config::hostQueue (the queue ReGPU renders on) before
+    // this returns: ReGPU hands over no fence, so that queue is what orders the host's reads after ReGPU's
+    // writes and ReGPU's next writes after the host's reads. The host keeps neither pointer past the
+    // call: ReGPU writes both again for the next picture. presentImage therefore needs
+    // Config::hostDevice and hostQueue; without them the process ends at Start with a FATAL line in
+    // regpu.log (not with REGPU_HEADLESS or REGPU_NO_HOST_PRESENT=1, which never call it). The pointer
+    // is read at each call: a host that clears it (at its shutdown) is not called again. SetFullscreen
+    // does nothing then (the window and its presentation are the host's), and the picture's size follows
+    // SetOutputSize.
+    // REGPU_NO_HOST_PRESENT=1 (read at Start; flipping it later does nothing): the callback is ignored and
+    // ReGPU presents itself, creating its own swap chain on Config::hostWindow (or its own window), which
+    // fails if the host already has a swap chain on that window.
+    void (*presentImage)(const PresentImage& picture) = nullptr;
     // Optional: a character typed into the game window (WM_CHAR), e.g. for cheat codes.
     void (*onChar)(wchar_t c) = nullptr;
     // Optional diagnostics: log every host thread's stack (a wait that looks hung); the calling
@@ -188,7 +231,8 @@ void SetOutputSize(uint32_t width, uint32_t height);
 // Works on Config::hostWindow too.
 void SetWindowSize(uint32_t width, uint32_t height);
 // Borderless fullscreen on the window's display, or a window again (at the output size), while the game
-// runs. Config::fullscreen is the starting mode. Not with Config::hostWindow (the host owns its window).
+// runs. Config::fullscreen is the starting mode. Not with Config::hostWindow (the host owns its window),
+// nor with Host::presentImage (ReGPU has no swap chain then): the call then does nothing.
 void SetFullscreen(bool on);
 // The anti-aliasing sample count while the game runs (Config's msaa at start): taken at the start of the
 // next frame with the host GPU idle; the surfaces are rebuilt and every pipeline is built again for the

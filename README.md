@@ -82,6 +82,18 @@ and memory. ReGPU never touches the rest of the kernel (files, threads, XAM, aud
 The renderer currently assumes the game draws at 1280x720, as most Xbox 360 games do (see
 [`docs/xenos-notes.md`](docs/xenos-notes.md)).
 
+### Your own device and presenter
+
+By default ReGPU creates its own Direct3D 12 device (on the high-performance adapter) and presents
+through its own swap chain, on its own window or on `Config::hostWindow`. A host that already draws
+(its own menus, overlays, a recorder) can take the device over, or the device and the presenting: a
+host device without a host presenter is fine, a host presenter needs the host device and queue.
+
+| Option | Effect |
+|---|---|
+| `Config::hostDevice`, `Config::hostQueue` | Your `ID3D12Device*` and its direct `ID3D12CommandQueue*`: ReGPU renders on them instead of creating its own, and chooses no adapter (`REGPU_ADAPTER` does nothing). Set both or neither (one alone ends the process at `Start` with a FATAL line in `regpu.log`), and keep both alive until `Start` has returned: ReGPU takes its own references in `Start`. `REGPU_D3D12_DEBUG`, `REGPU_D3D12_GBV` and `REGPU_DRED` then turn nothing on (turn them on when you create the device). |
+| `Host::presentImage` | You present. ReGPU opens no window and no swap chain, and hands you each finished picture (`PresentImage`: an R8G8B8A8 image already encoded for display, its resource state, and the optional progress overlay with its place): once for every guest swap once the renderer has started (from the first draw on), after that frame's commands were submitted to the queue (not waited for), and for each hold and first-boot screen. Frames and first-boot screens come on the renderer's thread; a hold comes on whichever thread waits for a shader or pipeline, which with `REGPU_DRAW_WORKERS` can be a draw piece worker. Return the image and overlay in the states given, with your work on them submitted on `Config::hostQueue` (the queue ReGPU renders on) before the callback returns: ReGPU hands over no fence, so that queue is what orders your reads after its writes and its next writes after your reads. Do not keep either pointer past the call: ReGPU writes both again for the next picture. It therefore needs `Config::hostDevice` and `hostQueue`; without them the process ends at `Start` with a FATAL line in `regpu.log` (not with `REGPU_HEADLESS` or `REGPU_NO_HOST_PRESENT=1`, which never call it). `regpu::SetFullscreen` does nothing then (the window is yours); `SetOutputSize` changes the size of the pictures you get. `REGPU_NO_HOST_PRESENT=1` (read at `Start`; flipping it later does nothing) ignores the callback, and ReGPU presents itself: it creates its own swap chain on `Config::hostWindow` (or its own window), which fails if you already have a swap chain on that window. |
+
 ### Game-specific fixes
 
 When a game needs something the console did that isn't the GPU's job, or a workaround for one of

@@ -4,6 +4,9 @@
 
 // Window + D3D12 swap chain (REGPU_HEADLESS=1 disables it).
 void PresenterInit();
+// Host::presentImage is set and REGPU_NO_HOST_PRESENT is not (decided in PresenterInit): the renderer
+// hands its pictures to the host instead of PresenterRecordCopy / PresenterPresent.
+bool PresenterHostPresents();
 // The size the game renders at (settings.h: resolution and forced aspect ratio). The swap
 // chain is the resolution; the image is centred in it and the swap chain stretches to the
 // window.
