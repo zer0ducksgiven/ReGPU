@@ -10817,6 +10817,35 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         auto readsSrcAlpha = [](uint32_t f) { return f == 6 || f == 7 || f == 16; };
         if (!noAlpha2 && (format == 3 || format == 12) && !readsSrcAlpha(srcFactor) && !readsSrcAlpha(dstFactor))
             pc->info[2] |= 32u;
+        // Min / max blending (comb functions 2, 3). Inferred, not measured on a console: the Xenos
+        // applies the blend factors before a min / max, max(src * srcFactor, dst * dstFactor), as XNA
+        // documents it; Direct3D's output merger takes the colours without the factors. A
+        // title draws blinking text with MAX and SRC_ALPHA / ONE from an image whose transparent texels
+        // are white with alpha 0: without the factor the whole quad came out white. A SRC_ALPHA source
+        // factor (SRC_COLOR too for the alpha channel, where it is the source alpha) is applied in the
+        // pixel shader (pinfo.z bits 17 colour, 18 alpha); ONE needs nothing. The alpha is not multiplied
+        // when a colour operation other than min / max reads the source alpha (its factor would become
+        // alpha squared). Other source factors, and every destination factor but ONE, are ignored (logged
+        // once; a SRC_ALPHA source is still applied beside them). The motion variant's reactive mask
+        // (MotionVariant) reads the output after this, so a min / max draw feeds it the multiplied
+        // colour or alpha. REGPU_NO_MINMAX_FACTORS=1: the factors ignored, as before (A/B).
+        static LiveSwitch noMinMaxFactors("REGPU_NO_MINMAX_FACTORS");
+        const uint32_t opC = (blend >> 5) & 7, srcA = (blend >> 16) & 0x1F, opA = (blend >> 21) & 7, dstA = (blend >> 24) & 0x1F;
+        const bool colorMinMax = opC == 2 || opC == 3, alphaMinMax = opA == 2 || opA == 3;
+        if (!noMinMaxFactors && edramMode != 5 && (colorMinMax || alphaMinMax))
+        {
+            const bool colorReadsSrcAlpha = !colorMinMax && (readsSrcAlpha(srcFactor) || readsSrcAlpha(dstFactor));
+            const bool alphaSrcIsSrcAlpha = srcA == 6 || srcA == 4;
+            if (colorMinMax && srcFactor == 6)
+                pc->info[2] |= 1u << 17;
+            if (alphaMinMax && alphaSrcIsSrcAlpha && !colorReadsSrcAlpha)
+                pc->info[2] |= 1u << 18;
+            const bool colorEmulated = !colorMinMax || ((srcFactor == 6 || srcFactor == 1) && dstFactor == 1);
+            const bool alphaEmulated = !alphaMinMax || (((alphaSrcIsSrcAlpha && !colorReadsSrcAlpha) || srcA == 1) && dstA == 1);
+            static std::atomic<bool> minMaxLogged{ false };
+            if ((!colorEmulated || !alphaEmulated) && !minMaxLogged.exchange(true))
+                Log("renderer: min / max blending with factors that are not emulated (RB_BLENDCONTROL0 %08X): a SRC_ALPHA source factor is applied (SRC_COLOR too for alpha, unless a colour blend other than min / max reads the source alpha); other source factors and every destination factor but ONE are ignored (logged once)", blend);
+        }
     }
     // A vertex shader that allocates interpolators but exports none (depth-only shaders end with an
     // empty export) leaves the pixel shader's inputs to whatever the hardware's parameter cache
