@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+#include "live_switch.h"
 #include "log.h"
 #include "render/presenter.h"
 #include "settings.h"
@@ -94,6 +95,7 @@ std::mutex g_deviceMutex;
 ComPtr<ID3D12Device> g_device;
 ComPtr<ID3D12CommandQueue> g_queue;
 std::atomic<bool> g_rendererActive{ false };
+bool g_hostPresents = false; // Host::presentImage in use (PresenterInit, before the renderer's thread starts)
 
 // The GPU to draw on: the high-performance one. On a laptop with two (NVIDIA Optimus, AMD switchable
 // graphics) Direct3D's default adapter is the integrated GPU unless the executable exports
@@ -132,6 +134,22 @@ void EnsureDevice()
     std::lock_guard lock(g_deviceMutex);
     if (g_device)
         return;
+    // The host's device and queue (Config::hostDevice, hostQueue): ReGPU renders on them and holds its
+    // own reference. No adapter is chosen (the host chose it), and the debug layer, GPU-based validation
+    // and DRED below act only before a device exists, so they are the host's to turn on.
+    const Settings& settings = GetSettings();
+    if (settings.hostDevice || settings.hostQueue)
+    {
+        if (!settings.hostDevice || !settings.hostQueue)
+            Fatal("presenter: Config::hostDevice and hostQueue are set together or not at all (only %s is set)",
+                settings.hostDevice ? "hostDevice" : "hostQueue");
+        g_device = static_cast<ID3D12Device*>(settings.hostDevice);
+        g_queue = static_cast<ID3D12CommandQueue*>(settings.hostQueue);
+        Log("presenter: using the host's device and queue");
+        if (getenv("REGPU_D3D12_DEBUG") || getenv("REGPU_DRED") || getenv("REGPU_ADAPTER"))
+            Log("presenter: REGPU_D3D12_DEBUG, REGPU_DRED and REGPU_ADAPTER do nothing (the host made the device)");
+        return;
+    }
     if (getenv("REGPU_D3D12_DEBUG"))
     {
         ComPtr<ID3D12Debug> debug;
@@ -443,9 +461,38 @@ void RenderThread()
 
 void PresenterInit()
 {
+    // ReGPU's own references to the host's device and queue (Config::hostDevice, hostQueue), taken
+    // now, with or without a host presenter and headless too: the host need keep them alive only until
+    // Start has returned. A pair set by half stops here. Without a host device nothing happens here
+    // (ReGPU's own device is created on first use, as before).
+    if (GetSettings().hostDevice || GetSettings().hostQueue)
+        EnsureDevice();
     if (getenv("REGPU_HEADLESS"))
         return;
+    // Host::presentImage: the host presents, so no thread, window or swap chain here. Its window
+    // (Config::hostWindow) still answers PresenterHasFocus and SetWindowSize. Decided once, here:
+    // REGPU_NO_HOST_PRESENT is read at Start only.
+    if (regpu::GetHost().presentImage)
+    {
+        static LiveSwitch off("REGPU_NO_HOST_PRESENT");
+        if (!off)
+        {
+            // The host's present is ordered against ReGPU's writes only by going on the queue ReGPU
+            // renders on (no fence is handed over), so that queue must be the host's.
+            if (!GetSettings().hostDevice || !GetSettings().hostQueue)
+                Fatal("presenter: Host::presentImage needs Config::hostDevice and Config::hostQueue (the host presents on the queue ReGPU renders on)");
+            g_hostPresents = true;
+            g_p.window = HWND(GetSettings().hostWindow);
+            Log("presenter: the host presents (no swap chain)");
+            return;
+        }
+    }
     std::thread(RenderThread).detach();
+}
+
+bool PresenterHostPresents()
+{
+    return g_hostPresents;
 }
 
 void PresenterSubmitFrame(uint64_t frame)
@@ -487,6 +534,14 @@ void PresenterResize(uint32_t width, uint32_t height)
 
 void regpu::SetFullscreen(bool on)
 {
+    // The host presents: ReGPU has no swap chain or window of its own to change. The early return below
+    // already makes the call do nothing then (the window is null or the host's); this one is here for its
+    // log line, so a host can see why nothing happened. Config::fullscreen is left as it is.
+    if (g_hostPresents)
+    {
+        Log("presenter: SetFullscreen(%s) ignored: the host presents", on ? "true" : "false");
+        return;
+    }
     if (!g_p.window || GetSettings().hostWindow || g_p.fullscreen == on)
         return;
     g_p.fullscreen = on;
